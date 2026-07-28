@@ -1,0 +1,23 @@
+[package]
+name = "onnx-vulkan"
+description = "Run ONNX models on a Vulkan GPU in pure Rust — no ONNX Runtime. Session::load → run → get"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["onnx", "vulkan", "gpu", "inference", "neural-network"]
+categories = ["science", "hardware-support"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+onnx-vulkan-core = { workspace = true }
+onnx-vulkan-frontend = { workspace = true }
+vk-compute = { workspace = true }
+log.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

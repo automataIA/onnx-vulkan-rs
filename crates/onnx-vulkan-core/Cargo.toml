@@ -1,0 +1,22 @@
+[package]
+name = "onnx-vulkan-core"
+description = "ONNX graph IR, device interpreter, WGSL shader sources, convex-block fusion and load-time rewrites — Vulkan-backed, no ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["onnx", "vulkan", "gpu", "inference", "neural-network"]
+categories = ["science", "hardware-support"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "onnx_vulkan_core"
+
+[dependencies]
+vk-compute = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

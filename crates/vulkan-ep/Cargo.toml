@@ -1,0 +1,17 @@
+[package]
+name = "vulkan-ep"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "onnxruntime_ep_vulkan"
+crate-type = ["cdylib"]
+
+[dependencies]
+onnx-vulkan-core = { path = "../onnx-vulkan-core" }
+ort-ep-sys = { path = "../ort-ep-sys" }
+vk-compute = { path = "../vk-compute" }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "stt-app"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "stt-app"
+path = "src/main.rs"
+
+[dependencies]
+ort-ep-sys = { path = "../ort-ep-sys" }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "std"] }
+hound = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

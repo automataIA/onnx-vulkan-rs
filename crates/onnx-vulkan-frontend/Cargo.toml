@@ -1,0 +1,27 @@
+[package]
+name = "onnx-vulkan-frontend"
+description = "Standalone .onnx → GraphIr loader (prost + protox), static shape inference keeping symbolic dims — no ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["onnx", "protobuf", "inference", "gpu", "parser"]
+categories = ["science", "parser-implementations"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+onnx-vulkan-core = { workspace = true }
+prost = "0.14"
+log.workspace = true
+
+[dev-dependencies]
+vk-compute = { workspace = true }
+env_logger.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9"

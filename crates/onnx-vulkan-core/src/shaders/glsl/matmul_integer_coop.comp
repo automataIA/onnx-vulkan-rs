@@ -1,0 +1,130 @@
+// MatMulInteger (u8 x u8 -> i32) on cooperative matrices (tensor cores).
+//
+// Why GLSL and not WGSL: naga's WGSL frontend has no 8-bit scalar type, and its
+// cooperative matrix types are square-only (8x8 / 16x16), while NVIDIA exposes
+// the integer combinations at K=32. Neither restriction can be worked around
+// from WGSL, so this one kernel is compiled offline with glslangValidator and
+// the SPIR-V is checked in (see scripts/build-glsl.sh). Everything else in the
+// project stays WGSL.
+//
+// Compiled once per (K_TILE, SUBGROUP_SIZE, accumulator) triple, all -D
+// defines. The valid combinations are whatever
+// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR reports, and the
+// accumulator component type must match it exactly: today NVIDIA reports
+// 16x16x32 u8*u8 -> u32 on a 32-wide subgroup, AMD 16x16x16 u8*u8 -> i32 on a
+// 64-wide one.
+//
+// Bindings and buffer layouts are identical to the WGSL variants, so the
+// dispatch side is shared: A is raw [M, K] u8, B is the [N, K] u8 transposed
+// pack produced by PACK_B, out is [M, N] i32. Both operands must already be
+// unsigned in memory (see the push constants).
+//
+// Algebra. The zero point cannot be subtracted before the matrix multiply, so
+// the same decomposition as the dot4 variant is used:
+//
+//     sum (a - za)(b - zb) = sum ab - za*sum b - zb*sum a + K*za*zb
+//
+// sum a and sum b are obtained from two extra coopMatMulAdd against an all-ones
+// operand, so all three terms stay on the tensor cores. Accumulation happens in
+// whichever 32-bit integer type the driver advertises: the true result fits in
+// int32 and two's complement arithmetic is modular, so either way the bit
+// pattern stored is the correct signed value.
+//
+// Tiles are clamped to the last full 16x16 block instead of being padded
+// (cooperativeMatrixRobustBufferAccess is false on NVIDIA, so an out-of-range
+// coopMatLoad is undefined). Overlapping tiles recompute identical values, so
+// the redundant stores are harmless. This requires M >= 16 and N >= 16; the
+// caller falls back to the WGSL kernel otherwise.
+
+#version 450 core
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#ifndef K_TILE
+#error "K_TILE must be defined (16 or 32)"
+#endif
+#ifndef SUBGROUP_SIZE
+#error "SUBGROUP_SIZE must be defined"
+#endif
+
+// The accumulator component type has to be the one the driver advertises.
+// Either way the arithmetic is modular over 32 bits and the stored bit pattern
+// is the correct int32 result.
+#ifdef ACC_SIGNED
+#define ACC_T int32_t
+#define ACC_ZERO 0
+#else
+#define ACC_T uint32_t
+#define ACC_ZERO 0u
+#endif
+
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuf { uint8_t a[]; };   // [M, K]
+layout(set = 0, binding = 1) readonly buffer BBuf { uint8_t b[]; };   // [N, K] packed
+layout(set = 0, binding = 2) readonly buffer AZp  { uint8_t azp[]; };
+layout(set = 0, binding = 3) readonly buffer BZp  { uint8_t bzp[]; };
+layout(set = 0, binding = 4) writeonly buffer OBuf { ACC_T o[]; };   // [M, N]
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint k;
+    uint n;
+    // 0x80 when the operand was int8 and got brought to uint8 by adding 128
+    // ahead of this kernel; the zero point in the buffer is still the original
+    // signed one, so it needs the same shift. A cooperative matrix has no
+    // bitwise operations, which is why the bytes themselves are never flipped
+    // here.
+    uint a_zp_xor;
+    uint b_zp_xor;
+} pc;
+
+#define TILE 16
+
+void main() {
+    // Clamp so every tile is fully in range; the last row/column band overlaps
+    // the previous one and recomputes the same values.
+    uint row0 = min(gl_WorkGroupID.y * TILE, pc.m - TILE);
+    uint col0 = min(gl_WorkGroupID.x * TILE, pc.n - TILE);
+
+    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(ACC_ZERO);
+    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> sa = acc;
+    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> sb = acc;
+
+    // All-ones operands: multiplying by them turns a matrix product into the
+    // row sums of A (ones on the B side) and the column sums of B (ones on the
+    // A side), replicated across the tile.
+    coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA> ones_a =
+        coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA>(uint8_t(1u));
+    coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB> ones_b =
+        coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB>(uint8_t(1u));
+
+    for (uint kt = 0u; kt < pc.k; kt += uint(K_TILE)) {
+        coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA> ma;
+        coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB> mb;
+        // A is [M, K] row major; B is stored transposed as [N, K], which is
+        // exactly column major for the [K, N] operand the multiply wants.
+        coopMatLoad(ma, a, row0 * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb, b, col0 * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutColumnMajor);
+
+        acc = coopMatMulAdd(ma, mb, acc);
+        sa = coopMatMulAdd(ma, ones_b, sa);
+        sb = coopMatMulAdd(ones_a, mb, sb);
+    }
+
+    ACC_T za = ACC_T(uint(azp[0]) ^ pc.a_zp_xor);
+    ACC_T zb = ACC_T(uint(bzp[0]) ^ pc.b_zp_xor);
+    ACC_T corr = ACC_T(pc.k) * za * zb;
+
+    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> res =
+        acc - sb * za - sa * zb
+        + coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(corr);
+
+    coopMatStore(res, o, row0 * pc.n + col0, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

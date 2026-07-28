@@ -1,0 +1,12 @@
+/target
+/info
+/docs
+/repo-reference
+/models
+/third_party
+/runs/*
+!/runs/baseline.json
+__pycache__/
+*.pyc
+*.md
+!README.md

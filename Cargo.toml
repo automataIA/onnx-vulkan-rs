@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ort-ep-sys",
+    "crates/onnx-vulkan-core",
+    "crates/vk-compute",
+    "crates/vulkan-ep",
+    "crates/stt-app",
+    "crates/model-runner",
+    "crates/onnx-vulkan-frontend",
+    "crates/onnx-vulkan",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/automataIA/onnx-vulkan-rs"
+
+[workspace.dependencies]
+ash = "0.38"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+hound = "3.5"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+# Internal crates: `version` is what crates.io sees, `path` is what local builds use.
+vk-compute = { version = "0.0.1", path = "crates/vk-compute" }
+onnx-vulkan-core = { version = "0.0.1", path = "crates/onnx-vulkan-core" }
+onnx-vulkan-frontend = { version = "0.0.1", path = "crates/onnx-vulkan-frontend" }

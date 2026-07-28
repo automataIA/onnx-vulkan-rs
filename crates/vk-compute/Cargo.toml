@@ -1,0 +1,21 @@
+[package]
+name = "vk-compute"
+description = "Pure-Rust Vulkan compute runtime: deferred command stream, persistent descriptor arena, WGSL→SPIR-V via naga, GPU timestamp profiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["vulkan", "gpu", "compute", "ash", "spir-v"]
+categories = ["graphics", "hardware-support"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+ash = { workspace = true }
+gpu-allocator = { workspace = true }
+naga = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

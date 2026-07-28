@@ -1,0 +1,100 @@
+onnx-vulkan-rs
+Copyright 2026 Dionisio Ferraro
+
+Licensed under the Apache License, Version 2.0 or the MIT License,
+at your option. See LICENSE-APACHE and LICENSE-MIT.
+
+================================================================================
+VENDORED FILES
+================================================================================
+
+proto/onnx.proto
+  From: https://github.com/onnx/onnx
+  License: Apache License 2.0
+  Copyright: The ONNX Project Contributors
+
+crates/onnx-vulkan-core/shaders/spv/*.spv
+  Compiled SPIR-V from GLSL sources in shaders/glsl/.
+  These are original work of this project, not third-party artifacts.
+
+================================================================================
+THIRD-PARTY DEPENDENCIES (not shipped, downloaded by scripts)
+================================================================================
+
+ONNX Runtime (third_party/onnxruntime/)
+  Downloaded by: scripts/fetch-deps.sh
+  Source: https://github.com/microsoft/onnxruntime
+  License: MIT License
+  Copyright: Microsoft Corporation
+  Note: Only used when building the ORT plugin (crates/vulkan-ep).
+        The standalone path (crates/onnx-vulkan) does not use or require it.
+
+================================================================================
+MODELS (not shipped, not in the repository)
+================================================================================
+
+The test suite references pre-trained models that are downloaded on demand by
+scripts/fetch-deps.sh and scripts/fetch-models.sh into models/, which is in
+.gitignore. No model weights are distributed with this repository.
+
+Users must comply with each model's license when downloading and using them.
+
+┌─────────────────────────────────┬──────────────────────────────────────────────┬────────────────────────────────────┐
+│ Model                           │ License                                      │ Source                             │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ Parakeet TDT 0.6B v3 (int8)    │ CC-BY-4.0                                    │ NVIDIA / NeMo                      │
+│                                 │ https://creativecommons.org/licenses/by/4.0/ │ https://huggingface.co/nvidia/     │
+│                                 │                                              │   parakeet-tdt-0.6b-v2             │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ RF-DETR Base (fp32, int8)       │ Apache-2.0                                   │ Roboflow                           │
+│                                 │                                              │ https://huggingface.co/            │
+│                                 │                                              │   onnx-community/rfdetr_base-ONNX  │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ SAM 2 / SAM 3 Tracker           │ Apache-2.0                                   │ Meta / facebookresearch             │
+│ (vision encoder int8,           │                                              │ https://huggingface.co/            │
+│  prompt encoder/decoder int8)   │                                              │   onnx-community/sam3-tracker-ONNX │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ SAM 3 ViT-H (fp32)             │ Apache-2.0                                   │ Meta / facebookresearch             │
+│ (sam3_image_encoder.onnx)       │                                              │                                    │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ MobileNetV2-12                  │ Apache-2.0                                   │ ONNX Model Zoo                     │
+│                                 │                                              │ https://huggingface.co/            │
+│                                 │                                              │   onnxmodelzoo/mobilenetv2-12      │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ YOLOv8n                         │ AGPL-3.0                                     │ Ultralytics                        │
+│                                 │ (Enterprise license available)               │ https://huggingface.co/            │
+│                                 │                                              │   cabelo/yolov8                    │
+│                                 │ Note: weights used only for testing;         │                                    │
+│                                 │ not distributed with this project.           │                                    │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ YOLOv4                          │ MIT (ONNX Model Zoo entry)                   │ ONNX Model Zoo                     │
+│                                 │                                              │ https://github.com/onnx/models     │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ ResNet50-v1-12-qdq              │ Apache-2.0                                   │ ONNX Model Zoo                     │
+│                                 │                                              │ https://github.com/onnx/models     │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ RoBERTa-base-11                 │ Apache-2.0                                   │ ONNX Model Zoo                     │
+│                                 │                                              │ https://github.com/onnx/models     │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ FasterRCNN-12                   │ Apache-2.0                                   │ ONNX Model Zoo                     │
+│                                 │                                              │ https://github.com/onnx/models     │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ Gemma 3 1B Instruct (q4)       │ Gemma Terms of Use                           │ Google                             │
+│                                 │ https://ai.google.dev/gemma/terms            │ https://huggingface.co/            │
+│                                 │ Note: custom license, not OSI-approved;      │   onnx-community/                  │
+│                                 │ permits commercial use with restrictions.    │   gemma-3-1b-it-ONNX               │
+│                                 │ Derivative models remain under Gemma ToU.    │                                    │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ Qwen2.5-VL 3B Instruct (q4)   │ Apache-2.0                                   │ Alibaba / Qwen                     │
+│ (vision encoder, decoder)       │                                              │ https://huggingface.co/            │
+│                                 │                                              │   onnx-community/                  │
+│                                 │                                              │   Qwen2.5-VL-3B-Instruct-ONNX     │
+└─────────────────────────────────┴──────────────────────────────────────────────┴────────────────────────────────────┘
+
+================================================================================
+SMALL TEST FIXTURES (shipped in the repository)
+================================================================================
+
+crates/onnx-vulkan-frontend/tests/models/*.onnx
+  Synthetic ONNX graphs (< 4 KB each) created for unit tests.
+  These are original work of this project, not third-party models.

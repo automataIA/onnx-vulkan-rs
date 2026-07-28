@@ -1,0 +1,252 @@
+# Manifest of the test suite (`scripts/testsuite.sh`) — the single source of truth
+# on *what* runs. The constraints of each model are already known from plan-test.md §7
+# and must not be rediscovered by hand every time.
+#
+# Fields:
+#   name        key used by `-m/--model` and name of the output folder
+#   path        path relative to the repo root (.onnx file or directory)
+#   runner      "model-runner" | "stt-app"
+#   args        extra arguments for the runner
+#   iters       iterations (model-runner `--iters`, stt-app `STT_BENCH`)
+#   default     enters the matrix when `-m` is not passed
+#   validate    "outputs" | "per-node" | "transcript" | "none"
+#   size_mb     on-disk size, to compare against the VRAM delta
+#   stats       also run the `VULKAN_EP_STATS=1` pass (default true)
+#   perf_tol    regression tolerated by the gate, in % (default 10)
+#   skip        if present, the model is not run: the text is the reason
+#   instrument  parameters for expose-intermediates.py when validate = "per-node"
+
+[[model]]
+name = "yolov8n"
+path = "models/zoo/yolov8/yolov8n.onnx"
+runner = "model-runner"
+args = []
+iters = 50
+default = true
+validate = "outputs"
+size_mb = 13
+
+[[model]]
+name = "mobilenetv2"
+path = "models/zoo/mobilenetv2/mobilenetv2-12.onnx"
+runner = "model-runner"
+args = []
+iters = 50
+default = true
+validate = "outputs"
+size_mb = 14
+# Official reference data from the ONNX model zoo: expected input and output,
+# produced by the model authors. It answers a question that random inputs
+# cannot — not "do the two backends agree" but "is the answer the correct
+# one". Downloaded by the suite if missing.
+reference = "models/zoo/mobilenetv2/test_data_set_0"
+fetch = { dir = "models/zoo/mobilenetv2/test_data_set_0", member = "mobilenetv2-12/test_data_set_0", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-12.tar.gz" }
+
+[[model]]
+name = "rfdetr"
+path = "models/zoo/rfdetr/model.onnx"
+runner = "model-runner"
+# with the default 1 the graph fails on Resize, for reasons unrelated to the EP
+args = ["--dim", "height=560", "--dim", "width=560"]
+iters = 5
+default = true
+validate = "outputs"
+size_mb = 129
+
+[[model]]
+name = "parakeet"
+path = "models/parakeet-tdt-0.6b-v3-onnx"
+runner = "stt-app"
+args = ["models/en-sample.wav"]
+# 20, not the 6 the other big models use: seven repeats of an identical binary
+# spanned 41.8–52.4 ms (25%), enough noise to trip a 10% gate on its own. The
+# median needs the extra samples; `perf_tol` stays at the default.
+iters = 20
+default = true
+validate = "transcript"
+expect = "Well, I don't wish to see it any more"
+size_mb = 700
+
+# Dynamically quantized graphs: the final outputs are not compared (the scales
+# come from min/max of the activations, ±1 LSB amplifies up to 97%).
+# The first quantized tensor of the instrumented graph is compared, ±1 LSB criterion.
+[[model]]
+name = "rfdetr-int8"
+path = "models/zoo/rfdetr/model_int8.onnx"
+runner = "model-runner"
+args = ["--dim", "height=560", "--dim", "width=560", "--no-opt", "--dump", "4"]
+iters = 1
+default = false
+validate = "per-node"
+size_mb = 33
+instrument = { from = 70, every = 1, limit = 70 }
+
+[[model]]
+name = "sam3-vision-int8"
+path = "models/zoo/sam3/vision_encoder_int8.onnx"
+runner = "model-runner"
+args = ["--no-opt", "--dump", "4"]
+iters = 1
+default = false
+validate = "per-node"
+size_mb = 210
+instrument = { from = 70, every = 1, limit = 70 }
+
+[[model]]
+name = "gemma3-1b"
+path = "models/zoo/gemma3-1b/model_q4.onnx"
+runner = "model-runner"
+args = []
+iters = 3
+default = false
+validate = "outputs"
+size_mb = 1000
+
+[[model]]
+name = "qwen25vl-decoder"
+path = "models/zoo/qwen25vl/decoder_model_merged_q4.onnx"
+runner = "model-runner"
+args = []
+iters = 3
+default = false
+validate = "outputs"
+size_mb = 1100
+
+[[model]]
+name = "qwen25vl-vision"
+path = "models/zoo/qwen25vl/vision_encoder_q4.onnx"
+skip = "incoherent synthetic inputs: image_grid_thw not consistent with pixel_values (plan-test.md §7)"
+
+[[model]]
+name = "sam3-prompt-int8"
+path = "models/zoo/sam3/prompt_encoder_mask_decoder_int8.onnx"
+skip = "incoherent synthetic inputs: indices out of range (plan-test.md §7)"
+
+# ---------------------------------------------------------------- golden
+#
+# Models from the official ONNX model zoo, used **only** as a correctness
+# gate: shaders, operators, shape propagation, CPU↔GPU transfers. They do not
+# measure product performance, because they are not the target models — for
+# that, the entries above apply.
+#
+# Each ships an official `test_data_set_0`: expected input and output produced
+# by the authors. The suite downloads the archive (model + data together) if missing.
+# `golden = true` excludes them from the performance and fragmentation gates.
+
+[[model]]
+name = "roberta-golden"
+path = "models/zoo/golden/roberta-base-11/roberta-base-11.onnx"
+runner = "model-runner"
+args = []
+# 20, not 3: the golden models exist for correctness, but their ratio is
+# quoted in CLAUDE.md, and at 3 iters it is not reproducible — roberta-golden
+# measured 1.13x once and 0.93x as the median of six. Correctness does not
+# care how many iterations run; the quoted number does.
+iters = 20
+default = true
+golden = true
+validate = "outputs"
+size_mb = 499
+# The mathematical foundation of Transformers before real language models:
+# MatMul with 3D broadcasting, Softmax over intermediate axes, LayerNormalization,
+# and the reshape/transpose of multi-head attention.
+#
+# `args = []` means `seq_len = 1`, and it is the shape of the authors' golden
+# data — so it cannot be changed without losing the comparison with the expected
+# output. Read it for what it is, though: **the GEMV regime**. With M = 1 all
+# 96 `MatMul`s are matrix-vector products. This entry is where that regime is
+# measured, and it is what drove `matmul_fp32::gemv_split`: the tiled kernels
+# ran it at 0.89× of the CPU EP, splitting K across workgroups puts it at 2.12×.
+# It remains a real and distinct regime — autoregressive decoding is exactly
+# this — but **it does not represent the model**: see `roberta-seq128` below.
+reference = "models/zoo/golden/roberta-base-11/test_data_set_0"
+fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz" }
+
+[[model]]
+name = "roberta-seq128"
+path = "models/zoo/golden/roberta-base-11/roberta-base-11.onnx"
+runner = "model-runner"
+# The same graph as `roberta-golden` at a realistic sequence length.
+# It is not a duplicate: it separates **correctness from performance**. Golden
+# data exists only at `(1, 1)`, so that entry can measure nothing but the
+# GEMV regime; this one has no reference data and therefore is not `golden`,
+# but it enters the performance and fragmentation gate, where the number it
+# reports is that of the load an encoder is actually served at.
+# Measured on the 4070: 51.2 ms CPU EP vs 18.8 → **2.72×**, against 2.12× at
+# seq_len = 1. The `prefer_blocked` predicate routes on its own to the 64×64
+# tile at this length (`MatMul16` → `MatMul` in the Pareto), so this entry and
+# `roberta-golden` exercise different kernels on the same graph.
+args = ["--dim", "batch_size=1", "--dim", "seq_len=128"]
+iters = 20
+default = true
+validate = "outputs"
+size_mb = 499
+fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz" }
+
+[[model]]
+name = "yolov4-golden"
+path = "models/zoo/golden/yolov4/yolov4.onnx"
+runner = "model-runner"
+args = []
+# 20, not 3: the golden models exist for correctness, but their ratio is
+# quoted in CLAUDE.md, and at 3 iters it is not reproducible — roberta-golden
+# measured 1.13x once and 0.93x as the median of six. Correctness does not
+# care how many iterations run; the quoted number does.
+iters = 20
+default = true
+golden = true
+validate = "outputs"
+size_mb = 245
+# Continuous tensor movement — Concat, Slice, Split, Resize, Reshape:
+# this is where an off-by-one in the offsets or a badly propagated shape shows up.
+# yolov8n measures performance but has no official data; this one does.
+reference = "models/zoo/golden/yolov4/test_data_set_0"
+fetch = { dir = "models/zoo/golden/yolov4", member = "yolov4", url = "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/yolov4/model/yolov4.tar.gz" }
+
+[[model]]
+name = "resnet50-qdq-golden"
+path = "models/zoo/golden/resnet50-v1-12-qdq/resnet50-v1-12-qdq.onnx"
+runner = "model-runner"
+args = []
+# 20, not 3: the golden models exist for correctness, but their ratio is
+# quoted in CLAUDE.md, and at 3 iters it is not reproducible — roberta-golden
+# measured 1.13x once and 0.93x as the median of six. Correctness does not
+# care how many iterations run; the quoted number does.
+iters = 20
+default = true
+golden = true
+# `argmax` criterion, not `outputs`: the golden is produced with the
+# QDQ→QLinearConv fusion, i.e. convolution in exact integer arithmetic. The
+# literal graph — dequantize, conv in f32, requantize — diverges by 3%, and
+# diverges **in the same way** even when run by ORT with optimizations disabled
+# (measured: max|Δ| 3.069e-1 in both cases). This is not a property of our
+# shaders, and widening the tolerance would hide it instead of stating it.
+validate = "argmax"
+size_mb = 25
+# **Static** Int8: scale and zero-point are in the model, so the result is
+# deterministic and comparable with the golden — unlike the dynamic quantization
+# of parakeet and rfdetr-int8, where ±1 LSB amplifies and the final outputs
+# cannot be validated.
+#
+# QDQ variant and not `-int8`: the latter is QOperator format (fused
+# `QLinearConv`), which we cover at 7% — it would run on ORT and not test our shaders.
+reference = "models/zoo/golden/resnet50-v1-12-qdq/test_data_set_0"
+fetch = { dir = "models/zoo/golden/resnet50-v1-12-qdq", member = "resnet50-v1-12-qdq", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v1-12-qdq.tar.gz" }
+
+[[model]]
+name = "fasterrcnn-golden"
+path = "models/zoo/golden/FasterRCNN-12/FasterRCNN-12.onnx"
+runner = "model-runner"
+args = []
+iters = 2
+default = false
+golden = true
+validate = "outputs"
+size_mb = 168
+# Hybrid backend: selection and filtering of bounding boxes, i.e. exchange of
+# tensors between GPU and CPU mid-graph. Coverage 92.9% — NonZero (98 nodes),
+# NonMaxSuppression (85), RoiAlign and ScatterElements remain, which ORT runs on
+# the CPU EP. Out of the default until those are covered: the graph breaks in
+# too many places for the result to say anything about our shaders.
+reference = "models/zoo/golden/FasterRCNN-12/test_data_set_0"
+fetch = { dir = "models/zoo/golden/FasterRCNN-12", member = "FasterRCNN-12", url = "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/faster-rcnn/model/FasterRCNN-12.tar.gz" }

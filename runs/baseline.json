@@ -1,0 +1,1471 @@
+{
+  "tag": "convsplit-1",
+  "env": {
+    "host": "DESKTOP-K4CMG90",
+    "commit": "06e02de",
+    "dirty": true,
+    "ort": "win-x64",
+    "gpu": "NVIDIA GeForce RTX 4070",
+    "driver": "610.74",
+    "sample_ms": 100,
+    "when": "2026-07-27T11:08:39Z"
+  },
+  "results": [
+    {
+      "model": "mobilenetv2",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 50,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 14.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 1.6,
+        "min": 1.5,
+        "max": 1.9,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 1.9,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 9.21e-07,
+        "outputs": [
+          {
+            "name": "output",
+            "n": 1000,
+            "max_abs_delta": 1.24e-05,
+            "ref_scale": 13.47,
+            "relative": 9.21e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 632,
+                "argmax_got": 632
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 1.24e-05,
+                "mismatches": 0,
+                "argmax_expected": 632,
+                "argmax_got": 632
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv",
+            "ms": 0.316,
+            "pct": 29.6,
+            "dispatches": 17
+          },
+          {
+            "op": "Conv_split",
+            "ms": 0.194,
+            "pct": 18.1,
+            "dispatches": 11
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.136,
+            "pct": 12.8,
+            "dispatches": 1
+          },
+          {
+            "op": "Conv16",
+            "ms": 0.135,
+            "pct": 12.7,
+            "dispatches": 7
+          },
+          {
+            "op": "Conv_grouped",
+            "ms": 0.127,
+            "pct": 11.9,
+            "dispatches": 17
+          },
+          {
+            "op": "Clip",
+            "ms": 0.092,
+            "pct": 8.6,
+            "dispatches": 35
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.035,
+            "pct": 3.3,
+            "dispatches": 11
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.008,
+            "pct": 0.8,
+            "dispatches": 1
+          }
+        ],
+        "compute_ms": 1.066,
+        "sync_ms": 0.184,
+        "flushes": 2,
+        "upload_mb": 0.6,
+        "download_mb": 0.0
+      },
+      "blocks": {
+        "nodes_claimed": 104,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 2,
+        "sm_pct": {
+          "mean": 1.0,
+          "max": 1.0,
+          "p95": 1.0
+        },
+        "fb_peak_mb": 2646.0,
+        "vram_delta_mb": 2.0,
+        "vram_idle_mb": 2644,
+        "vram_source": "global-delta",
+        "rss_mb": 182.0,
+        "cpu_pct": {
+          "mean": 78.0,
+          "max": 156.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "mobilenetv2",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "parakeet",
+      "mode": "compile",
+      "runner": "stt-app",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 700.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 44.3,
+        "min": 41.9,
+        "max": 46.7,
+        "iters_used": 19
+      },
+      "cpu_ep_ms": null,
+      "accuracy": {
+        "kind": "transcript",
+        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
+        "expect": "Well, I don't wish to see it any more",
+        "tolerated": true
+      },
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MMI_matmul_coop_k32",
+            "ms": 18.274,
+            "pct": 57.4,
+            "dispatches": 267
+          },
+          {
+            "op": "MatMul",
+            "ms": 1.395,
+            "pct": 4.4,
+            "dispatches": 72
+          },
+          {
+            "op": "DQL_partial",
+            "ms": 1.279,
+            "pct": 4.0,
+            "dispatches": 223
+          },
+          {
+            "op": "Transpose",
+            "ms": 1.246,
+            "pct": 3.9,
+            "dispatches": 195
+          },
+          {
+            "op": "Cast_dev",
+            "ms": 0.821,
+            "pct": 2.6,
+            "dispatches": 294
+          },
+          {
+            "op": "Slice",
+            "ms": 0.779,
+            "pct": 2.4,
+            "dispatches": 97
+          },
+          {
+            "op": "DQL_finalize",
+            "ms": 0.636,
+            "pct": 2.0,
+            "dispatches": 223
+          },
+          {
+            "op": "ConvInteger",
+            "ms": 0.628,
+            "pct": 2.0,
+            "dispatches": 27
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.561,
+            "pct": 1.8,
+            "dispatches": 120
+          },
+          {
+            "op": "DQL_quantize",
+            "ms": 0.537,
+            "pct": 1.7,
+            "dispatches": 223
+          },
+          {
+            "op": "Where",
+            "ms": 0.514,
+            "pct": 1.6,
+            "dispatches": 72
+          },
+          {
+            "op": "Pad",
+            "ms": 0.396,
+            "pct": 1.2,
+            "dispatches": 48
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.289,
+            "pct": 0.9,
+            "dispatches": 96
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.236,
+            "pct": 0.7,
+            "dispatches": 24
+          },
+          {
+            "op": "MMI_pack",
+            "ms": 0.114,
+            "pct": 0.4,
+            "dispatches": 50
+          },
+          {
+            "op": "relu",
+            "ms": 0.111,
+            "pct": 0.3,
+            "dispatches": 3
+          }
+        ],
+        "compute_ms": 31.855,
+        "sync_ms": 0.618,
+        "flushes": 7,
+        "upload_mb": 0.4,
+        "download_mb": 0.4
+      },
+      "blocks": {
+        "nodes_claimed": 3249,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 16,
+        "sm_pct": {
+          "mean": 26.3,
+          "max": 65.0,
+          "p95": 65.0
+        },
+        "fb_peak_mb": 5189.0,
+        "vram_delta_mb": 2624.0,
+        "vram_idle_mb": 2565,
+        "vram_source": "global-delta",
+        "rss_mb": 1457.0,
+        "cpu_pct": {
+          "mean": 88.2,
+          "max": 319.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "parakeet",
+      "mode": "cpu",
+      "runner": "stt-app",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 700.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": null,
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 300.8,
+        "min": 283.7,
+        "max": 317.4,
+        "iters_used": 19
+      },
+      "cpu_ep_ms": null,
+      "accuracy": {
+        "kind": "transcript",
+        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
+        "expect": "Well, I don't wish to see it any more",
+        "tolerated": true
+      },
+      "reference": null,
+      "gpu": null,
+      "blocks": {},
+      "system": {
+        "samples": 46,
+        "sm_pct": {
+          "mean": 8.4,
+          "max": 26.0,
+          "p95": 26.0
+        },
+        "fb_peak_mb": 2603.0,
+        "vram_delta_mb": 50.0,
+        "vram_idle_mb": 2553,
+        "vram_source": "global-delta",
+        "rss_mb": 806.0,
+        "cpu_pct": {
+          "mean": 504.8,
+          "max": 704.0
+        }
+      },
+      "raw": {
+        "stdout": "cpu.stdout.log",
+        "stats": null,
+        "metrics": "cpu.metrics.csv"
+      }
+    },
+    {
+      "model": "resnet50-qdq-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 25.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 4.6,
+        "min": 4.5,
+        "max": 5.4,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 6.4,
+      "accuracy": {
+        "kind": "argmax",
+        "outputs": [
+          {
+            "output": "resnetv17_dense0_fwd",
+            "worst_abs": 0.0,
+            "mismatches": 0,
+            "argmax_expected": 489,
+            "argmax_got": 489
+          }
+        ],
+        "tolerated": true,
+        "criterion": "argmax equal to the official reference"
+      },
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 2.186,
+            "pct": 62.0,
+            "dispatches": 43
+          },
+          {
+            "op": "Conv",
+            "ms": 0.377,
+            "pct": 10.7,
+            "dispatches": 10
+          },
+          {
+            "op": "DequantizeLinear",
+            "ms": 0.271,
+            "pct": 7.7,
+            "dispatches": 78
+          },
+          {
+            "op": "QuantizeLinear",
+            "ms": 0.258,
+            "pct": 7.3,
+            "dispatches": 74
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.172,
+            "pct": 4.9,
+            "dispatches": 43
+          },
+          {
+            "op": "relu",
+            "ms": 0.06,
+            "pct": 1.7,
+            "dispatches": 16
+          },
+          {
+            "op": "GEMV",
+            "ms": 0.025,
+            "pct": 0.7,
+            "dispatches": 1
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.008,
+            "pct": 0.2,
+            "dispatches": 1
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.008,
+            "pct": 0.2,
+            "dispatches": 1
+          },
+          {
+            "op": "GEMV_reduce",
+            "ms": 0.003,
+            "pct": 0.1,
+            "dispatches": 1
+          }
+        ],
+        "compute_ms": 3.526,
+        "sync_ms": 0.183,
+        "flushes": 2,
+        "upload_mb": 0.6,
+        "download_mb": 0.0
+      },
+      "blocks": {
+        "nodes_claimed": 349,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 3,
+        "sm_pct": {
+          "mean": 4.7,
+          "max": 6.0,
+          "p95": 6.0
+        },
+        "fb_peak_mb": 3126.0,
+        "vram_delta_mb": 520.0,
+        "vram_idle_mb": 2606,
+        "vram_source": "global-delta",
+        "rss_mb": 314.0,
+        "cpu_pct": {
+          "mean": 86.3,
+          "max": 195.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "resnet50-qdq-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "rfdetr",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 5,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 129.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 40.5,
+        "min": 37.5,
+        "max": 40.9,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 364.6,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 0.000184,
+        "outputs": [
+          {
+            "name": "pred_boxes",
+            "n": 1200,
+            "max_abs_delta": 0.0001841,
+            "ref_scale": 1.001,
+            "relative": 0.000184,
+            "mismatches": 0
+          },
+          {
+            "name": "logits",
+            "n": 27300,
+            "max_abs_delta": 0.0001559,
+            "ref_scale": 10.09,
+            "relative": 1.54e-05,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MatMul",
+            "ms": 20.509,
+            "pct": 61.3,
+            "dispatches": 133
+          },
+          {
+            "op": "Softmax",
+            "ms": 2.224,
+            "pct": 6.6,
+            "dispatches": 17
+          },
+          {
+            "op": "Transpose",
+            "ms": 1.862,
+            "pct": 5.6,
+            "dispatches": 83
+          },
+          {
+            "op": "Conv_split",
+            "ms": 1.202,
+            "pct": 3.6,
+            "dispatches": 8
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.526,
+            "pct": 1.6,
+            "dispatches": 37
+          },
+          {
+            "op": "ReduceMean",
+            "ms": 0.462,
+            "pct": 1.4,
+            "dispatches": 18
+          },
+          {
+            "op": "Slice",
+            "ms": 0.327,
+            "pct": 1.0,
+            "dispatches": 34
+          },
+          {
+            "op": "Conv",
+            "ms": 0.189,
+            "pct": 0.6,
+            "dispatches": 1
+          },
+          {
+            "op": "Erf",
+            "ms": 0.172,
+            "pct": 0.5,
+            "dispatches": 11
+          },
+          {
+            "op": "Concat",
+            "ms": 0.147,
+            "pct": 0.4,
+            "dispatches": 37
+          },
+          {
+            "op": "Gather",
+            "ms": 0.041,
+            "pct": 0.1,
+            "dispatches": 7
+          },
+          {
+            "op": "Resize",
+            "ms": 0.041,
+            "pct": 0.1,
+            "dispatches": 1
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.037,
+            "pct": 0.1,
+            "dispatches": 8
+          },
+          {
+            "op": "MatMul16",
+            "ms": 0.035,
+            "pct": 0.1,
+            "dispatches": 2
+          },
+          {
+            "op": "GridSample",
+            "ms": 0.034,
+            "pct": 0.1,
+            "dispatches": 3
+          },
+          {
+            "op": "relu",
+            "ms": 0.032,
+            "pct": 0.1,
+            "dispatches": 8
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.027,
+            "pct": 0.1,
+            "dispatches": 8
+          },
+          {
+            "op": "Where",
+            "ms": 0.02,
+            "pct": 0.1,
+            "dispatches": 2
+          },
+          {
+            "op": "Sqrt",
+            "ms": 0.017,
+            "pct": 0.1,
+            "dispatches": 9
+          },
+          {
+            "op": "ReduceMax",
+            "ms": 0.014,
+            "pct": 0.0,
+            "dispatches": 1
+          },
+          {
+            "op": "Cos",
+            "ms": 0.008,
+            "pct": 0.0,
+            "dispatches": 4
+          },
+          {
+            "op": "ReduceSum",
+            "ms": 0.007,
+            "pct": 0.0,
+            "dispatches": 3
+          },
+          {
+            "op": "Sin",
+            "ms": 0.006,
+            "pct": 0.0,
+            "dispatches": 4
+          },
+          {
+            "op": "Exp",
+            "ms": 0.006,
+            "pct": 0.0,
+            "dispatches": 3
+          }
+        ],
+        "compute_ms": 33.451,
+        "sync_ms": 0.697,
+        "flushes": 9,
+        "upload_mb": 4.1,
+        "download_mb": 0.2
+      },
+      "blocks": {
+        "nodes_claimed": 1069,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 16,
+        "sm_pct": {
+          "mean": 1.9,
+          "max": 7.0,
+          "p95": 7.0
+        },
+        "fb_peak_mb": 3336.0,
+        "vram_delta_mb": 698.0,
+        "vram_idle_mb": 2638,
+        "vram_source": "global-delta",
+        "rss_mb": 687.0,
+        "cpu_pct": {
+          "mean": 335.7,
+          "max": 591.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "rfdetr",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "roberta-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 499.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 3.3,
+        "min": 3.2,
+        "max": 4.1,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 7.7,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 9.05e-07,
+        "outputs": [
+          {
+            "name": "output_1",
+            "n": 768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 11.29,
+            "relative": 3.38e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "output_2",
+            "n": 768,
+            "max_abs_delta": 5.662e-07,
+            "ref_scale": 0.6258,
+            "relative": 9.05e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "output_1",
+                "worst_abs": 9.835e-07,
+                "mismatches": 0,
+                "argmax_expected": 588,
+                "argmax_got": 588
+              },
+              {
+                "output": "output_2",
+                "worst_abs": 3.651e-07,
+                "mismatches": 0,
+                "argmax_expected": 507,
+                "argmax_got": 507
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "output_1",
+                "worst_abs": 3.815e-06,
+                "mismatches": 0,
+                "argmax_expected": 588,
+                "argmax_got": 588
+              },
+              {
+                "output": "output_2",
+                "worst_abs": 7.153e-07,
+                "mismatches": 0,
+                "argmax_expected": 507,
+                "argmax_got": 507
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "GEMV",
+            "ms": 1.011,
+            "pct": 45.5,
+            "dispatches": 72
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.226,
+            "pct": 10.2,
+            "dispatches": 48
+          },
+          {
+            "op": "GEMV_reduce",
+            "ms": 0.209,
+            "pct": 9.4,
+            "dispatches": 72
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.103,
+            "pct": 4.7,
+            "dispatches": 25
+          },
+          {
+            "op": "MatMul16",
+            "ms": 0.1,
+            "pct": 4.5,
+            "dispatches": 24
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.087,
+            "pct": 3.9,
+            "dispatches": 1
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.039,
+            "pct": 1.8,
+            "dispatches": 12
+          },
+          {
+            "op": "Erf",
+            "ms": 0.023,
+            "pct": 1.0,
+            "dispatches": 12
+          },
+          {
+            "op": "Gather",
+            "ms": 0.019,
+            "pct": 0.8,
+            "dispatches": 4
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.002,
+            "pct": 0.1,
+            "dispatches": 1
+          }
+        ],
+        "compute_ms": 2.22,
+        "sync_ms": 0.445,
+        "flushes": 4,
+        "upload_mb": 0.0,
+        "download_mb": 0.0
+      },
+      "blocks": {
+        "nodes_claimed": 636,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 9,
+        "sm_pct": {
+          "mean": 4.6,
+          "max": 24.0,
+          "p95": 24.0
+        },
+        "fb_peak_mb": 3868.0,
+        "vram_delta_mb": 1343.0,
+        "vram_idle_mb": 2525,
+        "vram_source": "global-delta",
+        "rss_mb": 2085.0,
+        "cpu_pct": {
+          "mean": 140.0,
+          "max": 479.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "roberta-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "roberta-seq128",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 499.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 18.6,
+        "min": 17.5,
+        "max": 21.0,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 51.9,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 2.22e-06,
+        "outputs": [
+          {
+            "name": "output_1",
+            "n": 98304,
+            "max_abs_delta": 2.67e-05,
+            "ref_scale": 12.0,
+            "relative": 2.22e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "output_2",
+            "n": 768,
+            "max_abs_delta": 8.345e-07,
+            "ref_scale": 0.5699,
+            "relative": 1.46e-06,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MatMul",
+            "ms": 14.467,
+            "pct": 89.0,
+            "dispatches": 96
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.334,
+            "pct": 2.1,
+            "dispatches": 48
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.211,
+            "pct": 1.3,
+            "dispatches": 12
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.103,
+            "pct": 0.6,
+            "dispatches": 25
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.081,
+            "pct": 0.5,
+            "dispatches": 1
+          },
+          {
+            "op": "Erf",
+            "ms": 0.047,
+            "pct": 0.3,
+            "dispatches": 12
+          },
+          {
+            "op": "Gather",
+            "ms": 0.021,
+            "pct": 0.1,
+            "dispatches": 4
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.002,
+            "pct": 0.0,
+            "dispatches": 1
+          }
+        ],
+        "compute_ms": 16.263,
+        "sync_ms": 0.401,
+        "flushes": 4,
+        "upload_mb": 0.0,
+        "download_mb": 0.4
+      },
+      "blocks": {
+        "nodes_claimed": 636,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 16,
+        "sm_pct": {
+          "mean": 10.2,
+          "max": 92.0,
+          "p95": 92.0
+        },
+        "fb_peak_mb": 4018.0,
+        "vram_delta_mb": 1386.0,
+        "vram_idle_mb": 2632,
+        "vram_source": "global-delta",
+        "rss_mb": 1704.0,
+        "cpu_pct": {
+          "mean": 288.4,
+          "max": 644.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "roberta-seq128",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "yolov4-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 245.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 36.1,
+        "min": 35.1,
+        "max": 39.1,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 171.7,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 4.09e-06,
+        "outputs": [
+          {
+            "name": "Identity:0",
+            "n": 689520,
+            "max_abs_delta": 8.523e-06,
+            "ref_scale": 2.085,
+            "relative": 4.09e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "Identity_1:0",
+            "n": 172380,
+            "max_abs_delta": 4.262e-06,
+            "ref_scale": 2.898,
+            "relative": 1.47e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "Identity_2:0",
+            "n": 43095,
+            "max_abs_delta": 4.008e-06,
+            "ref_scale": 3.109,
+            "relative": 1.29e-06,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "Identity:0",
+                "worst_abs": 4.172e-06,
+                "mismatches": 0,
+                "argmax_expected": 676430,
+                "argmax_got": 676430
+              },
+              {
+                "output": "Identity_1:0",
+                "worst_abs": 2.25e-06,
+                "mismatches": 0,
+                "argmax_expected": 1956,
+                "argmax_got": 1956
+              },
+              {
+                "output": "Identity_2:0",
+                "worst_abs": 1.237e-06,
+                "mismatches": 0,
+                "argmax_expected": 36550,
+                "argmax_got": 36550
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "Identity:0",
+                "worst_abs": 7.629e-06,
+                "mismatches": 0,
+                "argmax_expected": 676430,
+                "argmax_got": 676430
+              },
+              {
+                "output": "Identity_1:0",
+                "worst_abs": 4.768e-06,
+                "mismatches": 0,
+                "argmax_expected": 1956,
+                "argmax_got": 1956
+              },
+              {
+                "output": "Identity_2:0",
+                "worst_abs": 3.532e-06,
+                "mismatches": 0,
+                "argmax_expected": 36550,
+                "argmax_got": 36550
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 10.815,
+            "pct": 56.3,
+            "dispatches": 78
+          },
+          {
+            "op": "Conv",
+            "ms": 3.87,
+            "pct": 20.1,
+            "dispatches": 32
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.39,
+            "pct": 2.0,
+            "dispatches": 72
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.36,
+            "pct": 1.9,
+            "dispatches": 78
+          },
+          {
+            "op": "Log",
+            "ms": 0.358,
+            "pct": 1.9,
+            "dispatches": 72
+          },
+          {
+            "op": "Exp",
+            "ms": 0.347,
+            "pct": 1.8,
+            "dispatches": 72
+          },
+          {
+            "op": "Concat",
+            "ms": 0.141,
+            "pct": 0.7,
+            "dispatches": 31
+          },
+          {
+            "op": "LeakyRelu",
+            "ms": 0.096,
+            "pct": 0.5,
+            "dispatches": 35
+          },
+          {
+            "op": "Slice",
+            "ms": 0.091,
+            "pct": 0.5,
+            "dispatches": 9
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.062,
+            "pct": 0.3,
+            "dispatches": 4
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.061,
+            "pct": 0.3,
+            "dispatches": 3
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.014,
+            "pct": 0.1,
+            "dispatches": 6
+          },
+          {
+            "op": "Resize",
+            "ms": 0.008,
+            "pct": 0.0,
+            "dispatches": 2
+          }
+        ],
+        "compute_ms": 19.219,
+        "sync_ms": 7.856,
+        "flushes": 4,
+        "upload_mb": 2.1,
+        "download_mb": 3.6
+      },
+      "blocks": {
+        "nodes_claimed": 589,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 30,
+        "sm_pct": {
+          "mean": 12.9,
+          "max": 84.0,
+          "p95": 78.0
+        },
+        "fb_peak_mb": 3876.0,
+        "vram_delta_mb": 1304.0,
+        "vram_idle_mb": 2572,
+        "vram_source": "global-delta",
+        "rss_mb": 1037.0,
+        "cpu_pct": {
+          "mean": 430.4,
+          "max": 662.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "yolov4-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "yolov8n",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 50,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 13.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 7.3,
+        "min": 6.7,
+        "max": 9.3,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 25.6,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 7.65e-07,
+        "outputs": [
+          {
+            "name": "output0",
+            "n": 705600,
+            "max_abs_delta": 0.0004883,
+            "ref_scale": 637.9,
+            "relative": 7.65e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 1.965,
+            "pct": 40.3,
+            "dispatches": 41
+          },
+          {
+            "op": "Conv",
+            "ms": 1.29,
+            "pct": 26.5,
+            "dispatches": 21
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.367,
+            "pct": 7.5,
+            "dispatches": 1
+          },
+          {
+            "op": "Slice",
+            "ms": 0.191,
+            "pct": 3.9,
+            "dispatches": 20
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.171,
+            "pct": 3.5,
+            "dispatches": 58
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.17,
+            "pct": 3.5,
+            "dispatches": 41
+          },
+          {
+            "op": "Concat",
+            "ms": 0.166,
+            "pct": 3.4,
+            "dispatches": 51
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.026,
+            "pct": 0.5,
+            "dispatches": 1
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.018,
+            "pct": 0.4,
+            "dispatches": 3
+          },
+          {
+            "op": "Conv16",
+            "ms": 0.015,
+            "pct": 0.3,
+            "dispatches": 2
+          },
+          {
+            "op": "Resize",
+            "ms": 0.013,
+            "pct": 0.3,
+            "dispatches": 2
+          }
+        ],
+        "compute_ms": 4.873,
+        "sync_ms": 0.361,
+        "flushes": 2,
+        "upload_mb": 4.9,
+        "download_mb": 2.8
+      },
+      "blocks": {
+        "nodes_claimed": 233,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 12,
+        "sm_pct": {
+          "mean": 36.8,
+          "max": 44.0,
+          "p95": 44.0
+        },
+        "fb_peak_mb": 2961.0,
+        "vram_delta_mb": 328.0,
+        "vram_idle_mb": 2633,
+        "vram_source": "global-delta",
+        "rss_mb": 292.0,
+        "cpu_pct": {
+          "mean": 361.8,
+          "max": 605.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "yolov8n",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    }
+  ]
+}

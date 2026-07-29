@@ -61,6 +61,14 @@ use crate::shaders::matmul_integer::{
     TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
+use crate::shaders::attention::{
+    OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
+    PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
+    PACK_PUSH_BYTES as ATTN_PACK_PUSH_BYTES, PAST as ATTN_PAST,
+    PAST_BINDINGS as ATTN_PAST_BINDINGS, PAST_PUSH_BYTES as ATTN_PAST_PUSH_BYTES,
+    SCORES as ATTN_SCORES, SCORES_BINDINGS as ATTN_SCORES_BINDINGS,
+    SCORES_PUSH_BYTES as ATTN_SCORES_PUSH_BYTES, WG as ATTN_WG,
+};
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
     PAD_BINDINGS, PAD_PUSH_BYTES, SLICE, SLICE_BINDINGS, SLICE_PUSH_BYTES,
@@ -111,6 +119,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "Softmax"
             | "LayerNormalization"
             | "SimplifiedLayerNormalization"
+            | "GroupQueryAttention"
             | "Cast"
             | "Mul"
             | "Add"
@@ -228,6 +237,33 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         // leave a value undefined
         "SimplifiedLayerNormalization" => {
             node.outputs.iter().filter(|o| !o.is_empty()).count() == 1
+        }
+        // the kernel covers the shape gemma3 and qwen2.5-VL export and nothing
+        // more: separate Q/K/V (not packed), half-split rotary, no attention
+        // softcap, and the KV cache written out of place, which needs both
+        // `present_*` outputs to exist
+        "GroupQueryAttention" => {
+            let float_attr = |name: &str, default: f32| {
+                node.attrs
+                    .get(name)
+                    .and_then(AttrValue::as_f32)
+                    .unwrap_or(default)
+            };
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            let rotary = int_attr("do_rotary", 0) != 0;
+            float_attr("softcap", 0.0) == 0.0
+                && int_attr("rotary_interleaved", 0) == 0
+                // ONNX Runtime hands the EP `smooth_softmax = -1` on a node
+                // whose file carries no such attribute, so a negative value is
+                // its "unset" marker and only a positive one means enabled
+                && int_attr("smooth_softmax", 0) <= 0
+                && present(1)
+                && present(2)
+                && present(3)
+                && present(4)
+                && (!rotary || (present(7) && present(8)))
+                && node.outputs.len() == 3
+                && node.outputs.iter().all(|o| !o.is_empty())
         }
         // only the form with `axes` as an attribute and a single axis: with axes
         // as input the value is not known when looking at the node
@@ -361,6 +397,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Softmax" => softmax(env, node),
         "LayerNormalization" => layernorm(env, node, false),
         "SimplifiedLayerNormalization" => layernorm(env, node, true),
+        "GroupQueryAttention" => group_query_attention(env, node),
         "Cast" => cast(env, node),
         "Mul" => elementwise_binary(env, node, "a[off_a] * b[off_b]", BinOp::Mul),
         "Add" => elementwise_binary(env, node, "a[off_a] + b[off_b]", BinOp::Add),
@@ -3390,6 +3427,327 @@ fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
             elem_count,
             buf: BufRef::Owned(out),
         }),
+    );
+    Ok(())
+}
+
+/// Workgroups for a flat `count` of threads, folded into 2D because `count`
+/// over the scores tensor easily exceeds 65535 workgroups on one axis.
+/// Returns the grid and its `x` extent, which the shader needs to unfold it.
+fn attn_grid(count: usize) -> ([u32; 3], u32) {
+    let groups = count.div_ceil(ATTN_WG as usize) as u32;
+    let gx = groups.clamp(1, 32768);
+    ([gx, groups.div_ceil(gx), 1], gx)
+}
+
+/// `GroupQueryAttention` (com.microsoft), 26 nodes of gemma3-1b.
+///
+/// Stateless by construction: `present_*` is a fresh tensor holding a copy of
+/// `past_*` plus the new step, so the node is a pure function of its inputs and
+/// can be diffed node by node against the CPU EP. The cache copy it pays for is
+/// the generation runtime's problem, not the kernel's.
+///
+/// `seqlens_k` and `total_sequence_length` are **not read**: the lengths follow
+/// from the shapes of `past_key` and `key`, which is equivalent as long as
+/// every sequence in the batch has the same length. That holds trivially at
+/// `b = 1` and cannot be checked without a readback otherwise, so `b > 1` is
+/// refused rather than guessed.
+fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let int_attr = |name: &str, default: i64| {
+        node.attrs
+            .get(name)
+            .and_then(AttrValue::as_i64)
+            .unwrap_or(default)
+    };
+    let nh = int_attr("num_heads", 0).max(0) as usize;
+    let kvh = int_attr("kv_num_heads", 0).max(0) as usize;
+    ensure!(
+        nh > 0 && kvh > 0 && nh.is_multiple_of(kvh),
+        "GroupQueryAttention: num_heads {nh} is not a multiple of kv_num_heads {kvh}"
+    );
+    let do_rotary = int_attr("do_rotary", 0) != 0;
+    let window = int_attr("local_window_size", -1);
+    let has_bias = node.inputs.len() > 10 && !node.inputs[10].is_empty();
+
+    let ctx = env.context();
+    for index in 0..5 {
+        env.ensure_device(&node.inputs[index])?;
+    }
+    if do_rotary {
+        env.ensure_device(&node.inputs[7])?;
+        env.ensure_device(&node.inputs[8])?;
+    }
+    if has_bias {
+        env.ensure_device(&node.inputs[10])?;
+    }
+
+    let q = env.device(&node.inputs[0])?;
+    let k = env.device(&node.inputs[1])?;
+    let v = env.device(&node.inputs[2])?;
+    let past_k = env.device(&node.inputs[3])?;
+    let past_v = env.device(&node.inputs[4])?;
+    ensure!(
+        q.shape.len() == 3 && k.shape.len() == 3 && v.shape.len() == 3,
+        "GroupQueryAttention: query/key/value must be [batch, seq, hidden]"
+    );
+    ensure!(
+        past_k.shape.len() == 4 && past_v.shape == past_k.shape,
+        "GroupQueryAttention: past_key/past_value must be [batch, kv_heads, past, head_size]"
+    );
+    let b = q.shape[0].max(0) as usize;
+    ensure!(
+        b == 1,
+        "GroupQueryAttention: batch {b} > 1 would need the per-sequence lengths in seqlens_k"
+    );
+    let s = q.shape[1].max(0) as usize;
+    let head_size = k.shape[2].max(0) as usize / kvh;
+    ensure!(
+        head_size > 0 && q.shape[2].max(0) as usize == nh * head_size && k.shape == v.shape,
+        "GroupQueryAttention: hidden sizes {:?}/{:?} disagree with {nh}/{kvh} heads",
+        q.shape,
+        k.shape
+    );
+    let past = past_k.shape[2].max(0) as usize;
+    ensure!(
+        past_k.shape[1].max(0) as usize == kvh && past_k.shape[3].max(0) as usize == head_size,
+        "GroupQueryAttention: past cache {:?} disagrees with {kvh} heads of {head_size}",
+        past_k.shape
+    );
+    let total = past + s;
+    let scale = match node.attrs.get("scale").and_then(AttrValue::as_f32) {
+        Some(scale) if scale != 0.0 => scale,
+        _ => 1.0 / (head_size as f32).sqrt(),
+    };
+
+    let (cos, sin) = if do_rotary {
+        (env.device(&node.inputs[7])?, env.device(&node.inputs[8])?)
+    } else {
+        (q, q)
+    };
+    let rot_half = if do_rotary {
+        let half = (*cos.shape.last().unwrap_or(&0)).max(0) as usize;
+        ensure!(
+            half * 2 == head_size && cos.shape == sin.shape,
+            "GroupQueryAttention: rotary width {} != head size {head_size}",
+            half * 2
+        );
+        half
+    } else {
+        0
+    };
+    let bias = if has_bias {
+        env.device(&node.inputs[10])?
+    } else {
+        q
+    };
+
+    let alloc = |elems: usize| ctx.create_storage_buffer((elems.max(1) * 4) as u64);
+    let present_k = alloc(b * kvh * total * head_size)?;
+    let present_v = alloc(b * kvh * total * head_size)?;
+    let q_rot = alloc(b * nh * s * head_size)?;
+    let scores = alloc(b * nh * s * total)?;
+    let probs = alloc(b * nh * s * total)?;
+    let out = alloc(b * s * nh * head_size)?;
+
+    // 1) past cache into the head of `present`
+    let past_count = b * kvh * past * head_size;
+    if past_count > 0 {
+        let (grid, gx) = attn_grid(past_count);
+        let mut push = Vec::with_capacity(ATTN_PAST_PUSH_BYTES as usize);
+        for value in [
+            past_count as u32,
+            past as u32,
+            total as u32,
+            head_size as u32,
+            gx,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        for (src, dst) in [(past_k, &present_k), (past_v, &present_v)] {
+            with_pipeline(
+                env.cache(),
+                "GQA_past",
+                || {
+                    ctx.create_pipeline(
+                        &compile_wgsl(ATTN_PAST)?,
+                        ATTN_PAST_BINDINGS,
+                        ATTN_PAST_PUSH_BYTES,
+                    )
+                },
+                |pipe| ctx.stream_dispatch(pipe, &[src.buffer(), dst], &push, grid),
+            )?;
+        }
+    }
+
+    // 2) rotary and head-major layout: query into its own buffer, key and value
+    //    appended to the cache at time offset `past`
+    let pack = |cache: &KernelCache<'_>,
+                x: &GpuBuffer,
+                dst: &GpuBuffer,
+                n: usize,
+                dst_len: usize,
+                dst_off: usize,
+                rotary: bool|
+     -> Result<()> {
+        let count = b * s * n * head_size;
+        if count == 0 {
+            return Ok(());
+        }
+        let (grid, gx) = attn_grid(count);
+        let mut push = Vec::with_capacity(ATTN_PACK_PUSH_BYTES as usize);
+        for value in [
+            count as u32,
+            s as u32,
+            n as u32,
+            head_size as u32,
+            dst_len as u32,
+            dst_off as u32,
+            past as u32,
+            rot_half as u32,
+            u32::from(rotary),
+            gx,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        with_pipeline(
+            cache,
+            "GQA_pack",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ATTN_PACK)?,
+                    ATTN_PACK_BINDINGS,
+                    ATTN_PACK_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[x, cos.buffer(), sin.buffer(), dst],
+                    &push,
+                    grid,
+                )
+            },
+        )
+    };
+    pack(env.cache(), q.buffer(), &q_rot, nh, s, 0, do_rotary)?;
+    pack(env.cache(), k.buffer(), &present_k, kvh, total, past, do_rotary)?;
+    pack(env.cache(), v.buffer(), &present_v, kvh, total, past, false)?;
+
+    let score_count = b * nh * s * total;
+    if score_count > 0 {
+        // 3) masked scores
+        let (grid, gx) = attn_grid(score_count);
+        let mut push = Vec::with_capacity(ATTN_SCORES_PUSH_BYTES as usize);
+        for value in [
+            score_count as u32,
+            nh as u32,
+            kvh as u32,
+            head_size as u32,
+            s as u32,
+            total as u32,
+            past as u32,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        push.extend_from_slice(&scale.to_le_bytes());
+        push.extend_from_slice(&(window.clamp(-1, i32::MAX as i64) as i32).to_le_bytes());
+        push.extend_from_slice(&u32::from(has_bias).to_le_bytes());
+        push.extend_from_slice(&gx.to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "GQA_scores",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ATTN_SCORES)?,
+                    ATTN_SCORES_BINDINGS,
+                    ATTN_SCORES_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[&q_rot, &present_k, bias.buffer(), &scores],
+                    &push,
+                    grid,
+                )
+            },
+        )?;
+
+        // 4) softmax over the key axis — the row kernel, with its own Pareto key
+        let rows = b * nh * s;
+        let sgx = rows.clamp(1, 32768) as u32;
+        let sgy = (rows as u32).div_ceil(sgx);
+        let mut push = Vec::with_capacity(SOFTMAX_PUSH_BYTES as usize);
+        for value in [total as u32, 1, rows as u32, sgx] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "GQA_softmax",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(SOFTMAX)?,
+                    SOFTMAX_BINDINGS,
+                    SOFTMAX_PUSH_BYTES,
+                )
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[&scores, &probs], &push, [sgx, sgy, 1]),
+        )?;
+
+        // 5) probabilities against the value cache, back to [batch, seq, hidden]
+        let out_count = b * s * nh * head_size;
+        let (grid, gx) = attn_grid(out_count);
+        let mut push = Vec::with_capacity(ATTN_OUT_PUSH_BYTES as usize);
+        for value in [
+            out_count as u32,
+            nh as u32,
+            kvh as u32,
+            head_size as u32,
+            s as u32,
+            total as u32,
+            gx,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "GQA_out",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ATTN_OUT)?,
+                    ATTN_OUT_BINDINGS,
+                    ATTN_OUT_PUSH_BYTES,
+                )
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[&probs, &present_v, &out], &push, grid),
+        )?;
+    }
+
+    let device = |shape: Vec<i64>, buf: GpuBuffer| {
+        let elem_count = shape.iter().map(|d| (*d).max(0) as usize).product();
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(buf),
+        })
+    };
+    let (b, s, nh, kvh, total, head_size) = (
+        b as i64,
+        s as i64,
+        nh as i64,
+        kvh as i64,
+        total as i64,
+        head_size as i64,
+    );
+    env.set(&node.outputs[0], device(vec![b, s, nh * head_size], out));
+    env.set(
+        &node.outputs[1],
+        device(vec![b, kvh, total, head_size], present_k),
+    );
+    env.set(
+        &node.outputs[2],
+        device(vec![b, kvh, total, head_size], present_v),
     );
     Ok(())
 }

@@ -111,6 +111,13 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         // kernel materializes would put a 4-bit LLM above the card's bandwidth.
         "MatMul" | "MatMulInteger" | "Gemm" | "MatMulNBits" => matmul_flops(node, meta)?,
         "Conv" | "ConvInteger" | "ConvTranspose" => conv_flops(node, meta)?,
+        // two matmuls of `total` contracted elements each -- `q·kᵀ` and
+        // `probs·v` -- over every element of the output. `total` is the time
+        // extent of `present_key`, i.e. past plus the new step.
+        "GroupQueryAttention" => {
+            let present = meta.shape(node.outputs.get(1)?)?;
+            4 * out_elems()? * (*present.get(2)?).max(0) as u64
+        }
         // per-element counts, approximate by construction (see the module doc):
         // an `exp` is not one flop and a `Div` is not one either, but the
         // column that matters for these is `gb_s`

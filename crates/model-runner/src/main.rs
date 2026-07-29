@@ -7,7 +7,7 @@
 //! well or poorly does not matter: two EPs are compared, not two models.
 //!
 //! ```text
-//! model-runner <model.onnx> [--dim NAME=N] [--iters N] [--tol F] [--seed S]
+//! model-runner <model.onnx> [--dim NAME=N] [--fill NAME=V] [--iters N] [--tol F] [--seed S]
 //! ```
 //!
 //! Dynamic dimensions default to 1 if not specified with `--dim`.
@@ -61,6 +61,12 @@ struct Args {
     /// agree" but "is the answer the right one". The expected values come from
     /// the model's authors.
     reference: Option<PathBuf>,
+    /// `--fill NAME=V`: fill that input with the constant `V` instead of random
+    /// values. Some inputs are not free variables: an `attention_mask` of random
+    /// integers makes ONNX Runtime's own `GroupQueryAttention` reject the run
+    /// (`seqlens_k` is derived from its sum), so the model cannot be validated
+    /// at all until the mask is a mask.
+    fill: HashMap<String, i64>,
     /// `--standalone`: also run the graph through the `onnx-vulkan` facade —
     /// same kernels, same rewrites, but the IR comes from our own parser
     /// instead of `OrtGraph`, and nothing is dispatched by ORT.
@@ -90,6 +96,7 @@ fn parse_args() -> Result<Args> {
         seed: 42,
         mem_pattern: true,
         reference: None,
+        fill: HashMap::new(),
         standalone: false,
     };
     while let Some(flag) = args.next() {
@@ -116,6 +123,10 @@ fn parse_args() -> Result<Args> {
             "--dim" => {
                 let (name, n) = value.split_once('=').context("--dim expects NAME=N")?;
                 out.dims.insert(name.to_string(), n.parse()?);
+            }
+            "--fill" => {
+                let (name, constant) = value.split_once('=').context("--fill expects NAME=V")?;
+                out.fill.insert(name.to_string(), constant.parse()?);
             }
             "--iters" => out.iters = value.parse::<usize>()?.max(1),
             "--tol" => out.tol = value.parse()?,
@@ -180,7 +191,12 @@ impl Rng {
 /// plausible values for the dtype. Integers stay small: they often serve as
 /// indices (token id, position) and large values would make the model fail for
 /// reasons unrelated to the EP.
-fn make_input(ty: &ValueType, dims: &HashMap<String, i64>, rng: &mut Rng) -> Result<Value> {
+fn make_input(
+    ty: &ValueType,
+    dims: &HashMap<String, i64>,
+    constant: Option<i64>,
+    rng: &mut Rng,
+) -> Result<Value> {
     let ValueType::Tensor {
         ty,
         shape,
@@ -203,21 +219,27 @@ fn make_input(ty: &ValueType, dims: &HashMap<String, i64>, rng: &mut Rng) -> Res
     let n: usize = shape.iter().product();
 
     Ok(match ty {
-        TensorElementType::Float32 => {
-            Tensor::from_array((shape, (0..n).map(|_| rng.next_f32()).collect::<Vec<f32>>()))?
-                .into_dyn()
-        }
+        TensorElementType::Float32 => Tensor::from_array((
+            shape,
+            (0..n)
+                .map(|_| match constant {
+                    Some(c) => c as f32,
+                    None => rng.next_f32(),
+                })
+                .collect::<Vec<f32>>(),
+        ))?
+        .into_dyn(),
         TensorElementType::Int64 => Tensor::from_array((
             shape,
             (0..n)
-                .map(|_| rng.next_below(64) as i64)
+                .map(|_| constant.unwrap_or_else(|| rng.next_below(64) as i64))
                 .collect::<Vec<_>>(),
         ))?
         .into_dyn(),
         TensorElementType::Int32 => Tensor::from_array((
             shape,
             (0..n)
-                .map(|_| rng.next_below(64) as i32)
+                .map(|_| constant.unwrap_or_else(|| rng.next_below(64) as i64) as i32)
                 .collect::<Vec<_>>(),
         ))?
         .into_dyn(),
@@ -645,7 +667,12 @@ fn main() -> Result<()> {
             .inputs
             .iter()
             .map(|input| {
-                let value = make_input(&input.input_type, &args.dims, &mut rng)
+                let value = make_input(
+                    &input.input_type,
+                    &args.dims,
+                    args.fill.get(&input.name).copied(),
+                    &mut rng,
+                )
                     .with_context(|| format!("input '{}'", input.name))?;
                 let ValueType::Tensor { shape, .. } = value.dtype() else {
                     unreachable!("make_input produces tensors")

@@ -132,6 +132,25 @@ def _gelu_ok(node, _consts) -> bool:
     return (v.decode() if isinstance(v, bytes) else v) in {"none", "tanh"}
 
 
+def _simplified_layernorm_ok(node, _consts) -> bool:
+    # the optional second output `inv_std_var` is not produced
+    return len([o for o in node.output if o]) == 1
+
+
+def _gqa_ok(node, _consts) -> bool:
+    present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
+    rotary = _attr(node, "do_rotary", 0) != 0
+    return (
+        _attr(node, "softcap", 0.0) == 0.0
+        and _attr(node, "rotary_interleaved", 0) == 0
+        and _attr(node, "smooth_softmax", 0) <= 0
+        and all(present(i) for i in (1, 2, 3, 4))
+        and (not rotary or (present(7) and present(8)))
+        and len(node.output) == 3
+        and all(o != "" for o in node.output)
+    )
+
+
 #: Per-node constraints, mirroring the arms of `is_implemented_node`.
 NODE_RULES = {
     "Resize": _resize_ok,
@@ -147,6 +166,8 @@ NODE_RULES = {
     "GridSample": _grid_sample_ok,
     "ScatterND": _scatter_nd_ok,
     "Gelu": _gelu_ok,
+    "SimplifiedLayerNormalization": _simplified_layernorm_ok,
+    "GroupQueryAttention": _gqa_ok,
 }
 
 
@@ -201,8 +222,12 @@ def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
         for node in graph.node:
             name = node.op_type if not node.domain else f"{node.domain}::{node.op_type}"
             counts[name] += 1
-            rule = NODE_RULES.get(name) if not node.domain else None
-            if name not in known:
+            # coverage is decided on the bare op name, domain included in the
+            # display only: `is_implemented` matches `node.op` and never looks
+            # at the domain, so a contrib op we implement (`GroupQueryAttention`)
+            # must count as covered here too
+            rule = NODE_RULES.get(node.op_type)
+            if node.op_type not in known:
                 missing[name] += 1
             elif rule is not None and not rule(node, consts):
                 # known name but non-claimable node: counts as a gap, and is

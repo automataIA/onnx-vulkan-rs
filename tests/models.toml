@@ -122,7 +122,20 @@ instrument = { from = 70, every = 1, limit = 70 }
 name = "gemma3-1b"
 path = "models/zoo/gemma3-1b/model_q4.onnx"
 runner = "model-runner"
-args = []
+# a decode step: one new token against 127 cached ones. The three dimensions
+# are not independent -- `total = past + sequence` -- and pinning them apart
+# makes `GroupQueryAttention` reject the run inside ONNX Runtime itself.
+# `attention_mask` is not a free variable either: `seqlens_k` is derived from
+# its sum, so random values are not a mask. `--tol` lifts the absolute floor,
+# calibrated for outputs of order 1, to something an int4 model with logits of
+# order 35 can meet; the relative tolerance stays at its default 1e-3.
+args = [
+    "--dim", "past_sequence_length=127",
+    "--dim", "sequence_length=1",
+    "--dim", "total_sequence_length=128",
+    "--fill", "attention_mask=1",
+    "--tol", "1e-2",
+]
 iters = 3
 default = false
 validate = "outputs"

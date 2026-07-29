@@ -127,6 +127,11 @@ def _scatter_nd_ok(node, _consts) -> bool:
     return (v.decode() if isinstance(v, bytes) else v) == "none"
 
 
+def _gelu_ok(node, _consts) -> bool:
+    v = _attr(node, "approximate", "none")
+    return (v.decode() if isinstance(v, bytes) else v) in {"none", "tanh"}
+
+
 #: Per-node constraints, mirroring the arms of `is_implemented_node`.
 NODE_RULES = {
     "Resize": _resize_ok,
@@ -141,6 +146,7 @@ NODE_RULES = {
     "ReduceMin": _one_axis,
     "GridSample": _grid_sample_ok,
     "ScatterND": _scatter_nd_ok,
+    "Gelu": _gelu_ok,
 }
 
 

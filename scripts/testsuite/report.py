@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import peaks as peaks_mod  # noqa: E402
 
 GATE_PERF_DEFAULT = 10.0  # tolerated worsening on the median wall time, %
 
@@ -123,6 +128,7 @@ def markdown(summary: dict) -> str:
         "(`test_data_set_*`), with ✓ if the backend reproduces it exactly and `~` if it",
         "reproduces the class but not the values (see docs/testsuite.md).",
     ]
+    notes += roofline_table(summary)
     invalid = sorted({r["model"] for r in summary["results"] if r.get("perf_valid") is False})
     if invalid:
         notes.append(
@@ -131,8 +137,95 @@ def markdown(summary: dict) -> str:
     return "\n".join(head + rows + notes) + "\n"
 
 
+def roofline_table(summary: dict) -> list[str]:
+    """Roofline of the Pareto head, one row per job that has one.
+
+    Its purpose is to answer "is this kernel worth touching" before anyone
+    touches it: `class` names the roof that binds and `efficiency` how far the
+    kernel is from it. A `memory` head near 100% of bandwidth is finished work;
+    a `latency` head is starved of parallelism and the lever is the grid, not
+    the tile (`plan.md` §9.3).
+    """
+    rows = []
+    skipped = 0
+    for r in summary["results"]:
+        if r.get("status") == "skip":
+            continue
+        pareto = (r.get("gpu") or {}).get("pareto") or []
+        head = pareto[0] if pareto else {}
+        if "class" not in head:
+            continue
+        # a Roofline needs a device the peaks describe: on a software
+        # rasterizer every kernel classifies `latency` and says nothing
+        if r.get("perf_valid") is False:
+            skipped += 1
+            continue
+        rows.append(
+            "| {model} | {mode} | {op} | {ms} | {gflops} | {gbs} | {ai} | {pc}/{pb} | {cls} |".format(
+                model=r["model"],
+                mode=r["mode"],
+                op=head["op"],
+                ms=fmt(head.get("ms"), ".3f"),
+                gflops=fmt(head.get("gflops") / 1e3 if head.get("gflops") else None, ".2f"),
+                gbs=fmt(head.get("gb_s"), ".0f"),
+                ai=fmt(head.get("intensity"), ".2f"),
+                pc=fmt(head.get("pct_peak_compute"), ".0f"),
+                pb=fmt(head.get("pct_peak_bw"), ".0f"),
+                cls=head.get("class", "—"),
+            )
+        )
+    if not rows:
+        return (
+            ["", f"Roofline: {skipped} job(s) had one, all on a non-benchmarkable device."]
+            if skipped
+            else []
+        )
+    peaks = next((r.get("peaks") for r in summary["results"] if r.get("peaks")), {}) or {}
+    return [
+        "",
+        "## Roofline (Pareto head)",
+        "",
+        f"Peaks: {peaks.get('peak_tflops_fp32', '?')} TFLOP/s fp32, "
+        f"{peaks.get('peak_gb_s', '?')} GB/s → ridge "
+        f"{peaks_mod.ridge(peaks):.1f} FLOP/B." if peaks else "",
+        "FLOPs are analytic; bytes are **compulsory** traffic (each tensor once),",
+        "so a percentage is distance from the best any implementation could do.",
+        "",
+        "| model | mode | op | ms | TFLOP/s | GB/s | FLOP/B | % peak c/b | class |",
+        "|---|---|---|---|---|---|---|---|---|",
+        *rows,
+    ]
+
+
 def key(r: dict) -> tuple[str, str]:
     return (r["model"], r["mode"])
+
+
+def parity_failures(summary: dict) -> list[str]:
+    """Standalone-vs-EP parity, checked **without** a baseline.
+
+    Every other gate is a comparison against a previous run, because it asks
+    whether something got worse. This one is absolute: the two hosts run the
+    same kernels over the same graph, so their outputs are identical or one of
+    them is wrong. There is no tolerance to spend and no baseline to promote.
+    """
+    failures = []
+    for r in summary["results"]:
+        if r.get("mode") != "standalone" or r.get("status") == "skip":
+            continue
+        tag = f"{r['model']}/standalone"
+        parity = r.get("parity")
+        if not parity or not parity.get("outputs"):
+            # a mode whose only verdict is missing must fail, not pass quietly
+            failures.append(f"parity: {tag} produced no standalone-vs-EP comparison")
+            continue
+        if not parity.get("bit_exact"):
+            worst = max(o["max_abs_delta"] for o in parity["outputs"])
+            failures.append(
+                f"parity: {tag} standalone and EP disagree (max|Δ|={worst:.3e}, "
+                f"relative={parity.get('vs_ep')}) — same kernels, so one path is wrong"
+            )
+    return failures
 
 
 def gate(summary: dict, baseline: dict) -> list[str]:
@@ -203,10 +296,94 @@ def gate(summary: dict, baseline: dict) -> list[str]:
     return failures
 
 
+TSV_COLUMNS = (
+    "when",
+    "commit",
+    "tag",
+    "model",
+    "mode",
+    "wall_ms",
+    "compute_ms",
+    "target_op",
+    "target_ms",
+    "blocks",
+    "flushes",
+    "status",
+    "description",
+)
+
+
+def target_op(result: dict) -> tuple[str | None, float | None]:
+    """The op the experiment is judged on.
+
+    Default is the Pareto head, because the head is what moves a model and it
+    *changes* as kernels are optimized — pinning it in the manifest would mean
+    editing the manifest every time an optimization succeeds. `TESTSUITE_TARGET_OP`
+    overrides it while hunting a specific op that is not (or no longer) the head.
+    """
+    pareto = (result.get("gpu") or {}).get("pareto") or []
+    if not pareto:
+        return None, None
+    wanted = os.environ.get("TESTSUITE_TARGET_OP")
+    if wanted:
+        entry = next((e for e in pareto if e.get("op") == wanted), None)
+        # asked for an op this model does not run: report the miss as a zero,
+        # not as the head, or the loop would compare two different ops
+        return (wanted, entry["ms"] if entry else 0.0)
+    head = pareto[0]
+    return head.get("op"), head.get("ms")
+
+
+def append_tsv(path: Path, summary: dict, description: str, tag: str) -> int:
+    """One line per job, appended to a file that outlives `--keep` rotation.
+
+    This is the loop's history: `runs/<tag>/` is deleted after N runs, so the
+    log cannot live inside it (AutoKernel's `results.tsv`, `plan.md` §9.5 P0).
+    """
+    env = summary.get("env") or {}
+    rows = []
+    for r in summary["results"]:
+        wall = r.get("wall_ms") or {}
+        gpu = r.get("gpu") or {}
+        blocks = r.get("blocks") or {}
+        op, op_ms = target_op(r)
+        rows.append(
+            {
+                "when": env.get("when", ""),
+                "commit": (env.get("commit", "") or "") + ("+dirty" if env.get("dirty") else ""),
+                "tag": tag,
+                "model": r.get("model", ""),
+                "mode": r.get("mode", ""),
+                "wall_ms": fmt(wall.get("median"), ".3f", ""),
+                "compute_ms": fmt(gpu.get("compute_ms"), ".3f", ""),
+                "target_op": op or "",
+                "target_ms": fmt(op_ms, ".3f", ""),
+                "blocks": fmt(blocks.get("convex_blocks"), "d", ""),
+                "flushes": fmt(gpu.get("flushes"), "d", ""),
+                "status": r.get("status") or ("ok" if r.get("ok") else "KO"),
+                "description": description,
+            }
+        )
+    new = not path.exists()
+    with path.open("a", encoding="utf-8") as fh:
+        if new:
+            fh.write("\t".join(TSV_COLUMNS) + "\n")
+        for row in rows:
+            # tabs and newlines in a free-text description would break the format
+            fh.write("\t".join(str(row[c]).replace("\t", " ").replace("\n", " ") for c in TSV_COLUMNS) + "\n")
+    return len(rows)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run_dir", type=Path)
     ap.add_argument("--baseline", type=Path)
+    ap.add_argument("--desc", default="", help="description recorded in results.tsv")
+    ap.add_argument(
+        "--results-tsv",
+        type=Path,
+        help="append one line per job here (default: <run_dir>/../results.tsv)",
+    )
     args = ap.parse_args()
 
     summary = collect(args.run_dir)
@@ -217,9 +394,30 @@ def main() -> int:
     (args.run_dir / "summary.md").write_text(md, encoding="utf-8")
     print(md)
 
+    tsv = args.results_tsv or (args.run_dir.parent / "results.tsv")
+    # resolved: invoked on `runs/latest` the tag would otherwise be recorded as
+    # "latest", and a row that cannot name its run directory is not history
+    tag = args.run_dir.resolve().name
+    n = append_tsv(tsv, summary, args.desc or tag, tag)
+    print(f"\n{n} line(s) appended to {tsv}")
+
     failed = [r for r in summary["results"] if not r.get("ok") and r.get("status") != "skip"]
     if failed:
         print("failed runs: " + ", ".join(f"{r['model']}/{r['mode']}" for r in failed))
+
+    # absolute, so it runs with or without a baseline
+    parity = parity_failures(summary)
+    if parity:
+        print("\n## Standalone parity\n")
+        for v in parity:
+            print(f"- ✗ {v}")
+    elif any(r.get("mode") == "standalone" for r in summary["results"]):
+        n = sum(
+            1
+            for r in summary["results"]
+            if r.get("mode") == "standalone" and (r.get("parity") or {}).get("bit_exact")
+        )
+        print(f"\n## Standalone parity\n\n- ✓ {n} model(s) bit-exact against the EP")
 
     if args.baseline:
         if not args.baseline.exists():
@@ -232,7 +430,7 @@ def main() -> int:
                 print(f"- ✗ {v}")
             return 1
         print("- ✓ no regression against the baseline")
-    return 1 if failed else 0
+    return 1 if (failed or parity) else 0
 
 
 if __name__ == "__main__":

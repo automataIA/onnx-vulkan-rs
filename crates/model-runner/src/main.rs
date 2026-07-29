@@ -61,6 +61,15 @@ struct Args {
     /// agree" but "is the answer the right one". The expected values come from
     /// the model's authors.
     reference: Option<PathBuf>,
+    /// `--standalone`: also run the graph through the `onnx-vulkan` facade —
+    /// same kernels, same rewrites, but the IR comes from our own parser
+    /// instead of `OrtGraph`, and nothing is dispatched by ORT.
+    ///
+    /// The point is the **same inputs in the same process**. Comparing a
+    /// standalone run against an EP run from two separate commands compares two
+    /// different random inputs, which on a dynamically-quantized graph is not a
+    /// comparison at all (`plan.md` Phase 1.5).
+    standalone: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -81,6 +90,7 @@ fn parse_args() -> Result<Args> {
         seed: 42,
         mem_pattern: true,
         reference: None,
+        standalone: false,
     };
     while let Some(flag) = args.next() {
         if flag == "--no-mem-pattern" {
@@ -93,6 +103,10 @@ fn parse_args() -> Result<Args> {
         }
         if flag == "--no-opt" {
             out.no_opt = true;
+            continue;
+        }
+        if flag == "--standalone" {
+            out.standalone = true;
             continue;
         }
         let value = args
@@ -223,6 +237,32 @@ fn make_input(ty: &ValueType, dims: &HashMap<String, i64>, rng: &mut Rng) -> Res
         .into_dyn(),
         TensorElementType::Bool => Tensor::from_array((shape, vec![true; n]))?.into_dyn(),
         other => bail!("input dtype {other:?} not handled by the runner"),
+    })
+}
+
+/// `ort::Value` → `HostTensor`, so the standalone engine is fed **the exact
+/// bytes** ORT was fed rather than a second generation from the same seed.
+fn host_tensor_from(value: &Value) -> Result<onnx_vulkan::HostTensor> {
+    use onnx_vulkan_core::host_ops::{HostTensor, INT32};
+    let ValueType::Tensor { ty, shape, .. } = value.dtype() else {
+        bail!("non-tensor input not supported");
+    };
+    let shape: Vec<i64> = shape.to_vec();
+    Ok(match ty {
+        TensorElementType::Float32 => {
+            let (_, data) = value.try_extract_tensor::<f32>()?;
+            HostTensor::from_f32(shape, data)
+        }
+        TensorElementType::Int64 => {
+            let (_, data) = value.try_extract_tensor::<i64>()?;
+            HostTensor::from_i64(shape, data)
+        }
+        TensorElementType::Int32 => {
+            let (_, data) = value.try_extract_tensor::<i32>()?;
+            let bytes = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            HostTensor::new(INT32, shape, bytes)
+        }
+        other => bail!("input dtype {other:?} not convertible to a host tensor"),
     })
 }
 
@@ -456,6 +496,91 @@ fn run(
     Ok((last.expect("at least one iteration"), times))
 }
 
+/// Runs the graph through the standalone facade on the same inputs.
+///
+/// Same kernels and same load-time rewrites as the EP — the differences are the
+/// IR source (our parser rather than `OrtGraph`) and the fact that ORT dispatches
+/// nothing here, so no node can quietly fall back to the CPU EP.
+fn run_standalone(
+    model: &Path,
+    inputs: &[(String, Value)],
+    iters: usize,
+) -> Result<(Outputs, Vec<f64>)> {
+    let session = onnx_vulkan::Session::load(model).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let feed: Vec<(String, onnx_vulkan::HostTensor)> = inputs
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), host_tensor_from(value)?)))
+        .collect::<Result<_>>()?;
+    let names: Vec<String> = session.outputs().iter().map(|o| o.name.clone()).collect();
+
+    let mut times = Vec::new();
+    let mut last = Vec::new();
+    for _ in 0..iters {
+        let start = Instant::now();
+        let run = session
+            .run(feed.iter().map(|(n, t)| (n.as_str(), t.clone())))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+        last = names
+            .iter()
+            .map(|name| {
+                let tensor = run.get(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let values = tensor
+                    .to_f32()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect();
+                Ok((name.clone(), values))
+            })
+            .collect::<Result<_>>()?;
+        run.finish();
+        // The Pareto is normally printed by the plugin's `OnRunEnd`, which does
+        // not exist here. Without it the profiler pass of a `standalone` job
+        // would report the **EP** sub-run's GPU time next to the facade's wall
+        // clock — two different executions in the same row.
+        //
+        // Once per iteration and not once at the end, because that is what the
+        // EP does and what `parse_run.py` assumes: it reads the *last* Pareto
+        // block, i.e. a single steady-state run. Dumping once would sum every
+        // iteration, first one included, and put a total next to a median.
+        vk_compute::stats::dump_and_reset();
+    }
+    Ok((last, times))
+}
+
+/// Element-wise worst relative difference between two runs, printed per output.
+///
+/// Separate from the CPU-vs-Vulkan block because it answers a different
+/// question: not "is the GPU right" but "do our two hosts agree with each
+/// other". They run the same kernels, so anything above float noise is a bug in
+/// one of the two paths, not model sensitivity.
+fn compare(label: &str, a: &Outputs, b: &Outputs, tol: f64, rtol: f64) -> (f64, usize) {
+    let (mut worst, mut total_mismatches) = (0.0f64, 0usize);
+    for ((name, x), (_, y)) in a.iter().zip(b) {
+        if x.len() != y.len() {
+            println!("  {label} {name}: different lengths ({} vs {})", x.len(), y.len());
+            total_mismatches += 1;
+            continue;
+        }
+        let diff = x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+        let scale = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let rel = if scale > 0.0 { diff / scale } else { 0.0 };
+        let mismatches = x
+            .iter()
+            .zip(y)
+            .filter(|(p, q)| (*p - *q).abs() > tol + rtol * p.abs())
+            .count();
+        worst = worst.max(rel);
+        total_mismatches += mismatches;
+        println!(
+            "  {label} {name:<24} n={:<9} max|Δ|={diff:.3e}  relative={rel:.2e}  beyond tolerance: {mismatches}",
+            x.len()
+        );
+    }
+    (worst, total_mismatches)
+}
+
 /// Steady-state statistics: median, minimum and maximum of iterations after
 /// the first (which includes pipeline compilation).
 fn steady(times: &[f64]) -> (f64, f64, f64) {
@@ -606,6 +731,22 @@ fn main() -> Result<()> {
         }
     }
 
+    // third backend: the standalone engine, on the very same inputs. The EP run
+    // has to be finished first — both want the Vulkan device.
+    let standalone_out = if args.standalone {
+        let (out, times) = run_standalone(&args.model, &inputs, args.iters)?;
+        let (ms, min, max) = steady(&times);
+        println!("standalone: {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
+        let (rel_ep, mismatches) = compare("standalone vs EP  ", &vk_out, &out, args.tol, args.rtol);
+        let (rel_cpu, _) = compare("standalone vs CPU ", &cpu_out, &out, args.tol, args.rtol);
+        println!("parity: standalone vs EP relative={rel_ep:.2e}, vs CPU EP relative={rel_cpu:.2e}");
+        // the two hosts run the same kernels: a divergence here is ours
+        failed |= mismatches > 0;
+        Some(out)
+    } else {
+        None
+    };
+
     if let Some(reference) = &reference {
         let backend = if args.self_check {
             "cpu-no-opt"
@@ -614,6 +755,9 @@ fn main() -> Result<()> {
         };
         let cpu_ok = check_reference("cpu", &cpu_out, reference, args.tol, args.rtol);
         let second_ok = check_reference(backend, &vk_out, reference, args.tol, args.rtol);
+        if let Some(out) = &standalone_out {
+            failed |= !check_reference("standalone", out, reference, args.tol, args.rtol);
+        }
         if !cpu_ok {
             // the CPU EP out of tolerance from the golden says nothing about
             // our backend: either the reference does not belong to this model,

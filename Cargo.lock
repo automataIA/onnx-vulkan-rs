@@ -584,9 +584,11 @@ dependencies = [
  "anyhow",
  "env_logger",
  "log",
+ "onnx-vulkan",
  "onnx-vulkan-core",
  "onnx-vulkan-frontend",
  "ort",
+ "vk-compute",
 ]
 
 [[package]]

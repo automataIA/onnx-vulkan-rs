@@ -317,6 +317,7 @@ impl VkContext {
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            crate::stats::record_submit();
             let result = device
                 .queue_submit(self.queue, &[submit], fence)
                 .and_then(|()| device.wait_for_fences(&[fence], true, u64::MAX));

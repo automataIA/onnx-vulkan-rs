@@ -112,6 +112,7 @@ impl VkContext {
     /// buffers already freed when one of the same size is there.
     pub fn create_storage_buffer(&self, size: u64) -> Result<GpuBuffer> {
         if let Some(buffer) = self.storage_pool.lock().unwrap().take(size) {
+            crate::stats::record_storage_pool_hit();
             return Ok(buffer);
         }
         let mut buffer = self.create_buffer(

@@ -15,6 +15,7 @@ pub mod interp;
 pub mod rewrite;
 pub mod shaders;
 pub mod shape;
+pub mod work;
 
 pub use cache::KernelCache;
 pub use device::{DeviceBuffer, DeviceTensor, Tensor};

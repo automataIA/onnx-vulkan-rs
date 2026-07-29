@@ -316,7 +316,7 @@ fn dead_after(ir: &GraphIr) -> Vec<Vec<&str>> {
 
 /// Executes a single node, inserting outputs into `env`.
 fn exec_node(env: &mut Env, node: &NodeIr) -> Result<()> {
-    vk_compute::stats::set_op("compile");
+    vk_compute::stats::begin_node();
     if log::log_enabled!(log::Level::Debug) {
         let ins: Vec<String> = node
             .inputs
@@ -330,6 +330,11 @@ fn exec_node(env: &mut Env, node: &NodeIr) -> Result<()> {
         log::debug!("exec {} in={ins:?}", node.op);
     }
     let r = exec_dispatch(env, node);
+    if r.is_ok() {
+        // after the dispatch: the output shapes only exist now, and so does the
+        // pipeline key the work is charged to
+        crate::work::record(node, &*env);
+    }
     if log::log_enabled!(log::Level::Debug) && r.is_ok() {
         for out in &node.outputs {
             if let Some(Tensor::Host(h)) = env.value(out)

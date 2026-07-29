@@ -16,3 +16,8 @@ env_logger = { workspace = true }
 # to read the TensorProtos of the `test_data_set_*`: the same parser as the engine
 onnx-vulkan-core = { path = "../onnx-vulkan-core" }
 onnx-vulkan-frontend = { path = "../onnx-vulkan-frontend" }
+# the standalone engine, for the parity mode: same graph, same kernels, no ORT
+onnx-vulkan = { path = "../onnx-vulkan" }
+# only to dump the profiler after a standalone run: nothing else does it, since
+# the Pareto is normally printed by the plugin's `OnRunEnd`
+vk-compute = { workspace = true }

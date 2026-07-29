@@ -7,6 +7,7 @@
 #   scripts/testsuite.sh -m yolov8n -M compile -i 50  # one model, one path
 #   scripts/testsuite.sh -n -m rfdetr                 # reuse existing staging
 #   scripts/testsuite.sh --baseline runs/baseline.json
+#   scripts/testsuite.sh --metric rfdetr.compile gpu.compute_ms   # read a number
 #
 # The reference plan is `plan-test-suite.md`; known limitations of the
 # measurements are in `docs/testsuite.md` and must be read before trusting a
@@ -22,7 +23,7 @@ BIN_DIR="$ROOT/target/$TARGET/release"
 WIN_DIR="${TESTSUITE_WIN_DIR:-}"
 
 MODELS=() MODES=() ITERS="" BUILD=1 STAGE_ONLY=0 SAMPLE_MS=100
-BASELINE="" TAG="" KEEP=20 DRY=0
+BASELINE="" TAG="" KEEP=20 DRY=0 DESC="" METRIC_SEL="" METRIC_PATH=""
 
 die() {
     echo "testsuite: $*" >&2
@@ -30,7 +31,7 @@ die() {
 }
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     cat <<'EOF'
 
   -m, --model NAME    only this model (repeatable; default: the manifest's `default` entries)
@@ -41,8 +42,15 @@ usage() {
       --sample MS     metric sampling period (0 = disable; default 100)
       --baseline FILE compare with a previous run and apply the gates
       --tag NAME      label of the output folder (default: timestamp)
+      --desc TEXT     description recorded in runs/results.tsv (default: the tag)
       --keep N        how many runs to keep in runs/ (default 20)
       --dry-run       print the commands without executing them
+
+      --metric SEL PATH   read a number out of an existing run and exit: SEL is
+                      <model>.<mode>, PATH a jq path into that result
+                      (gpu.compute_ms, gpu.flushes, wall_ms.median,
+                      gpu.pareto[0].ms). Reads runs/<--tag>/summary.json,
+                      default runs/latest. Runs nothing, builds nothing.
 EOF
     exit 0
 }
@@ -57,6 +65,10 @@ while [ $# -gt 0 ]; do
     --sample) SAMPLE_MS="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
+    --desc) DESC="$2"; shift 2 ;;
+    --metric)
+        [ $# -ge 3 ] || die "--metric wants <model>.<mode> and a jq path"
+        METRIC_SEL="$2"; METRIC_PATH="$3"; shift 3 ;;
     --keep) KEEP="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h | --help) usage ;;
@@ -64,10 +76,49 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ------------------------------------------------------- 0. --metric (query)
+# Reads an existing run and exits. Deliberately before every check below: a
+# query touches no Windows host, no staging dir and no toolchain, so it must
+# work anywhere the repo is checked out. Extraction stays separate from
+# execution — a loop chains them (`testsuite.sh -m X --tag e42 &&
+# testsuite.sh --metric X.compile gpu.compute_ms --tag e42`).
+if [ -n "$METRIC_SEL" ]; then
+    summary="$ROOT/runs/${TAG:-latest}/summary.json"
+    [ -f "$summary" ] || die "no summary to read: $summary"
+    case "$METRIC_SEL" in
+    *.*) : ;;
+    *) die "--metric wants <model>.<mode>, got: $METRIC_SEL" ;;
+    esac
+    # captured and not streamed: `jq -e` still prints `null` before failing on
+    # an absent path, and the contract of this mode is a number or nothing
+    metric_value="$(jq -e -r --arg m "${METRIC_SEL%%.*}" --arg mode "${METRIC_SEL#*.}" \
+        "[.results[] | select(.model == \$m and .mode == \$mode)][0] // error(\"no result for \" + \$m + \".\" + \$mode) | .$METRIC_PATH" \
+        "$summary")" ||
+        die "metric not found: $METRIC_SEL $METRIC_PATH (in $summary)"
+    printf '%s\n' "$metric_value"
+    exit 0
+fi
+
 [ -f "$MANIFEST" ] || die "manifest missing: $MANIFEST"
-command -v wslpath >/dev/null || die "WSL required: the suite drives the Windows binaries via interop"
-[[ -n "$WIN_DIR" ]] || die "set TESTSUITE_WIN_DIR to the Windows staging dir (WSL side)"
-WIN_PATH="$(wslpath -w "$WIN_DIR" 2>/dev/null)" || die "WIN_DIR not convertible: $WIN_DIR"
+
+# A run made only of `standalone` jobs never touches Windows: no cross-build, no
+# staging, no interop. That is the whole point of the mode — it turns a 3–5 min
+# cycle into seconds — so its requirements must not be the Windows ones.
+HAS_NATIVE=0 HAS_WIN=1 NATIVE_ONLY=0
+if [ ${#MODES[@]} -gt 0 ]; then
+    HAS_WIN=0
+    for m in "${MODES[@]}"; do
+        if [ "$m" = standalone ]; then HAS_NATIVE=1; else HAS_WIN=1; fi
+    done
+    [ "$HAS_NATIVE" = 1 ] && [ "$HAS_WIN" = 0 ] && NATIVE_ONLY=1
+fi
+
+WIN_PATH=""
+if [ "$NATIVE_ONLY" = 0 ]; then
+    command -v wslpath >/dev/null || die "WSL required: the suite drives the Windows binaries via interop"
+    [[ -n "$WIN_DIR" ]] || die "set TESTSUITE_WIN_DIR to the Windows staging dir (WSL side)"
+    WIN_PATH="$(wslpath -w "$WIN_DIR" 2>/dev/null)" || die "WIN_DIR not convertible: $WIN_DIR"
+fi
 
 run_cmd() { # executes, or just prints with --dry-run
     if [ "$DRY" = 1 ]; then
@@ -81,9 +132,15 @@ manifest() { "$HELPERS/manifest.py" "$@" --manifest "$MANIFEST"; }
 
 # ---------------------------------------------------------------- 1. build
 if [ "$BUILD" = 1 ]; then
-    echo "== build ($TARGET)"
-    run_cmd cargo xwin build --release --target "$TARGET" \
-        -p model-runner -p stt-app -p vulkan-ep || die "build failed"
+    if [ "$HAS_NATIVE" = 1 ]; then
+        echo "== build (native, for the standalone mode)"
+        run_cmd cargo build --release -p model-runner -p vulkan-ep || die "native build failed"
+    fi
+    if [ "$HAS_WIN" = 1 ]; then
+        echo "== build ($TARGET)"
+        run_cmd cargo xwin build --release --target "$TARGET" \
+            -p model-runner -p stt-app -p vulkan-ep || die "build failed"
+    fi
 fi
 
 # ---------------------------------------------------------------- 2. staging
@@ -124,7 +181,7 @@ if [ "$DRY" = 0 ]; then
     manifest fetch ${MODEL_ARGS+"${MODEL_ARGS[@]}"} || true
 fi
 
-[ "$BUILD" = 1 ] && stage
+[ "$BUILD" = 1 ] && [ "$HAS_WIN" = 1 ] && stage
 if [ "$STAGE_ONLY" = 1 ]; then
     echo "== stage-only: done"
     exit 0
@@ -145,8 +202,9 @@ jq -n \
     --arg gpu "${gpu_name:-unknown}" \
     --arg driver "${driver:-unknown}" \
     --arg sample_ms "$SAMPLE_MS" \
+    --argjson peaks "$("$HELPERS/peaks.py" "${gpu_name:-unknown}")" \
     '{host:$host, commit:$commit, dirty:$dirty, ort:$ort, gpu:$gpu, driver:$driver,
-      sample_ms:($sample_ms|tonumber), when:(now|todate)}' \
+      sample_ms:($sample_ms|tonumber), when:(now|todate)} + $peaks' \
     >"$RUN_DIR/env.json"
 
 # ---------------------------------------------------------------- 4. matrix
@@ -217,6 +275,21 @@ mode_env() { # $1 mode, $2 runner
     esac
 }
 
+# Runs a native Linux command from the repo root. The `standalone` mode's whole
+# reason to exist: no cross-build, no rsync to /mnt/c, no cmd.exe, no Windows
+# host held hostage — the cycle is seconds. The Vulkan device here is whatever
+# WSL exposes (usually lavapipe), so `parse_run.py` marks these runs
+# `perf_valid: false` on its own and only their **parity** verdict is a gate.
+native_exec() { # $1 `VAR=v` env prefix (space separated), $2 command line
+    local env_prefix="$1" cmdline="$2"
+    local common="RUST_LOG=info ORT_DYLIB_PATH=$ROOT/third_party/onnxruntime/linux-x64/lib/libonnxruntime.so VULKAN_EP_PATH=$ROOT/target/release/libonnxruntime_ep_vulkan.so"
+    if [ "$DRY" = 1 ]; then
+        echo "+ (cd $ROOT && env $common $env_prefix$cmdline)" >&2
+        return 0
+    fi
+    (cd "$ROOT" && eval "env $common $env_prefix$cmdline") 2>&1 </dev/null
+}
+
 failures=0
 jobs="$(manifest jobs ${MODEL_ARGS+"${MODEL_ARGS[@]}"} ${MODE_ARGS+"${MODE_ARGS[@]}"})" ||
     die "manifest unreadable"
@@ -246,6 +319,35 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
 
     # runner command line
     mapfile -t extra < <(echo "$args" | jq -r '.[]')
+    if [ "$mode" = standalone ]; then
+        # native paths, native binary, and `--standalone` adds the third backend:
+        # the same generated tensors go through ORT, the EP and the facade in one
+        # process. Two separate commands would compare two different inputs.
+        cmdline="./target/release/model-runner $model_path --iters $iters --standalone"
+        for a in ${extra+"${extra[@]}"}; do cmdline+=" $a"; done
+        [ -n "$reference" ] && cmdline+=" --reference $reference"
+        native_exec "VULKAN_EP_COMPILE=1 " "$cmdline" >"$out_dir/$mode.stdout.log"
+        code=$?
+        stats_arg=()
+        if [ "$stats" = 1 ]; then
+            native_exec "VULKAN_EP_COMPILE=1 VULKAN_EP_STATS=1 " "$cmdline" \
+                >"$out_dir/$mode.stats.log"
+            stats_arg=(--stats-log "$out_dir/$mode.stats.log")
+        fi
+        if [ "$DRY" = 0 ]; then
+            "$HELPERS/parse_run.py" --model "$name" --mode "$mode" --runner "$runner" \
+                --iters "$iters" --stdout "$out_dir/$mode.stdout.log" \
+                "${stats_arg[@]}" --validate "$validate" --expect "$expect" \
+                --size-mb "${size_mb:-0}" --perf-tol "${perf_tol:-10}" --exit-code "$code" \
+                --env "$RUN_DIR/env.json" \
+                $([ "$golden" = 1 ] && echo --golden) --out "$out_dir/$mode.json" ||
+                die "parsing failed for $name/$mode"
+            jq -r '"   parity vs EP \(.parity.vs_ep // "—") · wall \(.wall_ms.median // "—") ms · result \(if .ok then "ok" else "KO" end)"' \
+                "$out_dir/$mode.json"
+            jq -e '.ok' "$out_dir/$mode.json" >/dev/null || failures=$((failures + 1))
+        fi
+        continue
+    fi
     if [ "$runner" = stt-app ]; then
         cmdline="set STT_BENCH=$iters&& stt-app.exe"
         for a in ${extra+"${extra[@]}"}; do cmdline+=" $(win_rel "$a")"; done
@@ -286,7 +388,7 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
         --iters "$iters" --stdout "$out_dir/$mode.stdout.log" \
         "${stats_arg[@]}" ${exposed_arg+"${exposed_arg[@]}"} --metrics "$out_dir/$mode.metrics.csv" \
         --validate "$validate" --expect "$expect" --size-mb "${size_mb:-0}" \
-        --perf-tol "${perf_tol:-10}" --exit-code "$code" \
+        --perf-tol "${perf_tol:-10}" --exit-code "$code" --env "$RUN_DIR/env.json" \
         $([ "$golden" = 1 ] && echo --golden) --out "$out_dir/$mode.json" ||
         die "parsing failed for $name/$mode"
     jq -r '"   wall \(.wall_ms.median // "—") ms · CPU EP \(.cpu_ep_ms // "—") ms · result \(if .ok then "ok" else "KO" end)"' \
@@ -303,6 +405,7 @@ fi
 ln -sfn "$TAG" "$ROOT/runs/latest"
 report_args=()
 [ -n "$BASELINE" ] && report_args=(--baseline "$BASELINE")
+[ -n "$DESC" ] && report_args+=(--desc "$DESC")
 "$HELPERS/report.py" "$RUN_DIR" ${report_args+"${report_args[@]}"}
 gate=$?
 

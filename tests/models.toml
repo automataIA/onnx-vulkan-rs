@@ -67,6 +67,32 @@ validate = "transcript"
 expect = "Well, I don't wish to see it any more"
 size_mb = 700
 
+# The encoder alone, under `model-runner` instead of `stt-app`. It exists for
+# the `standalone` mode: parity needs one process feeding the same tensors to
+# both paths, which `stt-app` cannot do — and this is the exact model whose
+# "standalone vs EP" divergence Phase 1.5 was opened for. `default = false`
+# because the `parakeet` entry above already covers the model end to end on
+# Windows, and 652 MB do not need staging twice.
+#
+#   scripts/testsuite.sh -M standalone -m parakeet-encoder
+[[model]]
+name = "parakeet-encoder"
+path = "models/parakeet-tdt-0.6b-v3-onnx/encoder-model.int8.onnx"
+runner = "model-runner"
+# the real geometry: 744 frames, the ×8 subsampling the encoder is built for.
+# At the default of 1 the graph runs but every reduction is degenerate.
+args = [
+    "--dim", "audio_signal_dynamic_axes_1=1",
+    "--dim", "audio_signal_dynamic_axes_2=744",
+    "--dim", "length_dynamic_axes_1=1",
+]
+iters = 3
+default = false
+# int8: the outputs diverge from the CPU EP by construction, and in `standalone`
+# the verdict is parity, not agreement with ORT (see docs/testsuite.md).
+validate = "none"
+size_mb = 650
+
 # Dynamically quantized graphs: the final outputs are not compared (the scales
 # come from min/max of the activations, ±1 LSB amplifies up to 97%).
 # The first quantized tensor of the instrumented graph is compared, ±1 LSB criterion.

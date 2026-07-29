@@ -27,7 +27,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "tests" / "models.toml"
-MODES = ("cpu", "registry", "compile")
+# `standalone` is the odd one: it runs the **Linux-native** binary directly,
+# with no cross-build, no staging and no cmd.exe, which is what makes its cycle
+# time seconds instead of minutes (`plan.md` §9.5 P1).
+MODES = ("cpu", "registry", "compile", "standalone")
 SEP = "\x1f"  # field separator: non-whitespace, so empty fields are preserved
 
 JOB_FIELDS = (
@@ -94,6 +97,14 @@ def job_rows(model: dict, mode: str, iters: int | None) -> dict:
         # run: a separate `cpu` mode would be the same measurement, twice.
         row["status"] = "skip"
         row["reason"] = "model-runner already measures the CPU EP anyway"
+    elif mode == "standalone" and row["runner"] != "model-runner":
+        # parity is a property of the engine, and only model-runner can feed the
+        # same tensors to both paths; stt-app drives ORT sessions end to end
+        row["status"] = "skip"
+        row["reason"] = "standalone parity needs model-runner"
+    elif mode == "standalone" and not model.get("standalone", True):
+        row["status"] = "skip"
+        row["reason"] = model.get("standalone_reason", "excluded from standalone parity")
     return row
 
 

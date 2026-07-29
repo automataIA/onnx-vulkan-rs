@@ -21,7 +21,11 @@ import argparse
 import json
 import re
 import statistics
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import peaks as peaks_mod  # noqa: E402
 
 # --- model-runner -----------------------------------------------------------
 RE_CPU_EP = re.compile(r"^CPU EP:\s+([\d.]+) ms")
@@ -36,6 +40,21 @@ RE_OUTPUT = re.compile(
 RE_OK = re.compile(r"^OK: within atol=.*worst relative error ([\d.e+-]+)\)")
 RE_DIVERGE = re.compile(r"divergent outputs")
 
+# --- standalone parity (`--standalone`) -------------------------------------
+# The two hosts run the same kernels on the same graph, so their outputs are
+# expected **bit for bit** identical, not merely close: anything else is a bug
+# in one of the two paths rather than model sensitivity.
+RE_STANDALONE = re.compile(
+    r"^standalone:\s+([\d.]+) ms(?:.*?\[min ([\d.]+) max ([\d.]+)\])?"
+)
+RE_PARITY = re.compile(
+    r"parity: standalone vs EP relative=([\d.e+-]+), vs CPU EP relative=([\d.e+-]+)"
+)
+RE_PARITY_ROW = re.compile(
+    r"standalone vs (EP|CPU)\s+(\S+)\s+n=(\d+)\s+max\|Δ\|=([\d.e+-]+)\s+"
+    r"relative=([\d.e+-]+)\s+beyond tolerance: (\d+)"
+)
+
 # --- stt-app ----------------------------------------------------------------
 RE_ENC_ITER = re.compile(r"encoder iter (\d+)/(\d+): ([\d.]+) ms")
 
@@ -46,10 +65,23 @@ RE_BLOCKS = re.compile(r"compile: (\d+) nodes in (\d+) convex blocks")
 
 # --- profiler ---------------------------------------------------------------
 RE_PARETO_HEAD = re.compile(r"VulkanEP profile")
-RE_PARETO_ROW = re.compile(r"^\s*(\S+)\s+([\d.]+) ms\s+([\d.]+)%\s+\((\d+) dispatch\)")
+# `gflop`/`gb` are the analytic work of the nodes charged to the kernel
+# (`onnx-vulkan-core::work`). Optional: absent from logs predating them, and
+# from any op the work model does not cover.
+RE_PARETO_ROW = re.compile(
+    r"^\s*(\S+)\s+([\d.]+) ms\s+([\d.]+)%\s+\((\d+) dispatch\)"
+    r"(?:\s+gflop=([\d.]+)\s+gb=([\d.]+))?"
+)
 RE_GPU_TOTAL = re.compile(r"TOTAL GPU compute\s+([\d.]+) ms")
 RE_SYNC = re.compile(
     r"sync/overhead ~([\d.]+) ms across (\d+) flushes; transfer up ([\d.]+) MB / down ([\d.]+) MB"
+)
+# Counted, not timed: these do not move between two identical runs, which is
+# what makes them usable as the keep/discard signal of an experiment loop
+# (`plan.md` §9.2). Absent from logs produced before the counters existed —
+# the fields are then simply missing, and the gate does not read them.
+RE_COUNTERS = re.compile(
+    r"counters: submit=(\d+) upload=(\d+) download=(\d+) alloc=(\d+) pool-hit=(\d+)"
 )
 
 # --- official reference data (`test_data_set_*` of the model zoo) -----------
@@ -116,17 +148,55 @@ def steady(times: list[float]) -> dict | None:
     }
 
 
-def parse_wall(lines: list[str], runner: str) -> tuple[dict | None, float | None]:
+def parse_parity(lines: list[str]) -> dict | None:
+    """standalone-vs-EP agreement, the verdict of the `standalone` mode.
+
+    `max_abs_delta` and not just the relative figure: parity is expected to be
+    exactly zero, and a relative error rounds to `0.00e0` well before an
+    absolute one does.
+    """
+    outputs = []
+    for line in lines:
+        if m := RE_PARITY_ROW.search(line):
+            outputs.append(
+                {
+                    "against": m.group(1).lower(),
+                    "name": m.group(2),
+                    "n": int(m.group(3)),
+                    "max_abs_delta": float(m.group(4)),
+                    "relative": float(m.group(5)),
+                    "mismatches": int(m.group(6)),
+                }
+            )
+    totals = next((m for m in map(RE_PARITY.search, lines) if m), None)
+    if not totals and not outputs:
+        return None
+    vs_ep = [o for o in outputs if o["against"] == "ep"]
+    return {
+        "vs_ep": float(totals.group(1)) if totals else None,
+        "vs_cpu": float(totals.group(2)) if totals else None,
+        "outputs": vs_ep,
+        # the property the gate is on: same kernels, same graph, same bytes out
+        "bit_exact": bool(vs_ep) and all(o["max_abs_delta"] == 0.0 for o in vs_ep),
+        "mismatches": sum(o["mismatches"] for o in vs_ep),
+    }
+
+
+def parse_wall(lines: list[str], runner: str, mode: str = "") -> tuple[dict | None, float | None]:
     """(steady-state wall of the path under test, CPU EP time if the runner measures it)."""
     if runner == "stt-app":
         times = [float(m.group(3)) for m in map(RE_ENC_ITER.search, lines) if m]
         return steady(times), None
     cpu_ms = None
     wall = None
+    # in `standalone` the path under test is the facade, not the EP: the same
+    # log carries both timings and picking the wrong one would benchmark the
+    # thing the mode exists to avoid
+    second = RE_STANDALONE if mode == "standalone" else RE_SECOND
     for line in lines:
         if m := RE_CPU_EP.match(line):
             cpu_ms = float(m.group(1))
-        elif m := RE_SECOND.match(line):
+        elif m := second.match(line):
             wall = {
                 "median": float(m.group(1)),
                 "min": float(m.group(2)) if m.group(2) else None,
@@ -224,7 +294,50 @@ def parse_accuracy(lines: list[str], kind: str, expect: str, exposed: list[str])
     }
 
 
-def parse_gpu(lines: list[str]) -> dict | None:
+# Below this fraction of the attainable roof a kernel is not limited by the
+# machine but by its own launch shape: not enough workgroups, not enough work
+# per thread. `CLAUDE.md` calls it "latency-bound" and the lever there is grid
+# shape (split-K, occupancy), never the tile. The threshold is a reading aid,
+# not a measurement: `pct_peak_*` and `efficiency` are the numbers.
+LATENCY_EFFICIENCY = 0.10
+
+
+def roofline(entry: dict, peaks: dict) -> None:
+    """Adds the Roofline fields to a Pareto entry, in place.
+
+    Achieved throughput is the analytic work over the measured GPU time; the
+    class is decided by *arithmetic intensity against the ridge point*, not by
+    which percentage is larger — a kernel can sit at 19% of the compute roof and
+    still be compute-bound, with the missing 81% being its own inefficiency.
+    That distinction is what `efficiency` carries.
+    """
+    ms, gflop, gb = entry.get("ms"), entry.get("gflop"), entry.get("gb")
+    if ms is None or gflop is None or gb is None or ms <= 0:
+        return
+    seconds = ms / 1e3
+    entry["gflops"] = round(gflop / seconds, 2)
+    entry["gb_s"] = round(gb / seconds, 2)
+    if gb <= 0:
+        return
+    intensity = gflop / gb  # FLOP/B
+    entry["intensity"] = round(intensity, 4)
+    ridge = peaks_mod.ridge(peaks)
+    if ridge is None:
+        return
+    peak_gflops = peaks["peak_tflops_fp32"] * 1e3
+    entry["pct_peak_compute"] = round(entry["gflops"] / peak_gflops * 100, 2)
+    entry["pct_peak_bw"] = round(entry["gb_s"] / peaks["peak_gb_s"] * 100, 2)
+    attainable = min(peak_gflops, peaks["peak_gb_s"] * intensity)
+    efficiency = entry["gflops"] / attainable if attainable > 0 else 0.0
+    entry["efficiency"] = round(efficiency, 4)
+    entry["class"] = (
+        "latency"
+        if efficiency < LATENCY_EFFICIENCY
+        else ("memory" if intensity < ridge else "compute")
+    )
+
+
+def parse_gpu(lines: list[str], peaks: dict | None = None) -> dict | None:
     """Last Pareto block in the log: that is the steady-state one."""
     starts = [i for i, ln in enumerate(lines) if RE_PARETO_HEAD.search(ln)]
     if not starts:
@@ -239,15 +352,24 @@ def parse_gpu(lines: list[str]) -> dict | None:
             gpu["flushes"] = int(m.group(2))
             gpu["upload_mb"] = float(m.group(3))
             gpu["download_mb"] = float(m.group(4))
+        elif m := RE_COUNTERS.search(line):
+            gpu["submits"] = int(m.group(1))
+            gpu["uploads"] = int(m.group(2))
+            gpu["downloads"] = int(m.group(3))
+            gpu["allocs"] = int(m.group(4))
+            gpu["pool_hits"] = int(m.group(5))
         elif m := RE_PARETO_ROW.search(line.split("] ", 1)[-1]):
-            gpu["pareto"].append(
-                {
-                    "op": m.group(1),
-                    "ms": float(m.group(2)),
-                    "pct": float(m.group(3)),
-                    "dispatches": int(m.group(4)),
-                }
-            )
+            entry = {
+                "op": m.group(1),
+                "ms": float(m.group(2)),
+                "pct": float(m.group(3)),
+                "dispatches": int(m.group(4)),
+            }
+            if m.group(5):
+                entry["gflop"] = float(m.group(5))
+                entry["gb"] = float(m.group(6))
+                roofline(entry, peaks or {})
+            gpu["pareto"].append(entry)
     return gpu
 
 
@@ -332,13 +454,40 @@ def main() -> int:
     # golden models validate correctness, not product performance
     ap.add_argument("--golden", action="store_true")
     ap.add_argument("--exit-code", type=int, default=0)
+    ap.add_argument(
+        "--env",
+        type=Path,
+        help="run's env.json: source of the device peaks for the Roofline "
+        "(falls back to the table in peaks.py keyed by the device name)",
+    )
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
     clean = read(args.stdout)
     stats = read(args.stats_log)
-    wall, cpu_ms = parse_wall(clean, args.runner)
+    wall, cpu_ms = parse_wall(clean, args.runner, args.mode)
     device = next((m.group(1) for m in map(RE_DEVICE.search, clean + stats) if m), None)
+
+    # env.json first: it names the GPU the run was launched on, which on the
+    # standalone path is not the one the log reports
+    env = {}
+    if args.env and args.env.exists():
+        env = json.loads(args.env.read_text(encoding="utf-8"))
+    device_peaks = {k: env[k] for k in ("peak_tflops_fp32", "peak_gb_s") if k in env}
+    if not device_peaks:
+        device_peaks = peaks_mod.resolve(device or env.get("gpu"))
+
+    parity = parse_parity(clean)
+    if args.mode == "standalone":
+        # The verdict of this mode is parity, not agreement with ORT. A
+        # dynamically-quantized graph diverges from the CPU EP by construction
+        # (`plan.md` Phase 1.5) and the runner exits ≠ 0 for it; that question
+        # belongs to the `compile` mode, which asks it on the real GPU. Here the
+        # question is whether our two hosts compute the same thing, and its
+        # answer must not be shadowed by the other one.
+        ok = wall is not None and bool(parity and parity.get("bit_exact"))
+    else:
+        ok = (args.exit_code == 0 or args.validate in ("per-node", "argmax")) and wall is not None
 
     result = {
         "model": args.model,
@@ -350,8 +499,7 @@ def main() -> int:
         # the first quantized tensor instead of them
         # `argmax` like `per-node`: the runner exits ≠ 0 by construction,
         # because the element-by-element comparison is not the right criterion
-        "ok": (args.exit_code == 0 or args.validate in ("per-node", "argmax"))
-        and wall is not None,
+        "ok": ok,
         "exit_code": args.exit_code,
         "model_size_mb": args.size_mb,
         "perf_tol": args.perf_tol,
@@ -364,8 +512,12 @@ def main() -> int:
         "wall_ms": wall,
         "cpu_ep_ms": cpu_ms,
         "accuracy": parse_accuracy(clean, args.validate, args.expect, read(args.exposed)),
+        "parity": parity,
         "reference": parse_reference(clean),
-        "gpu": parse_gpu(stats or clean),
+        "gpu": parse_gpu(stats or clean, device_peaks),
+        # recorded next to the numbers derived from them: a Roofline read
+        # against the wrong peaks is worse than no Roofline
+        "peaks": device_peaks or None,
         "blocks": parse_blocks(stats or clean),
         "system": parse_metrics(args.metrics),
         "raw": {

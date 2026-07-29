@@ -97,7 +97,9 @@ fn reference(
             let query = rotate(q, (s * NH + head) * H, pq);
             let mut scores = vec![f32::NEG_INFINITY; total];
             for (t, score) in scores.iter_mut().enumerate() {
-                if t > pq || (case.window >= 0 && (pq - t) as i64 > case.window) {
+                // exactly `window` visible keys, the query's own position
+                // included; see the note on `shaders::attention::SCORES`
+                if t > pq || (case.window >= 0 && (pq - t) as i64 >= case.window) {
                     continue;
                 }
                 let mut acc = 0.0;

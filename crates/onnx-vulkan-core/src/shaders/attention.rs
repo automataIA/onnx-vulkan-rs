@@ -125,9 +125,13 @@ fn main(
 /// `past + sq` and cannot see beyond it. Sliding window: with
 /// `window >= 0` it additionally cannot see further back than `window`
 /// positions, which is what makes gemma3's 22 local layers differ from its 4
-/// global ones. The bound is `pq - pk > window`, i.e. `window + 1` visible
-/// keys including the query's own position — the convention ONNX Runtime's
-/// CPU kernel uses, and the reason this is validated against it.
+/// global ones. The bound is `pq - pk >= window`, i.e. exactly `window`
+/// visible keys including the query's own position.
+///
+/// That last `=` is measured, not assumed. gemma3 agrees with the CPU EP to
+/// 1e-5 at every cache length up to 511 and diverges by 5e-1 at 512 — the
+/// first length where a `window = 512` layer has anything to mask — which
+/// places the boundary on the key `window` positions back, not `window + 1`.
 pub const SCORES: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k: array<f32>;
@@ -157,7 +161,7 @@ fn main(
 
     let pq = pc.past + sq;
     var masked = t > pq;
-    if (pc.window >= 0 && i32(pq - t) > pc.window) { masked = true; }
+    if (pc.window >= 0 && i32(pq - t) >= pc.window) { masked = true; }
     if (masked) {
         scores[i] = -3.4028235e38;
         return;

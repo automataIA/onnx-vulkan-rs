@@ -67,6 +67,19 @@ struct Args {
     /// (`seqlens_k` is derived from its sum), so the model cannot be validated
     /// at all until the mask is a mask.
     fill: HashMap<String, i64>,
+    /// `--decode N`: run `N` autoregressive steps instead of one, feeding each
+    /// step's `present.*` back as the next step's `past_key_values.*` and
+    /// growing `past_sequence_length` by the step's `sequence_length`.
+    ///
+    /// A single-shot run says nothing about a generation loop: the KV cache
+    /// changes shape at every token, so buffer sizes never repeat and the
+    /// allocator sees a fresh request per tensor per step. That cost is
+    /// invisible at `--iters N`, which replays the *same* shapes.
+    ///
+    /// The two backends each feed back **their own** outputs, so any divergence
+    /// compounds the way it would in a real loop rather than being reset every
+    /// step.
+    decode: usize,
     /// `--standalone`: also run the graph through the `onnx-vulkan` facade —
     /// same kernels, same rewrites, but the IR comes from our own parser
     /// instead of `OrtGraph`, and nothing is dispatched by ORT.
@@ -97,6 +110,7 @@ fn parse_args() -> Result<Args> {
         mem_pattern: true,
         reference: None,
         fill: HashMap::new(),
+        decode: 0,
         standalone: false,
     };
     while let Some(flag) = args.next() {
@@ -129,6 +143,7 @@ fn parse_args() -> Result<Args> {
                 out.fill.insert(name.to_string(), constant.parse()?);
             }
             "--iters" => out.iters = value.parse::<usize>()?.max(1),
+            "--decode" => out.decode = value.parse()?,
             "--tol" => out.tol = value.parse()?,
             "--rtol" => out.rtol = value.parse()?,
             "--dump" => out.dump = value.parse()?,
@@ -571,6 +586,177 @@ fn run_standalone(
     Ok((last, times))
 }
 
+/// The KV-cache pairing of a decoder export: output `present.N.key` feeds input
+/// `past_key_values.N.key` at the next step.
+///
+/// Matched by name and nothing else. Other exports name the pair differently
+/// (`past_key.N` / `present_key.N`); this rule covers the ones in the suite and
+/// an empty result is reported rather than guessed at.
+fn kv_pairs(session: &Session) -> Vec<(String, String)> {
+    let inputs: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
+    session
+        .outputs
+        .iter()
+        .filter_map(|out| {
+            let suffix = out.name.strip_prefix("present")?;
+            let name = format!("past_key_values{suffix}");
+            inputs.contains(&name.as_str()).then_some((out.name.clone(), name))
+        })
+        .collect()
+}
+
+/// The step's non-cache inputs plus one backend's cache, as a borrowing feed.
+fn feed_with<'a>(
+    shared: &'a [(String, Value)],
+    cache: &'a [(String, Value)],
+) -> Vec<(String, &'a Value)> {
+    shared
+        .iter()
+        .chain(cache)
+        .map(|(name, value)| (name.clone(), value))
+        .collect()
+}
+
+/// The wall time of a decode step, the cache it produced, and its other outputs.
+type Step = (f64, Vec<(String, Value)>, Outputs);
+
+/// One decode step: the wall time, the `present.*` tensors rebuilt as owned
+/// values ready to be fed back, and every other output promoted to `f64`.
+fn decode_step(
+    session: &mut Session,
+    feed: Vec<(String, &Value)>,
+    pairs: &[(String, String)],
+) -> Result<Step> {
+    let start = Instant::now();
+    let outputs = session.run(feed)?;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut next = Vec::with_capacity(pairs.len());
+    for (from, to) in pairs {
+        let (shape, data) = outputs[from.as_str()].try_extract_tensor::<f32>()?;
+        let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        next.push((
+            to.clone(),
+            Tensor::from_array((shape, data.to_vec()))?.into_dyn(),
+        ));
+    }
+    // the cache is the loop's state, not its result: what is worth comparing is
+    // everything else, which for a decoder is the logits
+    let cached: Vec<&str> = pairs.iter().map(|(from, _)| from.as_str()).collect();
+    let rest = outputs
+        .iter()
+        .filter(|(name, _)| !cached.contains(name))
+        .map(|(name, value)| Ok((name.to_string(), extract(&value)?)))
+        .collect::<Result<Outputs>>()?;
+    Ok((ms, next, rest))
+}
+
+/// Runs `steps` autoregressive steps on both sessions, comparing them at each
+/// one. Returns false if any step left the tolerance.
+///
+/// Each backend feeds back its own cache. The inputs that are *not* cache —
+/// `input_ids`, `attention_mask` — are generated once per step and shared, so
+/// the only thing that can make the two diverge is the arithmetic.
+fn decode_loop(
+    cpu: &mut Session,
+    second: &mut Session,
+    label: &str,
+    args: &Args,
+    rng: &mut Rng,
+) -> Result<bool> {
+    let pairs = kv_pairs(cpu);
+    if pairs.is_empty() {
+        bail!("--decode: no present.*/past_key_values.* pair among the model's inputs and outputs");
+    }
+    let cached: Vec<&str> = pairs.iter().map(|(_, to)| to.as_str()).collect();
+    let seq = args.dims.get("sequence_length").copied().unwrap_or(1);
+    let mut past = args
+        .dims
+        .get("past_sequence_length")
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "decode: {} steps of {seq} token(s), cache from {past} to {}, {} tensors fed back",
+        args.decode,
+        past + seq * args.decode as i64,
+        pairs.len()
+    );
+
+    // step 0 starts from a generated cache, the same one for both backends
+    let mut dims = args.dims.clone();
+    let initial: Vec<(String, Value)> = cpu
+        .inputs
+        .iter()
+        .filter(|i| cached.contains(&i.name.as_str()))
+        .map(|input| {
+            let value = make_input(&input.input_type, &dims, None, rng)?;
+            Ok((input.name.clone(), value))
+        })
+        .collect::<Result<_>>()?;
+    let mut cpu_cache: Vec<(String, Value)> = Vec::new();
+    let mut vk_cache: Vec<(String, Value)> = Vec::new();
+    let mut failed = false;
+
+    for step in 0..args.decode {
+        dims.insert("past_sequence_length".into(), past);
+        dims.insert("sequence_length".into(), seq);
+        dims.insert("total_sequence_length".into(), past + seq);
+        let shared: Vec<(String, Value)> = cpu
+            .inputs
+            .iter()
+            .filter(|i| !cached.contains(&i.name.as_str()))
+            .map(|input| {
+                let value = make_input(
+                    &input.input_type,
+                    &dims,
+                    args.fill.get(&input.name).copied(),
+                    rng,
+                )
+                .with_context(|| format!("input '{}'", input.name))?;
+                Ok((input.name.clone(), value))
+            })
+            .collect::<Result<_>>()?;
+
+        let (cpu_ms, cpu_next, cpu_out) = decode_step(
+            cpu,
+            feed_with(&shared, if step == 0 { &initial } else { &cpu_cache }),
+            &pairs,
+        )?;
+        let (vk_ms, vk_next, vk_out) = decode_step(
+            second,
+            feed_with(&shared, if step == 0 { &initial } else { &vk_cache }),
+            &pairs,
+        )?;
+        cpu_cache = cpu_next;
+        vk_cache = vk_next;
+
+        let (worst, mismatches) = cpu_out
+            .iter()
+            .zip(&vk_out)
+            .map(|((name, a), (_, b))| {
+                if a.len() != b.len() {
+                    println!("  {name}: different lengths ({} vs {})", a.len(), b.len());
+                    return (0.0, 1);
+                }
+                let diff = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+                let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                let bad = a
+                    .iter()
+                    .zip(b)
+                    .filter(|(x, y)| (*x - *y).abs() > args.tol + args.rtol * x.abs())
+                    .count();
+                (if scale > 0.0 { diff / scale } else { 0.0 }, bad)
+            })
+            .fold((0.0f64, 0usize), |(w, n), (r, b)| (w.max(r), n + b));
+        failed |= mismatches > 0;
+        println!(
+            "  step {step:>3}  past={past:<6} CPU EP {cpu_ms:8.1} ms   {label} {vk_ms:8.1} ms   relative={worst:.2e}  beyond tolerance: {mismatches}"
+        );
+        past += seq;
+    }
+    Ok(!failed)
+}
+
 /// Element-wise worst relative difference between two runs, printed per output.
 ///
 /// Separate from the CPU-vs-Vulkan block because it answers a different
@@ -652,6 +838,50 @@ fn main() -> Result<()> {
     };
 
     let mut rng = Rng(args.seed);
+
+    // second session: Vulkan EP, or CPU without optimizations in self-check.
+    // Built before the first run because `--decode` interleaves the two.
+    let mut registered = false;
+    let mut second = if args.self_check {
+        Session::builder()?
+            .with_memory_pattern(args.mem_pattern)?
+            .with_optimization_level(GraphOptimizationLevel::Disable)?
+            .commit_from_file(&args.model)?
+    } else {
+        let path = plugin_path();
+        if !path.exists() {
+            bail!("plugin not found in {} (VULKAN_EP_PATH)", path.display());
+        }
+        plugin::register(&path)?;
+        registered = true;
+        let mut builder = opt(Session::builder()?.with_memory_pattern(args.mem_pattern)?)?;
+        let devices = plugin::append_to_session(&mut builder)?;
+        println!("(Vulkan EP: {devices} device)");
+        builder.commit_from_file(&args.model)?
+    };
+    let label = if args.self_check {
+        "CPU no-opt"
+    } else {
+        "Vulkan EP"
+    };
+
+    if args.decode > 0 {
+        let ok = decode_loop(&mut cpu, &mut second, label, &args, &mut rng)?;
+        drop(second);
+        if registered {
+            plugin::unregister()?;
+        }
+        if !ok {
+            bail!(
+                "divergent outputs beyond atol={:.1e} + rtol={:.1e}·|ref|",
+                args.tol,
+                args.rtol
+            );
+        }
+        println!("OK: {} decode steps within tolerance", args.decode);
+        return Ok(());
+    }
+
     let inputs: Vec<(String, Value)> = match reference_inputs {
         Some(given) => given
             .into_iter()
@@ -687,35 +917,9 @@ fn main() -> Result<()> {
     let (cpu_ms, cpu_min, cpu_max) = steady(&cpu_times);
     println!("CPU EP:    {cpu_ms:8.1} ms (regime)  [min {cpu_min:.1} max {cpu_max:.1}]");
 
-    // second session: Vulkan EP, or CPU without optimizations in self-check
-    let mut registered = false;
-    let mut second = if args.self_check {
-        Session::builder()?
-            .with_memory_pattern(args.mem_pattern)?
-            .with_optimization_level(GraphOptimizationLevel::Disable)?
-            .commit_from_file(&args.model)?
-    } else {
-        let path = plugin_path();
-        if !path.exists() {
-            bail!("plugin not found in {} (VULKAN_EP_PATH)", path.display());
-        }
-        plugin::register(&path)?;
-        registered = true;
-        let mut builder = opt(Session::builder()?.with_memory_pattern(args.mem_pattern)?)?;
-        let devices = plugin::append_to_session(&mut builder)?;
-        println!("(Vulkan EP: {devices} device)");
-        builder.commit_from_file(&args.model)?
-    };
     let (vk_out, vk_times) = run(&mut second, &inputs, args.iters)?;
     let (vk_ms, vk_min, vk_max) = steady(&vk_times);
-    println!(
-        "{}: {vk_ms:8.1} ms (regime)  [min {vk_min:.1} max {vk_max:.1}]",
-        if args.self_check {
-            "CPU no-opt"
-        } else {
-            "Vulkan EP"
-        }
-    );
+    println!("{label}: {vk_ms:8.1} ms (regime)  [min {vk_min:.1} max {vk_max:.1}]");
 
     // comparison
     let mut worst = 0.0f64;

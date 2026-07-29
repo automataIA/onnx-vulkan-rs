@@ -75,10 +75,12 @@ fn matmul_flops(node: &NodeIr, meta: &impl TensorMeta) -> Option<u64> {
         .get("transA")
         .and_then(AttrValue::as_i64)
         .unwrap_or(0);
-    let k = if trans_a == 1 {
-        *a.first()?
-    } else {
-        *a.last()?
+    // `MatMulNBits` states K as an attribute; it agrees with A's last dimension
+    // and is preferred because B carries K only in packed form
+    let k = match node.attrs.get("K").and_then(AttrValue::as_i64) {
+        Some(k) => k,
+        None if trans_a == 1 => *a.first()?,
+        None => *a.last()?,
     };
     Some(2 * elems(&out) * k.max(0) as u64)
 }
@@ -99,7 +101,15 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
     let out_elems = || meta.shape(node.outputs.first()?).map(|s| elems(&s));
     let in_elems = || meta.shape(node.inputs.first()?).map(|s| elems(&s));
     let flops = match node.op.as_str() {
-        "MatMul" | "MatMulInteger" | "Gemm" => matmul_flops(node, meta)?,
+        // `MatMulNBits` counts the same `2·M·N·K` as a dense matmul: the
+        // dequantization is not useful arithmetic, it is the price of the
+        // format — the same reading that gives a split-K reduction zero work.
+        // Its bytes need no special case either, and that is the whole point:
+        // B, scales and zero-points are tensors whose *stored* dtype and shape
+        // are already the packed ones, so the generic traffic model counts
+        // `K·N·bits/8` and not the dequantized weight. Counting the fp32 the
+        // kernel materializes would put a 4-bit LLM above the card's bandwidth.
+        "MatMul" | "MatMulInteger" | "Gemm" | "MatMulNBits" => matmul_flops(node, meta)?,
         "Conv" | "ConvInteger" | "ConvTranspose" => conv_flops(node, meta)?,
         // per-element counts, approximate by construction (see the module doc):
         // an `exp` is not one flop and a `Div` is not one either, but the
@@ -217,6 +227,48 @@ mod tests {
         ]));
         let w = node_work(&node("Conv", &["x", "w"], &["y"]), &meta).unwrap();
         assert_eq!(w.flops, 2 * 64 * 56 * 56 * 64 * 3 * 3);
+    }
+
+    /// gemma3-1b's most frequent `MatMulNBits`, from `matmulnbits-census.py`:
+    /// N=6912, K=1152, 4 bits, block 32, per-block 4-bit zero points.
+    #[test]
+    fn matmulnbits_counts_the_packed_weight_not_the_dequantized_one() {
+        const FLOAT: i32 = 1;
+        const UINT8: i32 = 2;
+        let (n, k, block) = (6912i64, 1152i64, 32i64);
+        let blocks = k / block; // 36
+        let meta = Meta(HashMap::from([
+            ("a", (vec![1, 1, k], FLOAT)),
+            // [N, K/block, block·bits/8] as ONNX Runtime stores it
+            ("b", (vec![n, blocks, block / 2], UINT8)),
+            ("scales", (vec![n * blocks], FLOAT)),
+            // 4-bit zero points, two per byte
+            ("zp", (vec![n, blocks / 2], UINT8)),
+            ("y", (vec![1, 1, n], FLOAT)),
+        ]));
+        let mut node = node("MatMulNBits", &["a", "b", "scales", "zp"], &["y"]);
+        node.attrs.insert("K".into(), AttrValue::Int(k));
+        node.attrs.insert("N".into(), AttrValue::Int(n));
+        node.attrs.insert("bits".into(), AttrValue::Int(4));
+        node.attrs.insert("block_size".into(), AttrValue::Int(block));
+        let w = node_work(&node, &meta).unwrap();
+
+        assert_eq!(w.flops, 2 * n as u64 * k as u64);
+        // 3.98 MB of packed weight, as the census reports — *not* the 31.9 MB
+        // the dequantized fp32 would be
+        let packed = (n * k / 2) as u64;
+        assert_eq!(packed, 3_981_312);
+        let scales = (n * blocks * 4) as u64;
+        let zero_points = (n * blocks / 2) as u64;
+        let activation = (k * 4) as u64;
+        let output = (n * 4) as u64;
+        assert_eq!(
+            w.bytes,
+            packed + scales + zero_points + activation + output
+        );
+        // and the intensity that follows is the one that decides the kernel's
+        // class: far below the 4070's ridge of 57.8 FLOP/B, i.e. memory-bound
+        assert!((w.flops as f64 / w.bytes as f64) < 4.0);
     }
 
     #[test]

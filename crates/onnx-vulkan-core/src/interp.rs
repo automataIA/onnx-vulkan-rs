@@ -61,6 +61,9 @@ use crate::shaders::matmul_integer::{
     TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
+use crate::shaders::gather_block_quantized::{
+    BINDINGS as GBQ_BINDINGS, GATHER_BLOCK_QUANTIZED as GBQ_GATHER, PUSH_BYTES as GBQ_PUSH_BYTES,
+};
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
 };
@@ -139,6 +142,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "MatMul"
             | "MatMulNBits"
             | "Gather"
+            | "GatherBlockQuantized"
             | "Slice"
             | "Where"
             | "Conv"
@@ -286,6 +290,22 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 && present(3)
                 && !present(4)
                 && !present(5)
+        }
+        // 4 bits, same packing as `MatMulNBits`, and the only axis pair that
+        // makes a gathered row contiguous: gather along 0, quantize along the
+        // last axis of a 2-D table. `block_size` must be even so a block starts
+        // on a byte boundary. The zero point is required for the same reason as
+        // in `MatMulNBits` — the kernel binds it unconditionally.
+        "GatherBlockQuantized" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            let block_size = int_attr("block_size", 0);
+            int_attr("bits", 4) == 4
+                && block_size > 0
+                && block_size % 2 == 0
+                && int_attr("gather_axis", 0) == 0
+                && int_attr("quantize_axis", 1) == 1
+                && present(2)
+                && present(3)
         }
         // only the form with `axes` as an attribute and a single axis: with axes
         // as input the value is not known when looking at the node
@@ -436,6 +456,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "MatMul" => matmul_fp32(env, node),
         "MatMulNBits" => matmul_nbits(env, node),
         "Gather" => gather(env, node),
+        "GatherBlockQuantized" => gather_block_quantized(env, node),
         "Slice" => slice(env, node),
         "Where" => where_op(env, node),
         "Conv" => conv_f32(env, node),
@@ -1493,6 +1514,133 @@ fn gather_device(env: &mut Env, node: &NodeIr, axis: i64) -> Result<()> {
             dtype: FLOAT,
             shape: out_shape,
             elem_count: n,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `GatherBlockQuantized` (com.microsoft): `Gather` on a 4-bit block-quantized
+/// table, dequantizing on the way out.
+///
+/// The table's own shape is the packed one — `[rows, cols/2]` u8 — so the
+/// logical column count comes from doubling its last dimension, exactly as
+/// `MatMulNBits` takes `K` from an attribute because the packed shape cannot
+/// state it. Indices are read on the host (they are a shape-sized control
+/// tensor) and re-uploaded as `i32`, like `gather`.
+fn gather_block_quantized(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let ctx = env.context();
+    let block_size = node
+        .attrs
+        .get("block_size")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0) as usize;
+
+    let data_shape = env.shape_of(&node.inputs[0])?;
+    ensure!(
+        data_shape.len() == 2,
+        "GatherBlockQuantized: expected a 2-D table, got {data_shape:?}"
+    );
+    let rows = data_shape[0].max(0) as usize;
+    let row_bytes = data_shape[1].max(0) as usize;
+    let cols = row_bytes * 2;
+    ensure!(
+        cols > 0 && cols.is_multiple_of(block_size),
+        "GatherBlockQuantized: {cols} columns is not a multiple of block_size {block_size}"
+    );
+    let n_blocks = cols / block_size;
+
+    let idx_host = env.host(&node.inputs[1])?;
+    let idx_shape = idx_host.shape.clone();
+    let idx_i32: Vec<i32> = idx_host
+        .to_i64()?
+        .into_iter()
+        .map(|mut g| {
+            if g < 0 {
+                g += rows as i64;
+            }
+            g as i32
+        })
+        .collect();
+    ensure!(
+        idx_i32.iter().all(|&g| g >= 0 && (g as usize) < rows),
+        "GatherBlockQuantized: an index falls outside the {rows}-row table"
+    );
+    let idx_count = idx_i32.len();
+
+    // the table stays packed in VRAM: dequantizing it here would cost 8× the
+    // memory of the model's largest initializer to read one row per token
+    for name in [&node.inputs[0], &node.inputs[2], &node.inputs[3]] {
+        env.ensure_device_dtype(name)?;
+    }
+    let quant = env.device(&node.inputs[0])?;
+    let scales = env.device(&node.inputs[2])?;
+    let zero_points = env.device(&node.inputs[3])?;
+    ensure!(
+        quant.dtype == UINT8 && zero_points.dtype == UINT8 && scales.dtype == FLOAT,
+        "GatherBlockQuantized: expected a u8 table and zero point with f32 scales, got {}/{}/{}",
+        quant.dtype,
+        zero_points.dtype,
+        scales.dtype
+    );
+    let zp_row_bytes = n_blocks.div_ceil(2);
+    ensure!(
+        scales.elem_count >= rows * n_blocks && zero_points.elem_count >= rows * zp_row_bytes,
+        "GatherBlockQuantized: scales or zero points are short for {rows}×{n_blocks} blocks"
+    );
+
+    let mut out_shape = idx_shape;
+    out_shape.push(cols as i64);
+    let count = idx_count * cols;
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, count)?)?;
+
+    let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let idx_buf = ctx.create_storage_buffer(idx_bytes.len().max(4) as u64)?;
+    ctx.stream_upload(&idx_buf, &idx_bytes)?;
+
+    if count > 0 {
+        let groups = (count as u32).div_ceil(256);
+        let gx = groups.min(32768);
+        let mut push = Vec::with_capacity(GBQ_PUSH_BYTES as usize);
+        for v in [
+            count as u32,
+            cols as u32,
+            row_bytes as u32,
+            n_blocks as u32,
+            block_size as u32,
+            zp_row_bytes as u32,
+            gx,
+            0,
+        ] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "GatherBlockQuantized",
+            || ctx.create_pipeline(&compile_wgsl(GBQ_GATHER)?, GBQ_BINDINGS, GBQ_PUSH_BYTES),
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[
+                        quant.buffer(),
+                        &idx_buf,
+                        scales.buffer(),
+                        zero_points.buffer(),
+                        &out,
+                    ],
+                    &push,
+                    [gx, groups.div_ceil(gx), 1],
+                )
+            },
+        )?;
+    }
+    ctx.defer_destroy(idx_buf);
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count: count,
             buf: BufRef::Owned(out),
         }),
     );

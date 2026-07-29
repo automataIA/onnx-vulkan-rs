@@ -550,6 +550,18 @@ fn infer_node(
                 attr_i64(node, "axis", 0),
             ),
         }],
+        // the table is packed two 4-bit elements per byte, so a gathered row is
+        // twice its last dimension wide; the output dtype is the scales', not
+        // the table's
+        "GatherBlockQuantized" => vec![TensorType {
+            dtype: Some(FLOAT),
+            shape: ctx.shape_of(node, 1).and_then(|indices| {
+                let cols = first.shape.as_ref()?.last()?.fixed()?;
+                let mut out = indices;
+                out.push(Dim::Fixed(cols * 2));
+                Some(out)
+            }),
+        }],
         "GatherElements" => vec![TensorType {
             dtype: first.dtype,
             shape: ctx.shape_of(node, 1),

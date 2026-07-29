@@ -167,6 +167,20 @@ def _matmul_nbits_ok(node, _consts) -> bool:
     )
 
 
+def _gather_block_quantized_ok(node, _consts) -> bool:
+    present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
+    block_size = _attr(node, "block_size", 0)
+    return (
+        _attr(node, "bits", 4) == 4
+        and block_size > 0
+        and block_size % 2 == 0
+        and _attr(node, "gather_axis", 0) == 0
+        and _attr(node, "quantize_axis", 1) == 1
+        and present(2)
+        and present(3)
+    )
+
+
 #: Per-node constraints, mirroring the arms of `is_implemented_node`.
 NODE_RULES = {
     "Resize": _resize_ok,
@@ -185,6 +199,7 @@ NODE_RULES = {
     "SimplifiedLayerNormalization": _simplified_layernorm_ok,
     "GroupQueryAttention": _gqa_ok,
     "MatMulNBits": _matmul_nbits_ok,
+    "GatherBlockQuantized": _gather_block_quantized_ok,
 }
 
 

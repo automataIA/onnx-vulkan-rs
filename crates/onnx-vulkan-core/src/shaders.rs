@@ -6,6 +6,7 @@ pub mod conv_integer;
 pub mod conv_transpose;
 pub mod dynamic_quantize;
 pub mod elementwise;
+pub mod gather_block_quantized;
 pub mod gemm;
 pub mod grid_sample;
 pub mod matmul_fp32;

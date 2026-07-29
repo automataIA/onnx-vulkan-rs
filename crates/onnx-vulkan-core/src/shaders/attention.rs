@@ -19,6 +19,16 @@
 //! | scores / probabilities | `[b, nh, s, total]` |
 //! | output | `[b, s, nh·H]` |
 //!
+//! The key/value kernels take the time extent of `present_*` **twice**: `total`
+//! bounds the loop, `stride` addresses the buffer. They are equal here — the
+//! cache is exactly as long as it is full — and the pair exists for the
+//! resident cache that replaces this one. A buffer that survives across tokens
+//! has to be laid out for the longest sequence it will ever hold, because the
+//! row stride of `[b, kvh, T, H]` is `T`: let `T` grow with the cache and every
+//! token already written changes address. Splitting the two now keeps the
+//! stateless path bit-identical (`stride == total`) while the addressing is
+//! already the one the resident path needs.
+//!
 //! The scores tensor is materialized: at `s = total = 512` and four heads it
 //! is 4 MB, and having it lets the softmax be the existing row kernel instead
 //! of an online rescan. A flash-attention formulation removes it and is the
@@ -29,9 +39,9 @@ pub const PACK_PUSH_BYTES: u32 = 40;
 pub const PAST_BINDINGS: u32 = 2;
 pub const PAST_PUSH_BYTES: u32 = 20;
 pub const SCORES_BINDINGS: u32 = 4;
-pub const SCORES_PUSH_BYTES: u32 = 44;
+pub const SCORES_PUSH_BYTES: u32 = 48;
 pub const OUT_BINDINGS: u32 = 3;
-pub const OUT_PUSH_BYTES: u32 = 28;
+pub const OUT_PUSH_BYTES: u32 = 32;
 
 /// Threads per workgroup for every kernel in this module.
 pub const WG: u32 = 256;
@@ -93,14 +103,17 @@ fn main(
 }
 "#;
 
-/// `[b, n, past_len, H]` → the first `past_len` time steps of
-/// `[b, n, total, H]`. A plain copy, but a strided one: batch and head are
+/// `[b, n, past_len, H]` → the first `past_len` time steps of a destination of
+/// row stride `stride`. A plain copy, but a strided one: batch and head are
 /// contiguous in both, the time axis is not.
+///
+/// The dispatch disappears entirely once the cache is resident, because source
+/// and destination are then the same memory.
 pub const PAST: &str = r#"
 @group(0) @binding(0) var<storage, read> past: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 
-struct Push { count: u32, past_len: u32, total: u32, h: u32, gx: u32 }
+struct Push { count: u32, past_len: u32, stride: u32, h: u32, gx: u32 }
 var<immediate> pc: Push;
 
 @compute @workgroup_size(256)
@@ -115,7 +128,7 @@ fn main(
     let t = rest % pc.past_len;
     // batch and head share one index: both layouts order them the same way
     let bh = rest / pc.past_len;
-    dst[(bh * pc.total + t) * pc.h + d] = past[i];
+    dst[(bh * pc.stride + t) * pc.h + d] = past[i];
 }
 "#;
 
@@ -141,7 +154,7 @@ pub const SCORES: &str = r#"
 struct Push {
     count: u32, nh: u32, kvh: u32, h: u32,
     s: u32, total: u32, past: u32, scale: f32,
-    window: i32, has_bias: u32, gx: u32,
+    window: i32, has_bias: u32, stride: u32, gx: u32,
 }
 var<immediate> pc: Push;
 
@@ -170,7 +183,7 @@ fn main(
     // grouped query: several query heads share one key/value head
     let hkv = head / (pc.nh / pc.kvh);
     let qb = ((batch * pc.nh + head) * pc.s + sq) * pc.h;
-    let kb = ((batch * pc.kvh + hkv) * pc.total + t) * pc.h;
+    let kb = ((batch * pc.kvh + hkv) * pc.stride + t) * pc.h;
     var acc = 0.0;
     for (var d = 0u; d < pc.h; d = d + 1u) {
         acc = acc + q[qb + d] * k[kb + d];
@@ -193,7 +206,7 @@ pub const OUT: &str = r#"
 @group(0) @binding(1) var<storage, read> v: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 
-struct Push { count: u32, nh: u32, kvh: u32, h: u32, s: u32, total: u32, gx: u32 }
+struct Push { count: u32, nh: u32, kvh: u32, h: u32, s: u32, total: u32, stride: u32, gx: u32 }
 var<immediate> pc: Push;
 
 @compute @workgroup_size(256)
@@ -212,7 +225,7 @@ fn main(
 
     let hkv = head / (pc.nh / pc.kvh);
     let pb = ((batch * pc.nh + head) * pc.s + sq) * pc.total;
-    let vb = (batch * pc.kvh + hkv) * pc.total * pc.h + d;
+    let vb = (batch * pc.kvh + hkv) * pc.stride * pc.h + d;
     var acc = 0.0;
     for (var t = 0u; t < pc.total; t = t + 1u) {
         acc = acc + probs[pb + t] * v[vb + t * pc.h];

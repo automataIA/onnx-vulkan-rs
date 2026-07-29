@@ -3671,9 +3671,15 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         q
     };
 
+    // Physical time extent of `present_key`/`present_value`, as opposed to the
+    // `total` the graph fills. They coincide while the cache is rebuilt on
+    // every call; a resident cache is laid out for `max_seq_len` instead,
+    // because the row stride of `[b, kvh, T, H]` is `T` and a growing `T`
+    // would move every token already written.
+    let kv_stride = total;
     let alloc = |elems: usize| ctx.create_storage_buffer((elems.max(1) * 4) as u64);
-    let present_k = alloc(b * kvh * total * head_size)?;
-    let present_v = alloc(b * kvh * total * head_size)?;
+    let present_k = alloc(b * kvh * kv_stride * head_size)?;
+    let present_v = alloc(b * kvh * kv_stride * head_size)?;
     let q_rot = alloc(b * nh * s * head_size)?;
     let scores = alloc(b * nh * s * total)?;
     let probs = alloc(b * nh * s * total)?;
@@ -3687,7 +3693,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         for value in [
             past_count as u32,
             past as u32,
-            total as u32,
+            kv_stride as u32,
             head_size as u32,
             gx,
         ] {
@@ -3760,8 +3766,8 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         )
     };
     pack(env.cache(), q.buffer(), &q_rot, nh, s, 0, do_rotary)?;
-    pack(env.cache(), k.buffer(), &present_k, kvh, total, past, do_rotary)?;
-    pack(env.cache(), v.buffer(), &present_v, kvh, total, past, false)?;
+    pack(env.cache(), k.buffer(), &present_k, kvh, kv_stride, past, do_rotary)?;
+    pack(env.cache(), v.buffer(), &present_v, kvh, kv_stride, past, false)?;
 
     let score_count = b * nh * s * total;
     if score_count > 0 {
@@ -3782,6 +3788,10 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         push.extend_from_slice(&scale.to_le_bytes());
         push.extend_from_slice(&(window.clamp(-1, i32::MAX as i64) as i32).to_le_bytes());
         push.extend_from_slice(&u32::from(has_bias).to_le_bytes());
+        // physical time extent of the K/V buffers; see the note on
+        // `shaders::attention`. Equal to `total` while the cache is rebuilt
+        // per run, and `max_seq_len` once it is resident.
+        push.extend_from_slice(&(kv_stride as u32).to_le_bytes());
         push.extend_from_slice(&gx.to_le_bytes());
         with_pipeline(
             env.cache(),
@@ -3835,6 +3845,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
             head_size as u32,
             s as u32,
             total as u32,
+            kv_stride as u32,
             gx,
         ] {
             push.extend_from_slice(&value.to_le_bytes());

@@ -292,3 +292,78 @@ fn softmax_more_rows_than_one_grid_dimension() {
     // dispatch must fall back to the 2D grid
     softmax_case(&[40000, 4], -1);
 }
+
+/// `SimplifiedLayerNormalization` (RMS norm): `x / sqrt(mean(x²) + eps) · scale`.
+///
+/// It shares a kernel with `LayerNormalization` and differs by one term, so the
+/// test that matters is that the mean is **not** subtracted: on data with a
+/// non-zero mean the two forms give different answers, and a flag wired the
+/// wrong way would pass any test on centred input.
+fn rms_norm_case(rows: usize, c: usize, mean_offset: f32) {
+    const EPS: f32 = 1e-5;
+    let n = rows * c;
+    let mut state = 11u64;
+    let x: Vec<f32> = (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / (1u64 << 29) as f32) - 2.0 + mean_offset
+        })
+        .collect();
+    let scale: Vec<f32> = (0..c).map(|i| 0.5 + i as f32 * 0.01).collect();
+
+    let mut want = vec![0.0f32; n];
+    for row in 0..rows {
+        let base = row * c;
+        let mean_square: f32 = x[base..base + c].iter().map(|v| v * v).sum::<f32>() / c as f32;
+        let inv_rms = 1.0 / (mean_square + EPS).sqrt();
+        for i in 0..c {
+            want[base + i] = x[base + i] * inv_rms * scale[i];
+        }
+    }
+
+    let ir = GraphIr {
+        nodes: vec![node(
+            "SimplifiedLayerNormalization",
+            &["x", "scale"],
+            &["out"],
+            &[
+                ("epsilon", AttrValue::Float(EPS)),
+                ("axis", AttrValue::Int(-1)),
+            ],
+        )],
+        initializers: HashMap::new(),
+        inputs: vec!["x".to_string(), "scale".to_string()],
+        outputs: vec!["out".to_string()],
+    };
+    let dims = vec![rows as i64, c as i64];
+    let out = run(
+        &ir,
+        &[
+            ("x", HostTensor::from_f32(dims.clone(), &x)),
+            ("scale", HostTensor::from_f32(vec![c as i64], &scale)),
+        ],
+        "out",
+    );
+    assert_eq!(out.shape, dims);
+    let got = out.to_f32().expect("output f32");
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+            "SimplifiedLayerNormalization rows={rows} c={c}: element {i}: {g} vs expected {w}"
+        );
+    }
+}
+
+#[test]
+fn simplified_layernorm_does_not_subtract_the_mean() {
+    // gemma3-1b normalizes over 1152 and 256 channels; the offset makes the
+    // row mean far from zero, which is where RMS and LayerNorm diverge
+    rms_norm_case(4, 1152, 3.0);
+    rms_norm_case(7, 256, -2.5);
+}
+
+#[test]
+fn simplified_layernorm_handles_rows_longer_than_the_workgroup() {
+    // 6912 = gemma's MLP width: the reduction loops several times per thread
+    rms_norm_case(2, 6912, 1.0);
+}

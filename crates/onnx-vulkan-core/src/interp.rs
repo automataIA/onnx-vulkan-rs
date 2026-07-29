@@ -110,6 +110,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "Relu"
             | "Softmax"
             | "LayerNormalization"
+            | "SimplifiedLayerNormalization"
             | "Cast"
             | "Mul"
             | "Add"
@@ -222,6 +223,12 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 )
         }
         "MaxPool" | "AveragePool" => int_attr("ceil_mode", 0) == 0 && node.outputs.len() == 1,
+        // the schema's optional second output is `inv_std_var`, which the kernel
+        // does not produce: claiming a node that asks for it would silently
+        // leave a value undefined
+        "SimplifiedLayerNormalization" => {
+            node.outputs.iter().filter(|o| !o.is_empty()).count() == 1
+        }
         // only the form with `axes` as an attribute and a single axis: with axes
         // as input the value is not known when looking at the node
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" => node
@@ -352,7 +359,8 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Sigmoid" => unary(env, node, "sigmoid", "1.0 / (1.0 + exp(-v))"),
         "Relu" => unary(env, node, "relu", "max(v, 0.0)"),
         "Softmax" => softmax(env, node),
-        "LayerNormalization" => layernorm(env, node),
+        "LayerNormalization" => layernorm(env, node, false),
+        "SimplifiedLayerNormalization" => layernorm(env, node, true),
         "Cast" => cast(env, node),
         "Mul" => elementwise_binary(env, node, "a[off_a] * b[off_b]", BinOp::Mul),
         "Add" => elementwise_binary(env, node, "a[off_a] + b[off_b]", BinOp::Add),
@@ -3308,9 +3316,17 @@ fn softmax(env: &mut Env, node: &NodeIr) -> Result<()> {
 
 /// `LayerNormalization` f32 on the last dimension; scale (+optional bias)
 /// typically a per-channel initializer.
-fn layernorm(env: &mut Env, node: &NodeIr) -> Result<()> {
+///
+/// `simplified` selects `SimplifiedLayerNormalization` (RMS normalization):
+/// same reduction, no mean subtracted, and no bias input in the schema.
+fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
     let ctx = env.context();
-    let has_bias = node.inputs.len() > 2 && !node.inputs[2].is_empty();
+    let op = if simplified {
+        "SimplifiedLayerNormalization"
+    } else {
+        "LayerNormalization"
+    };
+    let has_bias = !simplified && node.inputs.len() > 2 && !node.inputs[2].is_empty();
     env.ensure_device(&node.inputs[0])?;
     env.ensure_device(&node.inputs[1])?;
     if has_bias {
@@ -3330,11 +3346,11 @@ fn layernorm(env: &mut Env, node: &NodeIr) -> Result<()> {
         scale
     };
     let (shape, elem_count) = (x.shape.clone(), x.elem_count);
-    last_axis(node, shape.len() as i64, "LayerNormalization")?;
-    let (c, rows) = row_cols(&shape, elem_count, "LayerNormalization")?;
+    last_axis(node, shape.len() as i64, op)?;
+    let (c, rows) = row_cols(&shape, elem_count, op)?;
     ensure!(
         scale.elem_count == c,
-        "LayerNormalization: scale elem {} != {c}",
+        "{op}: scale elem {} != {c}",
         scale.elem_count
     );
     let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
@@ -3343,9 +3359,12 @@ fn layernorm(env: &mut Env, node: &NodeIr) -> Result<()> {
         push.extend_from_slice(&(c as u32).to_le_bytes());
         push.extend_from_slice(&epsilon.to_le_bytes());
         push.extend_from_slice(&(has_bias as u32).to_le_bytes());
+        push.extend_from_slice(&(simplified as u32).to_le_bytes());
+        // separate Pareto keys for the same pipeline: the two forms cost
+        // differently and an LLM runs only one of them
         with_pipeline(
             env.cache(),
-            "LayerNormalization",
+            op,
             || {
                 ctx.create_pipeline(
                     &compile_wgsl(LAYERNORM)?,

@@ -1,10 +1,10 @@
 //! Shared shaders and dispatch layouts for row normalizations
-//! (`Softmax`, `LayerNormalization`).
+//! (`Softmax`, `LayerNormalization`, `SimplifiedLayerNormalization`).
 
 pub const SOFTMAX_BINDINGS: u32 = 2;
 pub const SOFTMAX_PUSH_BYTES: u32 = 16;
 pub const LAYERNORM_BINDINGS: u32 = 4;
-pub const LAYERNORM_PUSH_BYTES: u32 = 12;
+pub const LAYERNORM_PUSH_BYTES: u32 = 16;
 
 /// Numerically stable f32 Softmax on **any axis**: one workgroup per
 /// row, max → sum of exps → normalization, with shared memory reductions.
@@ -33,7 +33,7 @@ fn main(
     // row r → (outer, inner_idx): base = outer * c * inner + inner_idx
     let base = (row / pc.inner) * pc.c * pc.inner + (row % pc.inner);
 
-    // 1) max di riga
+    // 1) row max
     var m = -3.4028235e38;
     var i = lid.x;
     while (i < pc.c) {
@@ -53,7 +53,7 @@ fn main(
     let row_max = sred[0];
     workgroupBarrier();
 
-    // 2) somma exp
+    // 2) sum of exps
     var sum = 0.0;
     i = lid.x;
     while (i < pc.c) {
@@ -72,7 +72,7 @@ fn main(
     }
     let inv_sum = 1.0 / sred[0];
 
-    // 3) scrittura
+    // 3) write-out
     i = lid.x;
     while (i < pc.c) {
         out[base + i * pc.inner] = exp(x[base + i * pc.inner] - row_max) * inv_sum;
@@ -83,13 +83,20 @@ fn main(
 
 /// f32 LayerNormalization: one workgroup per row, sum/sum-of-squares reduction
 /// in shared memory → mean and variance → optional scale and bias (`has_bias`).
+///
+/// `simplified` switches it to **RMS normalization**
+/// (`SimplifiedLayerNormalization`, 157 nodes of gemma3-1b): the mean is not
+/// subtracted and the denominator is the root mean square, so the sum
+/// reduction is skipped entirely. The two share a kernel because they differ by
+/// that one term; the branch is on a push constant, hence uniform across the
+/// workgroup and free of divergence.
 pub const LAYERNORM: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
-struct Push { c: u32, eps: f32, has_bias: u32 }
+struct Push { c: u32, eps: f32, has_bias: u32, simplified: u32 }
 var<immediate> pc: Push;
 
 var<workgroup> ssum: array<f32, 256>;
@@ -102,6 +109,7 @@ fn main(
 ) {
     let row = wid.x;
     let base = row * pc.c;
+    let centered = pc.simplified == 0u;
     var sum = 0.0;
     var sq = 0.0;
     var i = lid.x;
@@ -123,7 +131,12 @@ fn main(
         workgroupBarrier();
         s = s / 2u;
     }
-    let mean = ssum[0] / f32(pc.c);
+    // RMS normalization is this one minus the mean: the denominator becomes
+    // the root mean square of the row and nothing is subtracted from x
+    var mean = 0.0;
+    if (centered) {
+        mean = ssum[0] / f32(pc.c);
+    }
     let variance = ssq[0] / f32(pc.c) - mean * mean;
     let inv_std = inverseSqrt(variance + pc.eps);
     i = lid.x;
@@ -143,7 +156,7 @@ mod tests {
     #[test]
     fn sources_compile() {
         for source in [super::SOFTMAX, super::LAYERNORM] {
-            vk_compute::compile_wgsl(source).expect("shader di normalizzazione valido");
+            vk_compute::compile_wgsl(source).expect("valid normalization shader");
         }
     }
 }

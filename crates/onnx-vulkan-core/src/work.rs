@@ -118,7 +118,8 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         "LayerNormalization"
         | "InstanceNormalization"
         | "BatchNormalization"
-        | "SkipLayerNormalization" => 5 * out_elems()?,
+        | "SkipLayerNormalization"
+        | "SimplifiedLayerNormalization" => 5 * out_elems()?,
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceL2"
         | "GlobalAveragePool" | "MaxPool" | "AveragePool" => in_elems()?,
         "Add"
@@ -250,7 +251,8 @@ mod tests {
         node.attrs.insert("K".into(), AttrValue::Int(k));
         node.attrs.insert("N".into(), AttrValue::Int(n));
         node.attrs.insert("bits".into(), AttrValue::Int(4));
-        node.attrs.insert("block_size".into(), AttrValue::Int(block));
+        node.attrs
+            .insert("block_size".into(), AttrValue::Int(block));
         let w = node_work(&node, &meta).unwrap();
 
         assert_eq!(w.flops, 2 * n as u64 * k as u64);
@@ -262,10 +264,7 @@ mod tests {
         let zero_points = (n * blocks / 2) as u64;
         let activation = (k * 4) as u64;
         let output = (n * 4) as u64;
-        assert_eq!(
-            w.bytes,
-            packed + scales + zero_points + activation + output
-        );
+        assert_eq!(w.bytes, packed + scales + zero_points + activation + output);
         // and the intensity that follows is the one that decides the kernel's
         // class: far below the 4070's ridge of 57.8 FLOP/B, i.e. memory-bound
         assert!((w.flops as f64 / w.bytes as f64) < 4.0);

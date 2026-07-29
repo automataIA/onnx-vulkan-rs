@@ -18,6 +18,7 @@ pub struct ExecutionEnv<'context, 'values> {
     values: HashMap<String, Tensor<'values>>,
     initializers: &'values HashMap<String, InitializerIr>,
     host_cache: RefCell<HashMap<String, HostTensor>>,
+    bound_outputs: HashMap<String, (&'values vk_compute::GpuBuffer, usize)>,
 }
 
 impl<'context, 'values> ExecutionEnv<'context, 'values> {
@@ -33,7 +34,35 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             values: HashMap::new(),
             initializers,
             host_cache: RefCell::new(HashMap::new()),
+            bound_outputs: HashMap::new(),
         }
+    }
+
+    /// Hands a kernel a buffer to write one of its outputs into, instead of
+    /// letting it allocate one.
+    ///
+    /// `capacity` is in elements and may exceed what this run produces: that is
+    /// the point. A KV cache is allocated once for the longest sequence it will
+    /// ever hold and written a token at a time, so the buffer outlives the run
+    /// and its physical extent is not the run's logical one. The buffer is
+    /// borrowed, which is also what keeps it out of `release`/`release_owned` —
+    /// both only ever touch `DeviceBuffer::Owned`.
+    ///
+    /// Only kernels that look for it honour it; everything else allocates as
+    /// before.
+    pub fn bind_output(
+        &mut self,
+        name: &str,
+        buffer: &'values vk_compute::GpuBuffer,
+        capacity: usize,
+    ) {
+        self.bound_outputs
+            .insert(name.to_owned(), (buffer, capacity));
+    }
+
+    /// The buffer bound for `name`, with its capacity in elements.
+    pub fn bound_output(&self, name: &str) -> Option<(&'values vk_compute::GpuBuffer, usize)> {
+        self.bound_outputs.get(name).copied()
     }
 
     pub fn context(&self) -> &'context VkContext {

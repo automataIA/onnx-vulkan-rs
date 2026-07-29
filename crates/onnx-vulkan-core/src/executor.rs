@@ -14,7 +14,7 @@
 use crate::{
     ExecutionEnv, GraphIr, HostTensor, KernelCache, Result, Tensor, execute, is_implemented_node,
 };
-use vk_compute::VkContext;
+use vk_compute::{GpuBuffer, VkContext};
 
 /// A graph plus the GPU resources reused across its runs.
 ///
@@ -100,9 +100,32 @@ impl<'context> Executor<'context> {
     /// output into a buffer of its own inside the same command buffer, without
     /// a round trip through host memory.
     pub fn run<'a>(&'a self, inputs: Vec<(&str, Tensor<'a>)>) -> Result<Outputs<'a>> {
+        self.run_with_outputs(inputs, Vec::new())
+    }
+
+    /// Runs the graph writing the named values into buffers the caller already
+    /// owns, rather than into freshly allocated ones.
+    ///
+    /// Each entry is `(name, buffer, capacity_in_elements)`, and the capacity
+    /// may exceed what this run writes. That is what makes a KV cache resident:
+    /// the buffer is allocated once for the longest sequence, survives the run
+    /// because it is borrowed rather than owned, and can be passed back as the
+    /// *input* of the next run — at which point the kernel writing it can see
+    /// that source and destination are the same memory and skip the copy.
+    ///
+    /// A name nothing honours is silently unused: only kernels that look for a
+    /// bound output take one, everything else allocates as before.
+    pub fn run_with_outputs<'a>(
+        &'a self,
+        inputs: Vec<(&str, Tensor<'a>)>,
+        bound: Vec<(&str, &'a GpuBuffer, usize)>,
+    ) -> Result<Outputs<'a>> {
         let mut env = ExecutionEnv::new(&self.cache, &self.ir.initializers);
         for (name, tensor) in inputs {
             env.set(name, tensor);
+        }
+        for (name, buffer, capacity) in bound {
+            env.bind_output(name, buffer, capacity);
         }
         execute(&self.ir, &mut env)?;
         Ok(Outputs { env })

@@ -3720,17 +3720,25 @@ fn attn_grid(count: usize) -> ([u32; 3], u32) {
 
 /// `GroupQueryAttention` (com.microsoft), 26 nodes of gemma3-1b.
 ///
-/// Stateless by construction: `present_*` is a fresh tensor holding a copy of
+/// Stateless by default: `present_*` is a fresh tensor holding a copy of
 /// `past_*` plus the new step, so the node is a pure function of its inputs and
-/// can be diffed node by node against the CPU EP. The cache copy it pays for is
-/// the generation runtime's problem, not the kernel's.
+/// can be diffed node by node against the CPU EP.
+///
+/// A caller running a generation loop can instead **bind** `present_key` and
+/// `present_value` to buffers it owns (`Executor::run_with_outputs`) and pass
+/// the same buffers back as `past_key`/`past_value`. Then the physical time
+/// extent is the buffer's capacity rather than `total`, the new token is
+/// written straight to its slot, and the cache copy — `GQA_past`, the whole
+/// cache per node per token — is skipped because source and destination are
+/// the same memory. The arithmetic is unchanged: both paths run the same
+/// dispatches with the same push constants except for `stride`.
 ///
 /// `seqlens_k` and `total_sequence_length` are **not read**: the lengths follow
 /// from the shapes of `past_key` and `key`, which is equivalent as long as
 /// every sequence in the batch has the same length. That holds trivially at
 /// `b = 1` and cannot be checked without a readback otherwise, so `b > 1` is
 /// refused rather than guessed.
-fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
+fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> Result<()> {
     let int_attr = |name: &str, default: i64| {
         node.attrs
             .get(name)
@@ -3819,23 +3827,70 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         q
     };
 
+    let alloc = |elems: usize| ctx.create_storage_buffer((elems.max(1) * 4) as u64);
+
     // Physical time extent of `present_key`/`present_value`, as opposed to the
     // `total` the graph fills. They coincide while the cache is rebuilt on
-    // every call; a resident cache is laid out for `max_seq_len` instead,
-    // because the row stride of `[b, kvh, T, H]` is `T` and a growing `T`
-    // would move every token already written.
-    let kv_stride = total;
-    let alloc = |elems: usize| ctx.create_storage_buffer((elems.max(1) * 4) as u64);
-    let present_k = alloc(b * kvh * kv_stride * head_size)?;
-    let present_v = alloc(b * kvh * kv_stride * head_size)?;
+    // every call; a bound cache is laid out for `max_seq_len` instead, because
+    // the row stride of `[b, kvh, T, H]` is `T` and a growing `T` would move
+    // every token already written.
+    let row = b * kvh * head_size;
+    let bound = match (
+        env.bound_output(&node.outputs[1]),
+        env.bound_output(&node.outputs[2]),
+    ) {
+        (Some(key), Some(value)) => Some((key, value)),
+        (None, None) => None,
+        _ => bail!("GroupQueryAttention: bind present_key and present_value together or not at all"),
+    };
+    let (present_k, present_v, kv_stride) = match bound {
+        Some(((k_buf, k_cap), (v_buf, v_cap))) => {
+            ensure!(
+                row > 0 && k_cap == v_cap && k_cap.is_multiple_of(row),
+                "GroupQueryAttention: a bound cache of {k_cap}/{v_cap} elements is not a whole \
+                 number of {row}-element time steps"
+            );
+            let stride = k_cap / row;
+            ensure!(
+                stride >= total,
+                "GroupQueryAttention: the bound cache holds {stride} tokens, the graph asks for {total}"
+            );
+            // `[b, kvh, total, head_size]` describes the written prefix of the
+            // buffer only when there is a single `(batch, kv head)` row: with
+            // more, the written tokens of each row sit `stride` apart and the
+            // logical shape would lie about the layout.
+            ensure!(
+                stride == total || b * kvh == 1,
+                "GroupQueryAttention: a cache longer than the sequence is only addressable at \
+                 batch × kv_heads == 1, got {b}×{kvh}"
+            );
+            (BufRef::Borrowed(k_buf), BufRef::Borrowed(v_buf), stride)
+        }
+        None => (
+            BufRef::Owned(alloc(row * total)?),
+            BufRef::Owned(alloc(row * total)?),
+            total,
+        ),
+    };
+    let (present_k_buf, present_v_buf) = (present_k.get(), present_v.get());
+
     let q_rot = alloc(b * nh * s * head_size)?;
     let scores = alloc(b * nh * s * total)?;
     let probs = alloc(b * nh * s * total)?;
     let out = alloc(b * s * nh * head_size)?;
 
-    // 1) past cache into the head of `present`
+    // 1) past cache into the head of `present` — unless it is already there.
+    //    A caller that bound the cache and passed it back as `past_*` is
+    //    handing us the same memory for source and destination, so the copy is
+    //    a no-op that would race with itself.
+    let aliased = |past: &DevTensor<'_>, present: &GpuBuffer| past.buffer().buffer == present.buffer;
+    let in_place = aliased(past_k, present_k_buf);
+    ensure!(
+        in_place == aliased(past_v, present_v_buf),
+        "GroupQueryAttention: past_key and past_value must both alias the present cache or neither"
+    );
     let past_count = b * kvh * past * head_size;
-    if past_count > 0 {
+    if past_count > 0 && !in_place {
         let (grid, gx) = attn_grid(past_count);
         let mut push = Vec::with_capacity(ATTN_PAST_PUSH_BYTES as usize);
         for value in [
@@ -3847,7 +3902,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         ] {
             push.extend_from_slice(&value.to_le_bytes());
         }
-        for (src, dst) in [(past_k, &present_k), (past_v, &present_v)] {
+        for (src, dst) in [(past_k, present_k_buf), (past_v, present_v_buf)] {
             with_pipeline(
                 env.cache(),
                 "GQA_past",
@@ -3914,8 +3969,8 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         )
     };
     pack(env.cache(), q.buffer(), &q_rot, nh, s, 0, do_rotary)?;
-    pack(env.cache(), k.buffer(), &present_k, kvh, kv_stride, past, do_rotary)?;
-    pack(env.cache(), v.buffer(), &present_v, kvh, kv_stride, past, false)?;
+    pack(env.cache(), k.buffer(), present_k_buf, kvh, kv_stride, past, do_rotary)?;
+    pack(env.cache(), v.buffer(), present_v_buf, kvh, kv_stride, past, false)?;
 
     let score_count = b * nh * s * total;
     if score_count > 0 {
@@ -3954,7 +4009,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[&q_rot, &present_k, bias.buffer(), &scores],
+                    &[&q_rot, present_k_buf, bias.buffer(), &scores],
                     &push,
                     grid,
                 )
@@ -4008,7 +4063,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
                     ATTN_OUT_PUSH_BYTES,
                 )
             },
-            |pipe| ctx.stream_dispatch(pipe, &[&probs, &present_v, &out], &push, grid),
+            |pipe| ctx.stream_dispatch(pipe, &[&probs, present_v_buf, &out], &push, grid),
         )?;
     }
 
@@ -4030,14 +4085,24 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         head_size as i64,
     );
     env.set(&node.outputs[0], device(vec![b, s, nh * head_size], out));
-    env.set(
-        &node.outputs[1],
-        device(vec![b, kvh, total, head_size], present_k),
-    );
-    env.set(
-        &node.outputs[2],
-        device(vec![b, kvh, total, head_size], present_v),
-    );
+    // the cache keeps whichever ownership it came with: `Owned` when this call
+    // allocated it, `Borrowed` when the caller did — and `Borrowed` is exactly
+    // what `release`/`release_owned` step over, so a bound cache survives the run
+    for (name, buf) in [
+        (&node.outputs[1], present_k),
+        (&node.outputs[2], present_v),
+    ] {
+        let shape = vec![b, kvh, total, head_size];
+        env.set(
+            name,
+            Tensor::Device(DevTensor {
+                dtype: FLOAT,
+                elem_count: shape.iter().map(|d| (*d).max(0) as usize).product(),
+                shape,
+                buf,
+            }),
+        );
+    }
     Ok(())
 }
 

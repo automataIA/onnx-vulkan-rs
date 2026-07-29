@@ -27,11 +27,12 @@
 //!
 //! The Vulkan device is created once per process, on first use.
 
-use onnx_vulkan_core::{Executor, Tensor};
+use onnx_vulkan_core::{DeviceBuffer, DeviceTensor, Executor, Tensor};
+use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
 use std::sync::OnceLock;
-use vk_compute::VkContext;
+use vk_compute::{GpuBuffer, VkContext};
 
 pub use onnx_vulkan_core::graph::ElementType;
 pub use onnx_vulkan_core::host_ops::HostTensor;
@@ -233,6 +234,232 @@ impl Session {
         Ok(Run {
             outputs: self.executor.run(bound)?,
         })
+    }
+
+    /// Runs one step of a sequence against a resident cache.
+    ///
+    /// The caller supplies only the inputs that are not cache — the tokens,
+    /// the mask, the positions. The `past_key_values.*` are the cache itself,
+    /// bound as views over the buffers the previous step wrote, and the
+    /// `present.*` are bound as outputs onto that same memory. Nothing about
+    /// the cache crosses the PCIe bus.
+    ///
+    /// The cache's length advances by the sequence length this step produced,
+    /// so a prefill of `n` tokens and a decode of one are the same call.
+    pub fn run_cached<'a, N>(
+        &'a self,
+        inputs: impl IntoIterator<Item = (N, HostTensor)>,
+        cache: &'a KvCache,
+    ) -> Result<Run<'a>>
+    where
+        N: AsRef<str>,
+    {
+        let supplied: Vec<(String, HostTensor)> = inputs
+            .into_iter()
+            .map(|(name, tensor)| (name.as_ref().to_string(), tensor))
+            .collect();
+        for (name, _) in &supplied {
+            if !self.inputs.iter().any(|i| &i.name == name) {
+                return Err(Error::NoSuchValue(name.clone()));
+            }
+        }
+        for input in &self.inputs {
+            let supplied = supplied.iter().any(|(name, _)| name == &input.name);
+            let cached = cache.entries.iter().any(|e| e.past == input.name);
+            if !supplied && !cached {
+                return Err(Error::NoSuchValue(format!(
+                    "{} (a required input was neither supplied nor in the cache)",
+                    input.name
+                )));
+            }
+        }
+        let past = cache.len.get();
+        let mut bound: Vec<(&str, Tensor<'a>)> = supplied
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), Tensor::Host(tensor.clone())))
+            .collect();
+        for entry in &cache.entries {
+            bound.push((
+                entry.past.as_str(),
+                Tensor::Device(DeviceTensor {
+                    dtype: onnx_vulkan_core::host_ops::FLOAT,
+                    shape: entry.cache_shape(past),
+                    elem_count: entry.row() * past,
+                    buf: DeviceBuffer::Borrowed(&entry.buffer),
+                }),
+            ));
+        }
+        let outputs = self.executor.run_with_outputs(
+            bound,
+            cache
+                .entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.present.as_str(),
+                        &e.buffer,
+                        e.row() * cache.max_seq_len,
+                    )
+                })
+                .collect(),
+        )?;
+        // the graph decides how many tokens went in; reading it back from the
+        // cache it wrote is one source of truth instead of two
+        let total = outputs
+            .shape_of(&cache.entries[0].present)?
+            .get(2)
+            .copied()
+            .unwrap_or(past as i64)
+            .max(0) as usize;
+        if total > cache.max_seq_len {
+            return Err(Error::Device(format!(
+                "the sequence reached {total} tokens, past the cache's {} \
+                 (allocate a longer one)",
+                cache.max_seq_len
+            )));
+        }
+        cache.len.set(total);
+        Ok(Run { outputs })
+    }
+}
+
+impl CacheEntry {
+    /// `[batch, kv_heads, tokens, head_size]` is the declared shape, but the
+    /// engine only reads the time axis and the total element count, and the
+    /// rest of the layout is folded into `row`. At `batch · kv_heads == 1` —
+    /// the only case a cache longer than the sequence is addressable in — this
+    /// is exactly the written prefix of the buffer.
+    fn cache_shape(&self, tokens: usize) -> Vec<i64> {
+        let [batch, kv_heads, head_size] = self.dims;
+        vec![batch as i64, kv_heads as i64, tokens as i64, head_size as i64]
+    }
+
+    /// Elements per token.
+    fn row(&self) -> usize {
+        self.dims.iter().product()
+    }
+}
+
+/// A key/value cache that lives in VRAM across runs.
+///
+/// One buffer per `present.*` output, laid out for `max_seq_len` tokens and
+/// written a step at a time. What it removes is not one copy but three: the
+/// download of `present`, the upload of `past`, and the `GQA_past` dispatch
+/// that rebuilt the cache inside the graph. Source and destination of a decode
+/// step are the same memory, so the step writes only its own token.
+///
+/// The cache is the caller's, not the session's: a session serves any number
+/// of independent sequences, and each has its own cache and its own length.
+/// The buffers are handed to a run as borrows, which is also what keeps them
+/// out of the run's teardown — `ExecutionEnv` only ever reclaims what it owns.
+pub struct KvCache {
+    entries: Vec<CacheEntry>,
+    max_seq_len: usize,
+    len: Cell<usize>,
+}
+
+struct CacheEntry {
+    /// Graph output written by a run, and the input it comes back as.
+    present: String,
+    past: String,
+    buffer: GpuBuffer,
+    /// `batch`, `kv_heads` and `head_size` of `[batch, kv_heads, T, head_size]`
+    /// — everything but the time axis, which is what varies.
+    dims: [usize; 3],
+}
+
+impl KvCache {
+    /// Allocates a cache for every `present.*`/`past_key_values.*` pair the
+    /// model declares, sized for `max_seq_len` tokens.
+    ///
+    /// The pairing is by name, which is the convention every exported decoder
+    /// follows; a model with no such pair is an error rather than an empty
+    /// cache, because running it through here would silently do nothing.
+    pub fn new(session: &Session, max_seq_len: usize) -> Result<Self> {
+        let context = context()?;
+        let inputs: Vec<&str> = session.inputs.iter().map(|i| i.name.as_str()).collect();
+        let mut entries = Vec::new();
+        for output in &session.outputs {
+            let Some(suffix) = output.name.strip_prefix("present") else {
+                continue;
+            };
+            let past = format!("past_key_values{suffix}");
+            if !inputs.contains(&past.as_str()) {
+                continue;
+            }
+            // `[batch, kv_heads, total, head_size]`: every dimension but the
+            // time axis has to be a number, because it is what the layout is
+            // computed from. The time axis is the symbol that varies.
+            let shape = output.shape.as_ref().ok_or_else(|| {
+                Error::Unsupported(format!("{} has no declared shape", output.name))
+            })?;
+            if shape.len() != 4 {
+                return Err(Error::Unsupported(format!(
+                    "{} is not a [batch, kv_heads, total, head_size] cache",
+                    output.name
+                )));
+            }
+            let mut dims = [0usize; 3];
+            for (slot, axis) in [0usize, 1, 3].into_iter().enumerate() {
+                match shape[axis] {
+                    Dim::Fixed(n) if n > 0 => dims[slot] = n as usize,
+                    // a decoder exports its batch as a symbol, and here it can
+                    // only be 1: a cache longer than the sequence is
+                    // addressable only at `batch · kv_heads == 1`, because the
+                    // written tokens of each row sit `max_seq_len` apart. A run
+                    // that then asks for a wider batch fails against this
+                    // buffer's size rather than reading the wrong tokens.
+                    Dim::Symbol(_) => dims[slot] = 1,
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "{}: axis {axis} is neither fixed nor symbolic, so the cache layout \
+                             is unknown",
+                            output.name
+                        )));
+                    }
+                }
+            }
+            let row: usize = dims.iter().product();
+            let bytes = (row * max_seq_len).max(1) as u64 * 4;
+            let buffer = context
+                .create_storage_buffer(bytes)
+                .map_err(|e| Error::Device(format!("{e:#}")))?;
+            entries.push(CacheEntry {
+                present: output.name.clone(),
+                past,
+                buffer,
+                dims,
+            });
+        }
+        if entries.is_empty() {
+            return Err(Error::Unsupported(
+                "no present.*/past_key_values.* pair: this model has no KV cache".into(),
+            ));
+        }
+        Ok(Self {
+            entries,
+            max_seq_len,
+            len: Cell::new(0),
+        })
+    }
+
+    /// Tokens currently held.
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Tokens it was allocated for.
+    pub fn capacity(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// Forgets the sequence, keeping the memory for the next one.
+    pub fn clear(&self) {
+        self.len.set(0);
     }
 }
 

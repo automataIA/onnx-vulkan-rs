@@ -42,6 +42,7 @@ fn kv_pairs(session: &Session) -> Vec<(String, String)> {
 fn decode(
     session: &Session,
     steps: usize,
+    oracle: bool,
     dims: &HashMap<String, i64>,
     fills: &HashMap<String, i64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -100,6 +101,31 @@ fn decode(
     for step in 0..steps {
         let shared = step_inputs(step)?;
 
+        // `--oracle 0` runs only the resident path: the stateless loop
+        // allocates a cache that grows with the sequence, so leaving it in
+        // would attribute its VRAM to the resident one
+        if !oracle {
+            let started = Instant::now();
+            let run = session.run_cached(
+                shared.iter().map(|(n, t)| (n.as_str(), t.clone())),
+                &cache,
+            )?;
+            for name in &logits {
+                run.get(name)?;
+            }
+            run.finish();
+            println!(
+                "step {step}: cache {} tokens · resident {:?}",
+                cache.len(),
+                started.elapsed()
+            );
+            if vk_compute::stats::enabled() {
+                println!("  ── resident step {step}");
+            }
+            vk_compute::stats::dump_and_reset();
+            continue;
+        }
+
         let stateless = Instant::now();
         let feed: Vec<(&str, HostTensor)> = shared
             .iter()
@@ -121,6 +147,10 @@ fn decode(
             .collect::<Result<_, _>>()?;
         run.finish();
         let stateless = stateless.elapsed();
+        if vk_compute::stats::enabled() {
+            println!("  ── stateless step {step}");
+        }
+        vk_compute::stats::dump_and_reset();
 
         let resident = Instant::now();
         let run = session.run_cached(
@@ -149,6 +179,13 @@ fn decode(
              · max|Δ| {worst:.3e}",
             cache.len()
         );
+        // flushes, transfers, allocations and VRAM of the resident step; the
+        // stateless ones were consumed by the dump above.
+        // `VULKAN_EP_STATS=1 RUST_LOG=info` to see them.
+        if vk_compute::stats::enabled() {
+            println!("  ── resident step {step}");
+        }
+        vk_compute::stats::dump_and_reset();
         if worst > 1e-3 {
             return Err(format!("step {step}: the resident cache diverged by {worst:.3e}").into());
         }
@@ -166,11 +203,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut dims, mut fills) = (HashMap::new(), HashMap::new());
     let mut runs = 1usize;
     let mut decode_steps = 0usize;
+    let mut oracle = true;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(format!("{flag} needs an argument"))?;
         match flag.as_str() {
             "--runs" => runs = value.parse()?,
             "--decode" => decode_steps = value.parse()?,
+            "--oracle" => oracle = value != "0",
             "--dim" | "--fill" => {
                 let (name, number) = value
                     .split_once('=')
@@ -201,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if decode_steps > 0 {
-        return decode(&session, decode_steps, &dims, &fills);
+        return decode(&session, decode_steps, oracle, &dims, &fills);
     }
 
     let inputs: Vec<(String, HostTensor)> = session

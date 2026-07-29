@@ -4076,6 +4076,16 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
             buf: BufRef::Owned(buf),
         })
     };
+    // the three scratch tensors go back to the pool. Dropping a `GpuBuffer`
+    // instead does not free it: `destroy_buffer` is what releases the
+    // allocation and what records the free, so a dropped one leaks silently and
+    // the VRAM counter never notices. `scores` and `probs` are
+    // `num_heads · total` floats per layer, which is why the leak grew with the
+    // sequence — measured at +0.19 MB per token on gemma3-1b, worsening as the
+    // cache filled.
+    for scratch in [q_rot, scores, probs] {
+        ctx.recycle_storage_buffer(scratch);
+    }
     let (b, s, nh, kvh, total, head_size) = (
         b as i64,
         s as i64,

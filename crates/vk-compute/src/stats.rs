@@ -213,9 +213,16 @@ pub fn dump_and_reset() {
         up as f64 / 1e6,
         down as f64 / 1e6,
     );
+    // both numbers, because they answer different questions: the peak is what
+    // the device had to hold, `live` is what is still held now the run is over.
+    // A generation loop's `live` must come back to the same value every step —
+    // a peak that grows can just be a longer sequence, a `live` that grows is a
+    // buffer nobody freed.
+    let live = STORAGE_LIVE.load(Ordering::Relaxed);
     log::info!(
-        "  tensor VRAM peak {:.1} MB",
-        STORAGE_PEAK.swap(STORAGE_LIVE.load(Ordering::Relaxed), Ordering::Relaxed) as f64 / 1e6,
+        "  tensor VRAM peak {:.1} MB, live {:.1} MB",
+        STORAGE_PEAK.swap(live, Ordering::Relaxed) as f64 / 1e6,
+        live as f64 / 1e6,
     );
     // Counted, not derived from the timings above: an experiment loop needs a
     // metric that does not move between two identical runs, and these do not.

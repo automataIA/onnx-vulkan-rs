@@ -10,6 +10,7 @@ pub mod gemm;
 pub mod grid_sample;
 pub mod matmul_fp32;
 pub mod matmul_integer;
+pub mod matmul_nbits;
 pub mod movement;
 pub mod normalization;
 pub mod pooling;

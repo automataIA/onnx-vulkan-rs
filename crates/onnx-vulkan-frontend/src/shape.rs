@@ -475,6 +475,19 @@ fn infer_node(
             dtype: Some(INT32),
             shape: matmul(&ctx.shape_of(node, 0), &ctx.shape_of(node, 1)),
         }],
+        // B is packed, so its shape states neither K nor N; both are attributes
+        "MatMulNBits" => {
+            let mut shape = ctx.shape_of(node, 0);
+            if let Some(dims) = shape.as_mut()
+                && let Some(last) = dims.last_mut()
+            {
+                *last = Dim::Fixed(attr_i64(node, "N", 0));
+            }
+            vec![TensorType {
+                dtype: first.dtype,
+                shape,
+            }]
+        }
         "Gemm" => vec![TensorType {
             dtype: first.dtype,
             shape: gemm(node, &ctx),

@@ -61,6 +61,9 @@ use crate::shaders::matmul_integer::{
     TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
+use crate::shaders::matmul_nbits::{
+    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
+};
 use crate::shaders::attention::{
     OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
     PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
@@ -134,6 +137,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "DynamicQuantizeLinear"
             | "MatMulInteger"
             | "MatMul"
+            | "MatMulNBits"
             | "Gather"
             | "Slice"
             | "Where"
@@ -264,6 +268,24 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 && (!rotary || (present(7) && present(8)))
                 && node.outputs.len() == 3
                 && node.outputs.iter().all(|o| !o.is_empty())
+        }
+        // 4 bits only, and only with an explicit zero point: a missing one
+        // defaults to 8, but the kernel binds it unconditionally and there is no
+        // export in the suite that omits it. `g_idx` (per-`k` block indirection)
+        // and the fused bias are not implemented. `block_size` must be a
+        // multiple of 8 so a packed `u32` never straddles two blocks.
+        "MatMulNBits" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            let block_size = int_attr("block_size", 0);
+            int_attr("bits", 0) == 4
+                && block_size > 0
+                && block_size % 8 == 0
+                && int_attr("K", 0) > 0
+                && int_attr("N", 0) > 0
+                && present(2)
+                && present(3)
+                && !present(4)
+                && !present(5)
         }
         // only the form with `axes` as an attribute and a single axis: with axes
         // as input the value is not known when looking at the node
@@ -412,6 +434,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "DynamicQuantizeLinear" => dynamic_quantize(env, node),
         "MatMulInteger" => matmul_integer(env, node),
         "MatMul" => matmul_fp32(env, node),
+        "MatMulNBits" => matmul_nbits(env, node),
         "Gather" => gather(env, node),
         "Slice" => slice(env, node),
         "Where" => where_op(env, node),
@@ -3169,6 +3192,113 @@ fn matmul_fp32(env: &mut Env, node: &NodeIr) -> Result<()> {
                         (m as u32).div_ceil(tile),
                         (batch as u32).max(1),
                     ],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `MatMulNBits` (com.microsoft): `A [.., M, K] × dequant(B) [K, N]`.
+///
+/// `K` and `N` come from the attributes rather than from `B`'s shape, which
+/// states neither: `B` is `[N, n_blocks, blob]` and its `K` is only implied by
+/// `n_blocks · block_size`, rounded up. The check that they agree with `A` is
+/// the one that catches a mis-parsed graph.
+///
+/// The batch dimensions of `A` are folded into the row index — `B` has none, so
+/// there is nothing to broadcast against.
+fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let ctx = env.context();
+    let int_attr = |name: &str| node.attrs.get(name).and_then(AttrValue::as_i64).unwrap_or(0);
+    let k = int_attr("K") as usize;
+    let n = int_attr("N") as usize;
+    let block_size = int_attr("block_size") as usize;
+    let n_blocks = k.div_ceil(block_size);
+    let blob_words = block_size / 8;
+
+    env.ensure_device(&node.inputs[0])?;
+    // the packed weight and its zero points stay u8 in VRAM: the kernel unpacks
+    // them, and widening them here would undo the point of the format
+    for name in &node.inputs[1..4] {
+        env.ensure_device_dtype(name)?;
+    }
+    let a = env.device(&node.inputs[0])?;
+    let quant = env.device(&node.inputs[1])?;
+    let scales = env.device(&node.inputs[2])?;
+    let zero_points = env.device(&node.inputs[3])?;
+    let a_shape = a.shape.clone();
+    ensure!(!a_shape.is_empty(), "MatMulNBits: A is a scalar");
+    ensure!(
+        *a_shape.last().unwrap() as usize == k,
+        "MatMulNBits: A's last dimension {:?} disagrees with K={k}",
+        a_shape.last()
+    );
+    ensure!(
+        quant.dtype == UINT8 && zero_points.dtype == UINT8 && scales.dtype == FLOAT,
+        "MatMulNBits: expected u8 weight and zero point with f32 scales, got {}/{}/{}",
+        quant.dtype,
+        zero_points.dtype,
+        scales.dtype
+    );
+    ensure!(
+        quant.elem_count >= n * n_blocks * blob_words * 4
+            && scales.elem_count >= n * n_blocks
+            && zero_points.elem_count >= n * n_blocks.div_ceil(2),
+        "MatMulNBits: packed weight is short for K={k} N={n} block_size={block_size}"
+    );
+
+    let rows: usize = a_shape[..a_shape.len() - 1]
+        .iter()
+        .product::<i64>()
+        .max(0) as usize;
+    // one workgroup per output element, and `rows` is a grid dimension
+    ensure!(rows <= 65535, "MatMulNBits: {rows} rows of A is too many");
+    let mut out_shape = a_shape[..a_shape.len() - 1].to_vec();
+    out_shape.push(n as i64);
+    let elem_count = rows * n;
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+
+    if rows > 0 && n > 0 {
+        let gx = (n as u32).clamp(1, 32768);
+        let mut push = Vec::with_capacity(MMNB_PUSH_BYTES as usize);
+        for v in [
+            k as u32,
+            n as u32,
+            n_blocks as u32,
+            blob_words as u32,
+            block_size as u32,
+            n_blocks.div_ceil(2) as u32,
+            gx,
+            0,
+        ] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "MatMulNBits",
+            || ctx.create_pipeline(&compile_wgsl(MMNB_MATMUL)?, MMNB_BINDINGS, MMNB_PUSH_BYTES),
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[
+                        a.buffer(),
+                        quant.buffer(),
+                        scales.buffer(),
+                        zero_points.buffer(),
+                        &out,
+                    ],
+                    &push,
+                    [gx, (n as u32).div_ceil(gx), rows as u32],
                 )
             },
         )?;

@@ -151,6 +151,22 @@ def _gqa_ok(node, _consts) -> bool:
     )
 
 
+def _matmul_nbits_ok(node, _consts) -> bool:
+    present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
+    block_size = _attr(node, "block_size", 0)
+    return (
+        _attr(node, "bits", 0) == 4
+        and block_size > 0
+        and block_size % 8 == 0
+        and _attr(node, "K", 0) > 0
+        and _attr(node, "N", 0) > 0
+        and present(2)
+        and present(3)
+        and not present(4)
+        and not present(5)
+    )
+
+
 #: Per-node constraints, mirroring the arms of `is_implemented_node`.
 NODE_RULES = {
     "Resize": _resize_ok,
@@ -168,6 +184,7 @@ NODE_RULES = {
     "Gelu": _gelu_ok,
     "SimplifiedLayerNormalization": _simplified_layernorm_ok,
     "GroupQueryAttention": _gqa_ok,
+    "MatMulNBits": _matmul_nbits_ok,
 }
 
 

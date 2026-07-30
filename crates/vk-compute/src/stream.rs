@@ -219,6 +219,7 @@ impl VkContext {
         push_constants: &[u8],
         groups: [u32; 3],
     ) -> Result<()> {
+        crate::stats::record_dispatch_count();
         let started = crate::stats::enabled().then(std::time::Instant::now);
         let mut state = self.stream.lock().unwrap();
         let cmd = self.stream_cmd(&mut state)?;

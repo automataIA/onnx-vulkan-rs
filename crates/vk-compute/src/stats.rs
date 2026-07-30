@@ -81,6 +81,8 @@ static DOWNLOADS: AtomicU64 = AtomicU64::new(0);
 /// Device-local storage buffers actually allocated, and requests served from
 /// the pool instead. The ratio is what says whether `StoragePool` works.
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Dispatches recorded into the stream, for probes that attribute them.
+static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static POOL_HITS: AtomicU64 = AtomicU64::new(0);
 /// Live device-local bytes and their peak: the memory the graph actually
 /// holds, not what it allocated. The gap between the two indicates how
@@ -264,4 +266,15 @@ pub fn dump_and_reset() {
 /// Storage-buffer allocations so far (probe hook, see interp's ALLOC_PROBE).
 pub fn allocs() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
+}
+
+/// Dispatches recorded into the stream so far (probe hook, see the interpreter's
+/// `NODE_PROBE`). Counted unconditionally: one relaxed increment against a
+/// command-buffer recording is not measurable.
+pub fn dispatches() -> u64 {
+    DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn record_dispatch_count() {
+    DISPATCHES.fetch_add(1, Ordering::Relaxed);
 }

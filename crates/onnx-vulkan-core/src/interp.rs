@@ -436,9 +436,23 @@ pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
 fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
     let dead = dead_after(ir);
     let probe = std::env::var_os("ALLOC_PROBE").is_some();
+    // Host time per op, against the dispatches each op issued: what says whether
+    // the interpreter's cost is bookkeeping around a dispatch or host-side
+    // computation the graph asks for, which a replayed plan would still have to
+    // run. See `NODE_PROBE`.
+    let timing = std::env::var_os("NODE_PROBE").is_some();
+    let mut by_op: HashMap<&str, (u64, u64, u64)> = HashMap::new();
     for (index, node) in ir.nodes.iter().enumerate() {
         let before = probe.then(vk_compute::stats::allocs);
+        let clock = timing.then(std::time::Instant::now);
+        let dispatched = timing.then(vk_compute::stats::dispatches);
         exec_node(env, node)?;
+        if let (Some(clock), Some(dispatched)) = (clock, dispatched) {
+            let entry = by_op.entry(node.op.as_str()).or_default();
+            entry.0 += clock.elapsed().as_nanos() as u64;
+            entry.1 += 1;
+            entry.2 += vk_compute::stats::dispatches() - dispatched;
+        }
         if let Some(before) = before {
             let delta = vk_compute::stats::allocs() - before;
             if delta > 0 {
@@ -451,6 +465,16 @@ fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
         }
         for name in &dead[index] {
             env.release(name);
+        }
+    }
+    if timing {
+        let mut rows: Vec<_> = by_op.into_iter().collect();
+        rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
+        for (op, (ns, nodes, dispatches)) in rows.into_iter().take(12) {
+            eprintln!(
+                "NODE {op:<28} {:>7.3} ms  {nodes:>4} nodes  {dispatches:>4} dispatch",
+                ns as f64 / 1e6
+            );
         }
     }
     Ok(())

@@ -91,6 +91,13 @@ impl StepPlan {
     /// inferred from them predicts a step nobody looked at. A plan that fails
     /// the check is not returned.
     pub fn build(ir: &GraphIr, traces: &[StepTrace], origin: i64) -> Result<Self> {
+        let borrowed: Vec<&StepTrace> = traces.iter().collect();
+        Self::build_from(ir, &borrowed, origin)
+    }
+
+    /// As [`Self::build`], for a caller that keeps its traces somewhere that
+    /// does not hand out a slice — a decode loop holds only the last three.
+    pub fn build_from(ir: &GraphIr, traces: &[&StepTrace], origin: i64) -> Result<Self> {
         if traces.len() < 3 {
             return Err(Error::Unsupported(format!(
                 "a plan needs three captured steps to be checked, {} given",
@@ -98,7 +105,7 @@ impl StepPlan {
             )));
         }
         let (first, second) = (&traces[0], &traces[1]);
-        same_structure(first, second)?;
+        same_structure(ir, first, second)?;
         let host_nodes = host_nodes(ir, first)?;
         let payloads = payloads(traces)?;
         let push = push_patches(first, second)?;
@@ -110,7 +117,7 @@ impl StepPlan {
             origin,
             held: Vec::new(),
         };
-        plan.check(traces)?;
+        plan.check(ir, traces)?;
         Ok(plan)
     }
 
@@ -149,9 +156,9 @@ impl StepPlan {
 
     /// Predicts the ops of `step` and compares them against what the traces
     /// recorded, so the caller finds out here and not through a wrong logit.
-    fn check(&self, traces: &[StepTrace]) -> Result<()> {
+    fn check(&self, ir: &GraphIr, traces: &[&StepTrace]) -> Result<()> {
         for (index, trace) in traces.iter().enumerate().skip(1) {
-            same_structure(&traces[0], trace)?;
+            same_structure(ir, traces[0], trace)?;
             let ops = self.patched(self.origin + index as i64);
             for (position, (predicted, actual)) in ops.iter().zip(&trace.ops).enumerate() {
                 let (StreamOp::Dispatch(predicted), StreamOp::Dispatch(actual)) =
@@ -191,7 +198,7 @@ impl StepPlan {
 
 /// Two traces issue the same commands on the same memory, differing only in
 /// the scalars and payloads a step is allowed to change.
-fn same_structure(first: &StepTrace, second: &StepTrace) -> Result<()> {
+fn same_structure(ir: &GraphIr, first: &StepTrace, second: &StepTrace) -> Result<()> {
     if first.ops.len() != second.ops.len() {
         return Err(Error::Unsupported(format!(
             "one step issued {} commands and the next {}: the graph is not doing the same work \
@@ -202,9 +209,15 @@ fn same_structure(first: &StepTrace, second: &StepTrace) -> Result<()> {
     }
     for (index, (a, b)) in first.ops.iter().zip(&second.ops).enumerate() {
         if !a.same_shape(b) {
+            let node = first
+                .nodes
+                .iter()
+                .position(|range| range.contains(&index))
+                .map(|node| format!("{} '{}'", ir.nodes[node].op, ir.nodes[node].name))
+                .unwrap_or_else(|| "no node".into());
             return Err(Error::Unsupported(format!(
-                "command {index} is a {} in one step and a {} in the next: a plan can carry \
-                 different numbers, not a different pipeline, buffer or grid",
+                "command {index} ({node}) is a {} in one step and a {} in the next: a plan can \
+                 carry different numbers, not a different pipeline, buffer or grid",
                 a.kind(),
                 b.kind()
             )));
@@ -262,7 +275,7 @@ fn host_nodes(ir: &GraphIr, trace: &StepTrace) -> Result<Vec<usize>> {
 /// An upload whose bytes are identical in all three traces is left alone. Those
 /// are the constants a kernel passes in a buffer because they do not fit a push
 /// constant, and they are already shared by content across the session.
-fn payloads(traces: &[StepTrace]) -> Result<Vec<PayloadPatch>> {
+fn payloads(traces: &[&StepTrace]) -> Result<Vec<PayloadPatch>> {
     let mut patches = Vec::new();
     for (position, op) in traces[0].ops.iter().enumerate() {
         let StreamOp::Upload(first) = op else {
@@ -325,9 +338,44 @@ fn push_patches(first: &StepTrace, second: &StepTrace) -> Result<Vec<PushPatch>>
 }
 
 impl StepPlan {
+    /// Checks the plan's own output against a step the interpreter ran.
+    ///
+    /// `check` compares the push constants, which are inferred; this compares
+    /// **everything the plan would issue**, payloads included, against what the
+    /// interpreter actually issued for the same step. It is the difference
+    /// between trusting that the host nodes rebuild the mask the same way and
+    /// having seen them do it.
+    pub fn verify_against(
+        &self,
+        trace: &StepTrace,
+        step: i64,
+        host: &dyn Fn(&str) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let ops = self.ops_for(step, host)?;
+        for (index, (planned, actual)) in ops.iter().zip(&trace.ops).enumerate() {
+            let disagreement = match (planned, actual) {
+                (StreamOp::Dispatch(a), StreamOp::Dispatch(b)) if a.push != b.push => {
+                    Some(format!("push constants {:?} against {:?}", a.push, b.push))
+                }
+                (StreamOp::Upload(a), StreamOp::Upload(b)) if a.bytes != b.bytes => Some(format!(
+                    "{} bytes of '{}' that are not the ones the step uploaded",
+                    a.bytes.len(),
+                    a.label.as_deref().unwrap_or("an unnamed value")
+                )),
+                _ => None,
+            };
+            if let Some(disagreement) = disagreement {
+                return Err(Error::Unsupported(format!(
+                    "the plan would issue, for command {index} of step {step}, {disagreement}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The ops to issue for `step`, given an environment in which the host
     /// nodes have already run.
-    pub(crate) fn ops_for(
+    pub fn ops_for(
         &self,
         step: i64,
         host: &dyn Fn(&str) -> Result<Vec<u8>>,
@@ -342,13 +390,13 @@ impl StepPlan {
         Ok(ops)
     }
 
-    pub(crate) fn host_nodes(&self) -> &[usize] {
+    pub fn host_nodes(&self) -> &[usize] {
         &self.host_nodes
     }
 }
 
 /// A tensor's bytes as they are on the host, for an upload the plan refreshes.
-pub(crate) fn host_bytes(tensor: &Tensor<'_>) -> Option<Vec<u8>> {
+pub fn host_bytes(tensor: &Tensor<'_>) -> Option<Vec<u8>> {
     match tensor {
         Tensor::Host(host) => Some(host.data.clone()),
         Tensor::Device(_) => None,

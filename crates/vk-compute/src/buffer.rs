@@ -169,7 +169,16 @@ impl VkContext {
     /// decides everything; between steps the queue is left permuted by the
     /// interleaving of acquisitions and releases, and this undoes that.
     pub fn reset_pool_order(&self) {
-        self.storage_pool.lock().unwrap().canonicalize();
+        let mut pool = self.storage_pool.lock().unwrap();
+        pool.canonicalize();
+        if std::env::var_os("POOL_PROBE").is_some() {
+            for (size, list) in pool.free.iter() {
+                if *size == 4608 {
+                    let ids: Vec<u64> = list.iter().map(|b| b.id).collect();
+                    eprintln!("POOL size {size}: {} free, ids {ids:?}", list.len());
+                }
+            }
+        }
     }
 
     /// Returns a storage buffer to the pool instead of destroying it.

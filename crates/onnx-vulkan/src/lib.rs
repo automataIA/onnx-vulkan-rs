@@ -315,6 +315,236 @@ impl Session {
         cache.len.set(total);
         Ok(Run { outputs })
     }
+
+    /// A decode loop that stops walking the graph once it has seen enough of it.
+    ///
+    /// The first steps run through the interpreter and are recorded; from then
+    /// on each token issues the recorded commands with this token's scalars in
+    /// them. See `onnx_vulkan_core::plan` for what makes that sound and what
+    /// makes it refuse.
+    pub fn decoder<'a>(&'a self, cache: &'a KvCache) -> Decoder<'a> {
+        Decoder {
+            session: self,
+            cache,
+            traces: std::collections::VecDeque::new(),
+            plan: None,
+            run: None,
+            step: 0,
+        }
+    }
+
+    /// One captured step: `run_cached`, recording what it issues.
+    fn run_traced_cached<'a>(
+        &'a self,
+        supplied: &[(String, HostTensor)],
+        cache: &'a KvCache,
+    ) -> Result<(Run<'a>, onnx_vulkan_core::StepTrace)> {
+        let past = cache.len.get();
+        let mut bound: Vec<(&str, Tensor<'a>)> = supplied
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), Tensor::Host(tensor.clone())))
+            .collect();
+        for entry in &cache.entries {
+            bound.push((
+                entry.past.as_str(),
+                Tensor::Device(DeviceTensor {
+                    dtype: onnx_vulkan_core::host_ops::FLOAT,
+                    shape: entry.cache_shape(past),
+                    elem_count: entry.row() * past,
+                    buf: DeviceBuffer::Borrowed(&entry.buffer),
+                }),
+            ));
+        }
+        let (outputs, trace) = self.executor.run_traced(
+            bound,
+            cache
+                .entries
+                .iter()
+                .map(|e| (e.present.as_str(), &e.buffer, e.row() * cache.max_seq_len))
+                .collect(),
+        )?;
+        let total = outputs
+            .shape_of(&cache.entries[0].present)?
+            .get(2)
+            .copied()
+            .unwrap_or(past as i64)
+            .max(0) as usize;
+        if total > cache.max_seq_len {
+            return Err(Error::Device(format!(
+                "the sequence reached {total} tokens, past the cache's {} \
+                 (allocate a longer one)",
+                cache.max_seq_len
+            )));
+        }
+        cache.len.set(total);
+        Ok((Run { outputs }, trace))
+    }
+}
+
+/// Steps a plan is inferred from: two to see what moves between tokens, one to
+/// check the answer on a step neither of them saw.
+const PLAN_STEPS: usize = 3;
+
+/// How long to keep trying before deciding this decoder has no plan.
+///
+/// The first tokens of a sequence are not like the ones after them — the buffer
+/// pool is still filling, so a request is served a different buffer than it
+/// will be later — and how many it takes to settle is a property of the graph,
+/// not a constant worth guessing. So the loop simply tries again on the last
+/// three steps until they agree, and gives up here.
+const PLAN_ATTEMPTS: usize = 12;
+
+/// A decode loop that replaces the interpreter with a recording of itself.
+///
+/// Each `step` takes the inputs that are not cache and advances the sequence by
+/// one token. The first `CAPTURED_STEPS` run normally and are recorded; if they
+/// agree on a plan, every later step issues that plan instead of walking the
+/// graph. If they do not agree, `planned` stays false and the loop keeps
+/// interpreting — the outputs are the same either way.
+pub struct Decoder<'a> {
+    session: &'a Session,
+    cache: &'a KvCache,
+    traces: std::collections::VecDeque<onnx_vulkan_core::StepTrace>,
+    plan: Option<onnx_vulkan_core::StepPlan>,
+    /// The run whose environment names the buffers a replayed step writes into,
+    /// which is also how its outputs are read.
+    run: Option<Run<'a>>,
+    step: i64,
+}
+
+impl<'a> Decoder<'a> {
+    /// Advances one step, from the inputs that are not the cache.
+    pub fn step<N: AsRef<str>>(
+        &mut self,
+        inputs: impl IntoIterator<Item = (N, HostTensor)>,
+    ) -> Result<()> {
+        let supplied: Vec<(String, HostTensor)> = inputs
+            .into_iter()
+            .map(|(name, tensor)| (name.as_ref().to_string(), tensor))
+            .collect();
+        if let (Some(plan), Some(run)) = (self.plan.as_ref(), self.run.as_mut()) {
+            // `Tensor::Host` owns its bytes, so these are free of the
+            // environment's lifetime even though `supplied` is local.
+            let refs: Vec<(&str, Tensor<'a>)> = supplied
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), Tensor::Host(tensor.clone())))
+                .collect();
+            self.session
+                .executor
+                .replay_step(plan, self.step, run.outputs.env_mut(), refs)?;
+            self.cache.len.set(self.cache.len.get() + 1);
+            self.step += 1;
+            return Ok(());
+        }
+
+        if let Some(previous) = self.run.take() {
+            previous.finish();
+        }
+        let (run, trace) = self.session.run_traced_cached(&supplied, self.cache)?;
+        self.run = Some(run);
+        self.traces.push_back(trace);
+        if self.traces.len() > PLAN_STEPS {
+            self.traces.pop_front();
+        }
+        self.step += 1;
+        if self.traces.len() == PLAN_STEPS && (self.step as usize) <= PLAN_ATTEMPTS {
+            let recent: Vec<&onnx_vulkan_core::StepTrace> = self.traces.iter().collect();
+            let origin = self.step - PLAN_STEPS as i64;
+            match onnx_vulkan_core::StepPlan::build_from(
+                self.session.executor.graph(),
+                &recent,
+                origin,
+            ) {
+                Ok(mut plan) => {
+                    // The plan against the very step it was built to reproduce,
+                    // payloads included: `StepPlan::build` checks the scalars it
+                    // inferred, this checks that re-running the host nodes
+                    // rebuilds the same mask and positions.
+                    let last = self.step - 1;
+                    let verified = {
+                        let run = self.run.as_mut().expect("the step that was just captured");
+                        let ir = self.session.executor.graph();
+                        let env = run.outputs.env_mut();
+                        // the step's own inputs, which its execution consumed
+                        // and released: the host nodes read them
+                        for (name, tensor) in &supplied {
+                            env.set(name, Tensor::Host(tensor.clone()));
+                        }
+                        onnx_vulkan_core::execute_host_nodes(ir, env, plan.host_nodes())
+                            .map_err(Error::from)
+                            .and_then(|()| {
+                                plan.verify_against(
+                                    self.traces.back().expect("a trace"),
+                                    last,
+                                    &|name| {
+                                        env.value(name)
+                                            .and_then(onnx_vulkan_core::host_bytes)
+                                            .ok_or_else(|| {
+                                                onnx_vulkan_core::Error::InvalidTensor(
+                                                    name.to_string(),
+                                                )
+                                            })
+                                    },
+                                )
+                                .map_err(Error::from)
+                            })
+                    };
+                    if let Err(error) = verified {
+                        log::info!("plan rejected by its own step: {error}");
+                        return Ok(());
+                    }
+                    log::info!(
+                        "decode plan: {} dispatches, {} host nodes, from steps {origin}..{}",
+                        plan.dispatches(),
+                        plan.host_node_count(),
+                        self.step - 1
+                    );
+                    plan.hold_pool(context()?);
+                    self.plan = Some(plan);
+                }
+                Err(error) => {
+                    if self.step as usize == PLAN_ATTEMPTS {
+                        log::info!("no plan for this decoder, interpreting: {error}");
+                    } else {
+                        log::debug!("step {}: no plan yet: {error}", self.step - 1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the loop is issuing a plan rather than walking the graph.
+    pub fn planned(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    /// Index of the largest element along the last axis of an output.
+    pub fn argmax(&mut self, name: &str) -> Result<Vec<i64>> {
+        self.run
+            .as_mut()
+            .ok_or_else(|| Error::NoSuchValue(name.to_string()))?
+            .argmax(name)
+    }
+
+    /// Reads an output on the host.
+    pub fn get(&self, name: &str) -> Result<HostTensor> {
+        self.run
+            .as_ref()
+            .ok_or_else(|| Error::NoSuchValue(name.to_string()))?
+            .get(name)
+    }
+
+    /// Releases the loop's buffers.
+    pub fn finish(self) -> Result<()> {
+        if let Some(run) = self.run {
+            run.finish();
+        }
+        if let Some(plan) = self.plan {
+            plan.release(context()?);
+        }
+        Ok(())
+    }
 }
 
 impl CacheEntry {

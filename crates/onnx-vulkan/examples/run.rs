@@ -48,6 +48,7 @@ fn decode(
     steps: usize,
     oracle: bool,
     greedy: bool,
+    plan: bool,
     dims: &HashMap<String, i64>,
     fills: &HashMap<String, i64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -103,6 +104,11 @@ fn decode(
         })
         .collect::<Result<_, String>>()?;
     let cache = KvCache::new(session, 2048)?;
+    // `--plan 1` swaps the interpreter for a recording of it after the first
+    // few tokens. Under `--oracle 1` the planned loop is the side the stateless
+    // path checks, which is the only way to know the plan computes the same
+    // thing the interpreter would have.
+    let mut decoder = plan.then(|| session.decoder(&cache));
     for step in 0..steps {
         let shared = step_inputs(step)?;
 
@@ -111,23 +117,49 @@ fn decode(
         // would attribute its VRAM to the resident one
         if !oracle {
             let started = Instant::now();
-            let mut run =
-                session.run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
-            // `--greedy 1` is what a generation loop does: the logits are
-            // reduced where they are and only the token index is downloaded
             let mut picked = Vec::new();
-            for name in &logits {
-                if greedy {
-                    picked.extend(run.argmax(name)?);
-                } else {
-                    run.get(name)?;
+            // Without `--greedy` the logits come back to the host, and their
+            // fingerprint is what makes two runs comparable: the planned loop
+            // and the interpreted one are different processes, so this is the
+            // only way to hold one against the other.
+            let mut mark = String::new();
+            let mut fingerprint = |tensor: HostTensor| -> Result<(), Box<dyn std::error::Error>> {
+                let values = tensor.to_f32()?;
+                let sum: f64 = values.iter().map(|v| *v as f64).sum();
+                let peak = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                mark = format!(" · Σ {sum:.6e} max {peak:.6e}");
+                Ok(())
+            };
+            let planned = if let Some(decoder) = decoder.as_mut() {
+                decoder.step(shared.iter().map(|(n, t)| (n.as_str(), t.clone())))?;
+                for name in &logits {
+                    if greedy {
+                        picked.extend(decoder.argmax(name)?);
+                    } else {
+                        fingerprint(decoder.get(name)?)?;
+                    }
                 }
-            }
-            run.finish();
+                decoder.planned()
+            } else {
+                let mut run = session
+                    .run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
+                // `--greedy 1` is what a generation loop does: the logits are
+                // reduced where they are and only the token index is downloaded
+                for name in &logits {
+                    if greedy {
+                        picked.extend(run.argmax(name)?);
+                    } else {
+                        fingerprint(run.get(name)?)?;
+                    }
+                }
+                run.finish();
+                false
+            };
             println!(
-                "step {step}: cache {} tokens · resident {:?}{}",
+                "step {step}: cache {} tokens · resident {:?}{}{}{mark}",
                 cache.len(),
                 started.elapsed(),
+                if planned { " · planned" } else { "" },
                 if greedy {
                     format!(" · token {picked:?}")
                 } else {
@@ -168,18 +200,37 @@ fn decode(
         vk_compute::stats::dump_and_reset();
 
         let resident = Instant::now();
-        let mut run =
-            session.run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
-        let got: Vec<Vec<f32>> = logits
-            .iter()
-            .map(|name| Ok(run.get(name)?.to_f32()?))
-            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        // With `--plan 1` the resident side of the oracle is the planned loop,
+        // so what the stateless path checks is the plan and not the
+        // interpreter that built it.
+        let mut planned = false;
+        let (got, mut run) = if let Some(decoder) = decoder.as_mut() {
+            decoder.step(shared.iter().map(|(n, t)| (n.as_str(), t.clone())))?;
+            planned = decoder.planned();
+            let got: Vec<Vec<f32>> = logits
+                .iter()
+                .map(|name| Ok(decoder.get(name)?.to_f32()?))
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            (got, None)
+        } else {
+            let run =
+                session.run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
+            let got: Vec<Vec<f32>> = logits
+                .iter()
+                .map(|name| Ok(run.get(name)?.to_f32()?))
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            (got, Some(run))
+        };
         // the device reduction against the host one over the same downloaded
         // values: on a real vocabulary this is the only oracle that covers the
         // split, and it costs one extra dispatch on a run that is already slow
         if greedy {
             for (name, values) in logits.iter().zip(&got) {
-                let rows = run.argmax(name)?;
+                let rows = match (run.as_mut(), decoder.as_mut()) {
+                    (Some(run), _) => run.argmax(name)?,
+                    (None, Some(decoder)) => decoder.argmax(name)?,
+                    (None, None) => unreachable!("one of the two ran this step"),
+                };
                 let width = values.len() / rows.len().max(1);
                 for (row, &index) in rows.iter().enumerate() {
                     let slice = &values[row * width..(row + 1) * width];
@@ -199,7 +250,9 @@ fn decode(
                 }
             }
         }
-        run.finish();
+        if let Some(run) = run {
+            run.finish();
+        }
         let resident = resident.elapsed();
 
         let mut worst = 0.0f32;
@@ -215,9 +268,10 @@ fn decode(
                 .fold(worst, |acc, (w, g)| acc.max((w - g).abs()));
         }
         println!(
-            "step {step}: cache {} tokens · stateless {stateless:?} · resident {resident:?} \
+            "step {step}: cache {} tokens · stateless {stateless:?} · resident {resident:?}{} \
              · max|Δ| {worst:.3e}",
-            cache.len()
+            cache.len(),
+            if planned { " (planned)" } else { "" }
         );
         // flushes, transfers, allocations and VRAM of the resident step; the
         // stateless ones were consumed by the dump above.
@@ -245,6 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decode_steps = 0usize;
     let mut oracle = true;
     let mut greedy = false;
+    let mut plan = false;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(format!("{flag} needs an argument"))?;
         match flag.as_str() {
@@ -252,6 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--decode" => decode_steps = value.parse()?,
             "--oracle" => oracle = value != "0",
             "--greedy" => greedy = value != "0",
+            "--plan" => plan = value != "0",
             "--dim" | "--fill" => {
                 let (name, number) = value
                     .split_once('=')
@@ -282,7 +338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if decode_steps > 0 {
-        return decode(&session, decode_steps, oracle, greedy, &dims, &fills);
+        return decode(&session, decode_steps, oracle, greedy, plan, &dims, &fills);
     }
 
     let inputs: Vec<(String, HostTensor)> = session

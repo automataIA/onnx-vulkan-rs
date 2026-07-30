@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use vk_compute::{GpuBuffer, VkContext};
 
 const NH: usize = 4;
-const KVH: usize = 1;
 const H: usize = 8;
 const MAX_SEQ: usize = 1024;
 const STEPS: usize = 3;
@@ -43,7 +42,7 @@ fn ramp(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-fn graph() -> GraphIr {
+fn graph(kvh: usize) -> GraphIr {
     let inputs = [
         "query",
         "key",
@@ -67,7 +66,7 @@ fn graph() -> GraphIr {
             .collect(),
         attrs: [
             ("num_heads", AttrValue::Int(NH as i64)),
-            ("kv_num_heads", AttrValue::Int(KVH as i64)),
+            ("kv_num_heads", AttrValue::Int(kvh as i64)),
             ("scale", AttrValue::Float(0.0)),
             ("do_rotary", AttrValue::Int(1)),
             ("rotary_interleaved", AttrValue::Int(0)),
@@ -86,7 +85,7 @@ fn graph() -> GraphIr {
 }
 
 /// Query, key and value of step `t`, plus the rotary tables.
-fn step_inputs(t: usize) -> Vec<(&'static str, HostTensor)> {
+fn step_inputs(t: usize, kvh: usize) -> Vec<(&'static str, HostTensor)> {
     let half = H / 2;
     let angles: Vec<f32> = (0..(MAX_SEQ + 1) * half)
         .map(|i| (i % 17) as f32 * 0.37)
@@ -98,11 +97,11 @@ fn step_inputs(t: usize) -> Vec<(&'static str, HostTensor)> {
         ),
         (
             "key",
-            HostTensor::from_f32(vec![1, 1, (KVH * H) as i64], &ramp(KVH * H, t + 5)),
+            HostTensor::from_f32(vec![1, 1, (kvh * H) as i64], &ramp(kvh * H, t + 5)),
         ),
         (
             "value",
-            HostTensor::from_f32(vec![1, 1, (KVH * H) as i64], &ramp(KVH * H, t + 9)),
+            HostTensor::from_f32(vec![1, 1, (kvh * H) as i64], &ramp(kvh * H, t + 9)),
         ),
         (
             "cos_cache",
@@ -122,14 +121,14 @@ fn step_inputs(t: usize) -> Vec<(&'static str, HostTensor)> {
 }
 
 /// The stateless path, `STEPS` decode steps with the cache carried on the host.
-fn stateless(context: &'static VkContext) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let executor = Executor::new(context, graph()).expect("executor");
+fn stateless(context: &'static VkContext, kvh: usize) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let executor = Executor::new(context, graph(kvh)).expect("executor");
     let mut past_k: Vec<f32> = Vec::new();
     let mut past_v: Vec<f32> = Vec::new();
     let mut steps = Vec::new();
     for t in 0..STEPS {
-        let host = step_inputs(t);
-        let cache_shape = vec![1, KVH as i64, t as i64, H as i64];
+        let host = step_inputs(t, kvh);
+        let cache_shape = vec![1, kvh as i64, t as i64, H as i64];
         let past = [
             ("past_key", HostTensor::from_f32(cache_shape.clone(), &past_k)),
             ("past_value", HostTensor::from_f32(cache_shape, &past_v)),
@@ -154,11 +153,11 @@ fn stateless(context: &'static VkContext) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>
 }
 
 /// The cache as this step's past: the first `t` tokens of the resident buffer.
-fn past_view(buffer: &GpuBuffer, t: usize) -> Tensor<'_> {
+fn past_view(buffer: &GpuBuffer, t: usize, kvh: usize) -> Tensor<'_> {
     Tensor::Device(DeviceTensor {
         dtype: host_ops::FLOAT,
-        shape: vec![1, KVH as i64, t as i64, H as i64],
-        elem_count: KVH * t * H,
+        shape: vec![1, kvh as i64, t as i64, H as i64],
+        elem_count: kvh * t * H,
         buf: DeviceBuffer::Borrowed(buffer),
     })
 }
@@ -167,20 +166,21 @@ fn past_view(buffer: &GpuBuffer, t: usize) -> Tensor<'_> {
 /// written in place and passed straight back as the next step's past.
 fn resident(
     context: &'static VkContext,
+    kvh: usize,
     key_buf: &GpuBuffer,
     value_buf: &GpuBuffer,
 ) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let capacity = KVH * MAX_SEQ * H;
-    let executor = Executor::new(context, graph()).expect("executor");
+    let capacity = kvh * MAX_SEQ * H;
+    let executor = Executor::new(context, graph(kvh)).expect("executor");
     let mut steps = Vec::new();
     for t in 0..STEPS {
-        let host = step_inputs(t);
+        let host = step_inputs(t, kvh);
         let mut inputs: Vec<(&str, Tensor<'_>)> = host
             .iter()
             .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone())))
             .collect();
-        inputs.push(("past_key", past_view(key_buf, t)));
-        inputs.push(("past_value", past_view(value_buf, t)));
+        inputs.push(("past_key", past_view(key_buf, t, kvh)));
+        inputs.push(("past_value", past_view(value_buf, t, kvh)));
         let outputs = executor
             .run_with_outputs(
                 inputs,
@@ -203,12 +203,41 @@ fn resident(
                 "{name} at step {t} is not the buffer that was bound"
             );
         }
-        let read = |name: &str| outputs.host(name).expect(name).to_f32().unwrap();
-        let (out, key, value) = (read("out"), read("present_key"), read("present_value"));
+        // `out` first: reading it is the flush, so the cache buffers hold this
+        // step's tokens by the time they are downloaded
+        let out = outputs.host("out").expect("out").to_f32().unwrap();
+        let cache = |buffer: &GpuBuffer| {
+            destride(
+                &context.download(buffer).expect("cache download"),
+                kvh,
+                t + 1,
+            )
+        };
+        let (key, value) = (cache(key_buf), cache(value_buf));
         outputs.finish();
         steps.push((out, key, value));
     }
     steps
+}
+
+/// The written prefix of a padded cache, in the `[kvh, tokens, H]` layout the
+/// stateless path produces.
+///
+/// Row `h` of the resident buffer starts `MAX_SEQ` tokens in, not `tokens` in,
+/// which is the whole difference between the two layouts and the reason
+/// `Outputs::host` refuses this tensor above `kvh = 1`: its leading elements are
+/// row 0's tokens followed by padding, not the cache.
+fn destride(bytes: &[u8], kvh: usize, tokens: usize) -> Vec<f32> {
+    let all: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    (0..kvh)
+        .flat_map(|h| {
+            let base = h * MAX_SEQ * H;
+            all[base..base + tokens * H].to_vec()
+        })
+        .collect()
 }
 
 fn close(name: &str, step: usize, want: &[f32], got: &[f32]) {
@@ -223,25 +252,42 @@ fn close(name: &str, step: usize, want: &[f32], got: &[f32]) {
 
 /// The whole point: three decode steps at `stride = 1024`, agreeing with the
 /// path that rebuilds the cache every time.
-#[test]
-fn a_resident_cache_matches_the_stateless_path() {
+///
+/// Run at `kv_heads = 1` (multi-query, gemma3's shape) and at `kv_heads = 2`
+/// with 4 query heads (grouped, which is what Llama 3 and Qwen export). The
+/// second is not a variation on the first: with one row the padding sits behind
+/// every written token and any stride arithmetic that ignores it still lands in
+/// the right place, so a kernel that used `total` where it should use the
+/// physical stride passes at `kvh = 1` and puts row 1's tokens on top of row 0's
+/// here.
+fn resident_matches_stateless(kvh: usize) {
     // leaked so the buffers can borrow a `'static` context, as `Session` does
     let context: &'static VkContext = Box::leak(Box::new(VkContext::new().expect("Vulkan")));
-    let bytes = (KVH * MAX_SEQ * H * 4) as u64;
+    let bytes = (kvh * MAX_SEQ * H * 4) as u64;
     let key_buf = context.create_storage_buffer(bytes).expect("key cache");
     let value_buf = context.create_storage_buffer(bytes).expect("value cache");
 
-    let want = stateless(context);
-    let got = resident(context, &key_buf, &value_buf);
+    let want = stateless(context, kvh);
+    let got = resident(context, kvh, &key_buf, &value_buf);
 
     for (step, ((w_out, w_key, w_value), (g_out, g_key, g_value))) in
         want.iter().zip(&got).enumerate()
     {
         close("out", step, w_out, g_out);
-        // the cache is read back as `[1, kvh, total, H]`, i.e. the written
-        // prefix of a 1024-token buffer: what the tokens of earlier steps must
-        // still contain, untouched by the step that skipped `GQA_past`
+        // the written prefix of each row of a 1024-token buffer: what the tokens
+        // of earlier steps must still contain, untouched by the step that
+        // skipped `GQA_past`
         close("present_key", step, w_key, g_key);
         close("present_value", step, w_value, g_value);
     }
+}
+
+#[test]
+fn a_multi_query_cache_matches_the_stateless_path() {
+    resident_matches_stateless(1);
+}
+
+#[test]
+fn a_grouped_cache_matches_the_stateless_path() {
+    resident_matches_stateless(2);
 }

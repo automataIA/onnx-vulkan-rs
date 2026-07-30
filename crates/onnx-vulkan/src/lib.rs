@@ -326,9 +326,10 @@ impl Session {
 impl CacheEntry {
     /// `[batch, kv_heads, tokens, head_size]` is the declared shape, but the
     /// engine only reads the time axis and the total element count, and the
-    /// rest of the layout is folded into `row`. At `batch · kv_heads == 1` —
-    /// the only case a cache longer than the sequence is addressable in — this
-    /// is exactly the written prefix of the buffer.
+    /// rest of the layout is folded into `row`. At `batch · kv_heads == 1` this
+    /// is also the written prefix of the buffer; with more rows it is the
+    /// logical cache and the rows sit `max_seq_len` apart, which the kernels
+    /// address through the stride and a host download does not.
     fn cache_shape(&self, tokens: usize) -> Vec<i64> {
         let [batch, kv_heads, head_size] = self.dims;
         vec![batch as i64, kv_heads as i64, tokens as i64, head_size as i64]
@@ -404,11 +405,14 @@ impl KvCache {
                 match shape[axis] {
                     Dim::Fixed(n) if n > 0 => dims[slot] = n as usize,
                     // a decoder exports its batch as a symbol, and here it can
-                    // only be 1: a cache longer than the sequence is
-                    // addressable only at `batch · kv_heads == 1`, because the
-                    // written tokens of each row sit `max_seq_len` apart. A run
-                    // that then asks for a wider batch fails against this
+                    // only be 1: the cache is laid out for one sequence, and a
+                    // run that then asks for a wider batch fails against this
                     // buffer's size rather than reading the wrong tokens.
+                    // `kv_heads` is a different matter — it is fixed in the
+                    // file, and grouped attention (`1 < kv_heads < num_heads`,
+                    // which is what Llama 3 and Qwen export) is supported: the
+                    // rows sit `max_seq_len` apart and the kernels stride over
+                    // them.
                     Dim::Symbol(_) => dims[slot] = 1,
                     _ => {
                         return Err(Error::Unsupported(format!(

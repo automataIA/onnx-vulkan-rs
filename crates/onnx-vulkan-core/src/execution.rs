@@ -19,6 +19,9 @@ pub struct ExecutionEnv<'context, 'values> {
     initializers: &'values HashMap<String, InitializerIr>,
     host_cache: RefCell<HashMap<String, HostTensor>>,
     bound_outputs: HashMap<String, (&'values vk_compute::GpuBuffer, usize)>,
+    /// Values whose declared shape is the logical tensor while the buffer holds
+    /// it with a longer row stride — see `mark_row_padded`.
+    row_padded: HashMap<String, usize>,
 }
 
 impl<'context, 'values> ExecutionEnv<'context, 'values> {
@@ -35,7 +38,26 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             initializers,
             host_cache: RefCell::new(HashMap::new()),
             bound_outputs: HashMap::new(),
+            row_padded: HashMap::new(),
         }
+    }
+
+    /// Records that `name` sits in its buffer with a row stride of `stride`
+    /// time steps while its shape declares fewer.
+    ///
+    /// A KV cache bound for `max_seq_len` tokens and holding more than one
+    /// `(batch, kv head)` row is the case: the kernels address it through that
+    /// stride, so on the device it is exact, but the leading elements of the
+    /// buffer are no longer the logical tensor. [`Self::host`] refuses those
+    /// values instead of downloading a prefix that interleaves real tokens with
+    /// whatever the padding holds.
+    pub fn mark_row_padded(&mut self, name: &str, stride: usize) {
+        self.row_padded.insert(name.to_owned(), stride);
+    }
+
+    /// The row stride of a value whose buffer is padded, if it is one.
+    pub fn row_padding(&self, name: &str) -> Option<usize> {
+        self.row_padded.get(name).copied()
     }
 
     /// Hands a kernel a buffer to write one of its outputs into, instead of
@@ -129,6 +151,13 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 initializer.shape.clone(),
                 initializer.data.clone(),
             ));
+        }
+        if let Some(stride) = self.row_padding(name) {
+            return Err(Error::InvalidTensor(format!(
+                "'{name}' lives in a buffer padded to {stride} time steps per row, so its leading \
+                 elements are not the tensor its shape declares: read it row by row with that \
+                 stride, or run against a cache whose length is the sequence"
+            )));
         }
         match self.values.get(name) {
             Some(Tensor::Host(tensor)) => Ok(tensor.clone()),

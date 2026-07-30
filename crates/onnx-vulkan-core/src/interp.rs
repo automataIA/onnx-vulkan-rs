@@ -4141,7 +4141,7 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         (None, None) => None,
         _ => bail!("GroupQueryAttention: bind present_key and present_value together or not at all"),
     };
-    let (present_k, present_v, kv_stride) = match bound {
+    let (present_k, present_v, kv_stride, padded_rows) = match bound {
         Some(((k_buf, k_cap), (v_buf, v_cap))) => {
             ensure!(
                 row > 0 && k_cap == v_cap && k_cap.is_multiple_of(row),
@@ -4153,21 +4153,30 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
                 stride >= total,
                 "GroupQueryAttention: the bound cache holds {stride} tokens, the graph asks for {total}"
             );
-            // `[b, kvh, total, head_size]` describes the written prefix of the
-            // buffer only when there is a single `(batch, kv head)` row: with
-            // more, the written tokens of each row sit `stride` apart and the
-            // logical shape would lie about the layout.
-            ensure!(
-                stride == total || b * kvh == 1,
-                "GroupQueryAttention: a cache longer than the sequence is only addressable at \
-                 batch × kv_heads == 1, got {b}×{kvh}"
-            );
-            (BufRef::Borrowed(k_buf), BufRef::Borrowed(v_buf), stride)
+            // Every kernel below addresses the cache through `kv_stride`, so a
+            // padded cache is as addressable at `kvh = 8` as at `kvh = 1` — and
+            // it has to be, because grouped attention with `1 < kvh < nh` is
+            // what Llama 3, Qwen and most of the field export. What multiple
+            // rows do change is the **shape** of the present outputs below:
+            // `[b, kvh, total, head_size]` is the logical cache, but the written
+            // tokens of each row sit `stride` apart, so it stops describing the
+            // buffer's leading `total · row` elements. Reading it back on the
+            // host is what that breaks — the next step consumes it in VRAM,
+            // where the stride is what the kernels use — so the padded rows are
+            // reported to the caller rather than refused here.
+            let padded_rows = stride != total && b * kvh > 1;
+            (
+                BufRef::Borrowed(k_buf),
+                BufRef::Borrowed(v_buf),
+                stride,
+                padded_rows,
+            )
         }
         None => (
             BufRef::Owned(alloc(row * total)?),
             BufRef::Owned(alloc(row * total)?),
             total,
+            false,
         ),
     };
     let (present_k_buf, present_v_buf) = (present_k.get(), present_v.get());
@@ -4410,6 +4419,13 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
                 buf,
             }),
         );
+        // grouped attention against a cache longer than the sequence: the shape
+        // is the logical cache and the buffer holds it `kv_stride` apart, so a
+        // download of the leading elements would mix row 0's tokens with the
+        // padding behind them. The kernels are unaffected — they use the stride
+        if padded_rows {
+            env.mark_row_padded(name, kv_stride);
+        }
     }
     Ok(())
 }

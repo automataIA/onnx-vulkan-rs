@@ -35,6 +35,19 @@ const H: usize = 8;
 const MAX_SEQ: usize = 1024;
 const STEPS: usize = 3;
 
+/// What the graph hands the node as `attention_bias`.
+#[derive(Clone, Copy, PartialEq)]
+enum Bias {
+    None,
+    /// Ordinary additive bias.
+    Values,
+    /// Every key masked out. A graph builds this from an all-zero
+    /// `attention_mask`, and it is not a hypothetical: it is what gemma3-1b
+    /// receives when the caller forgets to fill the mask. With one key the row
+    /// still normalizes to 1 and nothing looks wrong.
+    Masking,
+}
+
 /// Deterministic values in a small range, distinct per step and per tensor.
 fn ramp(count: usize, seed: usize) -> Vec<f32> {
     (0..count)
@@ -42,8 +55,8 @@ fn ramp(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-fn graph(kvh: usize) -> GraphIr {
-    let inputs = [
+fn graph(kvh: usize, bias: Bias) -> GraphIr {
+    let mut inputs = vec![
         "query",
         "key",
         "value",
@@ -54,6 +67,11 @@ fn graph(kvh: usize) -> GraphIr {
         "cos_cache",
         "sin_cache",
     ];
+    if bias != Bias::None {
+        // index 9 is unused by this op, index 10 is `attention_bias`
+        inputs.push("");
+        inputs.push("bias");
+    }
     let node = NodeIr {
         domain: "com.microsoft".into(),
         op: "GroupQueryAttention".into(),
@@ -85,12 +103,12 @@ fn graph(kvh: usize) -> GraphIr {
 }
 
 /// Query, key and value of step `t`, plus the rotary tables.
-fn step_inputs(t: usize, kvh: usize) -> Vec<(&'static str, HostTensor)> {
+fn step_inputs(t: usize, kvh: usize, bias: Bias) -> Vec<(&'static str, HostTensor)> {
     let half = H / 2;
     let angles: Vec<f32> = (0..(MAX_SEQ + 1) * half)
         .map(|i| (i % 17) as f32 * 0.37)
         .collect();
-    vec![
+    let mut supplied = vec![
         (
             "query",
             HostTensor::from_f32(vec![1, 1, (NH * H) as i64], &ramp(NH * H, t + 1)),
@@ -117,17 +135,36 @@ fn step_inputs(t: usize, kvh: usize) -> Vec<(&'static str, HostTensor)> {
                 &angles.iter().map(|a| a.sin()).collect::<Vec<_>>(),
             ),
         ),
-    ]
+    ];
+    if bias != Bias::None {
+        // `[b, 1, s, total]`: one row per query, as long as the sequence so far,
+        // and it grows by one every step — the graph knows nothing about how far
+        // the cache buffer reaches
+        let total = t + 1;
+        let values = match bias {
+            Bias::Masking => vec![-3.4028235e38; total],
+            _ => ramp(total, t + 13),
+        };
+        supplied.push((
+            "bias",
+            HostTensor::from_f32(vec![1, 1, 1, total as i64], &values),
+        ));
+    }
+    supplied
 }
 
 /// The stateless path, `STEPS` decode steps with the cache carried on the host.
-fn stateless(context: &'static VkContext, kvh: usize) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let executor = Executor::new(context, graph(kvh)).expect("executor");
+fn stateless(
+    context: &'static VkContext,
+    kvh: usize,
+    bias: Bias,
+) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let executor = Executor::new(context, graph(kvh, bias)).expect("executor");
     let mut past_k: Vec<f32> = Vec::new();
     let mut past_v: Vec<f32> = Vec::new();
     let mut steps = Vec::new();
     for t in 0..STEPS {
-        let host = step_inputs(t, kvh);
+        let host = step_inputs(t, kvh, bias);
         let cache_shape = vec![1, kvh as i64, t as i64, H as i64];
         let past = [
             ("past_key", HostTensor::from_f32(cache_shape.clone(), &past_k)),
@@ -167,14 +204,15 @@ fn past_view(buffer: &GpuBuffer, t: usize, kvh: usize) -> Tensor<'_> {
 fn resident(
     context: &'static VkContext,
     kvh: usize,
+    bias: Bias,
     key_buf: &GpuBuffer,
     value_buf: &GpuBuffer,
 ) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let capacity = kvh * MAX_SEQ * H;
-    let executor = Executor::new(context, graph(kvh)).expect("executor");
+    let executor = Executor::new(context, graph(kvh, bias)).expect("executor");
     let mut steps = Vec::new();
     for t in 0..STEPS {
-        let host = step_inputs(t, kvh);
+        let host = step_inputs(t, kvh, bias);
         let mut inputs: Vec<(&str, Tensor<'_>)> = host
             .iter()
             .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone())))
@@ -260,15 +298,15 @@ fn close(name: &str, step: usize, want: &[f32], got: &[f32]) {
 /// the right place, so a kernel that used `total` where it should use the
 /// physical stride passes at `kvh = 1` and puts row 1's tokens on top of row 0's
 /// here.
-fn resident_matches_stateless(kvh: usize) {
+fn resident_matches_stateless(kvh: usize, bias: Bias) {
     // leaked so the buffers can borrow a `'static` context, as `Session` does
     let context: &'static VkContext = Box::leak(Box::new(VkContext::new().expect("Vulkan")));
     let bytes = (kvh * MAX_SEQ * H * 4) as u64;
     let key_buf = context.create_storage_buffer(bytes).expect("key cache");
     let value_buf = context.create_storage_buffer(bytes).expect("value cache");
 
-    let want = stateless(context, kvh);
-    let got = resident(context, kvh, &key_buf, &value_buf);
+    let want = stateless(context, kvh, bias);
+    let got = resident(context, kvh, bias, &key_buf, &value_buf);
 
     for (step, ((w_out, w_key, w_value), (g_out, g_key, g_value))) in
         want.iter().zip(&got).enumerate()
@@ -284,10 +322,35 @@ fn resident_matches_stateless(kvh: usize) {
 
 #[test]
 fn a_multi_query_cache_matches_the_stateless_path() {
-    resident_matches_stateless(1);
+    resident_matches_stateless(1, Bias::None);
 }
 
 #[test]
 fn a_grouped_cache_matches_the_stateless_path() {
-    resident_matches_stateless(2);
+    resident_matches_stateless(2, Bias::None);
+}
+
+#[test]
+fn a_bias_survives_the_padded_score_row() {
+    resident_matches_stateless(1, Bias::Values);
+}
+
+/// The case that caught a real bug: a bias that masks **every** key, against a
+/// cache longer than the sequence.
+///
+/// The score buffer covers the cache's whole physical extent so the grid stays
+/// the same from token to token, and the padding used to be normalized along
+/// with the row. With any real key surviving that is harmless — the padding
+/// carries a masked-out sentinel and softmax gives it zero — but when the row is
+/// entirely masked the probability has to go somewhere, and it went to the
+/// padding: 1/2048 per key instead of 1 on the single real one. gemma3-1b hit
+/// this on its first token and diverged by 2.9e1.
+///
+/// Nothing else in the suite covers it: the tests above have no bias,
+/// `tests/attention.rs` has no bound cache, and neither has a row where every
+/// key is masked. The fix is that softmax normalizes `total` keys `stride`
+/// apart, so the padded entries are not read at all.
+#[test]
+fn a_fully_masked_row_keeps_its_probability_out_of_the_padding() {
+    resident_matches_stateless(1, Bias::Masking);
 }

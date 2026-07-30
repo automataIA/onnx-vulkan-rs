@@ -3687,8 +3687,9 @@ fn softmax(env: &mut Env, node: &NodeIr) -> Result<()> {
     let gy = (rows as u32).div_ceil(gx);
     let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
     if elem_count > 0 {
-        let mut push = Vec::with_capacity(16);
-        for v in [c as u32, inner as u32, rows as u32, gx] {
+        let mut push = Vec::with_capacity(SOFTMAX_PUSH_BYTES as usize);
+        // rows are packed: the pitch is the row itself
+        for v in [c as u32, inner as u32, rows as u32, c as u32, gx] {
             push.extend_from_slice(&v.to_le_bytes());
         }
         with_pipeline(
@@ -4181,9 +4182,20 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
     };
     let (present_k_buf, present_v_buf) = (present_k.get(), present_v.get());
 
+    // Key extent the score and probability scratch are laid out for, and the one
+    // the two dispatches over them cover. Against a resident cache this is the
+    // cache's physical stride rather than the `total` this step reached, which
+    // makes both the allocation sizes and the grids **independent of the step**:
+    // that is the precondition for reusing a recorded dispatch across tokens,
+    // where `total` grows by one each time and would otherwise change the grid
+    // of every attention node. The padded keys are not a special case for the
+    // kernels — `GQA_scores` already writes `-3.4e38` at every `t > past + sq`,
+    // so softmax gives them exactly zero — and `GQA_out` still sums only `total`
+    // of them, so the padding is never read.
+    let keys = if kv_stride > total { kv_stride } else { total };
     let q_rot = alloc(b * nh * s * head_size)?;
-    let scores = alloc(b * nh * s * total)?;
-    let probs = alloc(b * nh * s * total)?;
+    let scores = alloc(b * nh * s * keys)?;
+    let probs = alloc(b * nh * s * keys)?;
     let out = alloc(b * s * nh * head_size)?;
 
     // 1) past cache into the head of `present` — unless it is already there.
@@ -4279,7 +4291,7 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
     pack(env.cache(), k.buffer(), present_k_buf, kvh, kv_stride, past, do_rotary)?;
     pack(env.cache(), v.buffer(), present_v_buf, kvh, kv_stride, past, false)?;
 
-    let score_count = b * nh * s * total;
+    let score_count = b * nh * s * keys;
     if score_count > 0 {
         // 3) masked scores
         let (grid, gx) = attn_grid(score_count);
@@ -4302,6 +4314,8 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         // `shaders::attention`. Equal to `total` while the cache is rebuilt
         // per run, and `max_seq_len` once it is resident.
         push.extend_from_slice(&(kv_stride as u32).to_le_bytes());
+        // row extent of the score buffer, which is the padded one
+        push.extend_from_slice(&(keys as u32).to_le_bytes());
         push.extend_from_slice(&gx.to_le_bytes());
         with_pipeline(
             env.cache(),
@@ -4328,7 +4342,10 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         let sgx = rows.clamp(1, 32768) as u32;
         let sgy = (rows as u32).div_ceil(sgx);
         let mut push = Vec::with_capacity(SOFTMAX_PUSH_BYTES as usize);
-        for value in [total as u32, 1, rows as u32, sgx] {
+        // `total` keys to normalize, `keys` apart: the padding of a resident
+        // cache is not touched, so a row whose real keys are all masked keeps its
+        // probability inside the row
+        for value in [total as u32, 1, rows as u32, keys as u32, sgx] {
             push.extend_from_slice(&value.to_le_bytes());
         }
         with_pipeline(
@@ -4356,6 +4373,7 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
             s as u32,
             total as u32,
             kv_stride as u32,
+            keys as u32,
             gx,
         ] {
             push.extend_from_slice(&value.to_le_bytes());
@@ -4374,6 +4392,27 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         )?;
     }
 
+    static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if std::env::var_os("GQA_PROBE").is_some()
+        && PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+    {
+        ctx.flush().expect("probe flush");
+        let read = |buf: &GpuBuffer, n: usize| -> Vec<f32> {
+            let bytes = ctx.download(buf).expect("probe download");
+            bytes[..n * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let sc = read(&scores, keys.min(8));
+        let pr = read(&probs, keys.min(8));
+        let sum: f32 = read(&probs, keys).iter().sum();
+        log::warn!(
+            "probe {} keys={keys} total={total} past={past} bias={has_bias} window={window} scale={scale} s={s} nh={nh} scores[..8]={sc:?} \
+             probs[..8]={pr:?} sum={sum}",
+            node.name
+        );
+    }
     let device = |shape: Vec<i64>, buf: GpuBuffer| {
         let elem_count = shape.iter().map(|d| (*d).max(0) as usize).product();
         Tensor::Device(DevTensor {

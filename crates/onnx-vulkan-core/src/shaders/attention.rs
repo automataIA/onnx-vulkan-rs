@@ -41,9 +41,9 @@ pub const PACK_PUSH_BYTES: u32 = 40;
 pub const PAST_BINDINGS: u32 = 2;
 pub const PAST_PUSH_BYTES: u32 = 20;
 pub const SCORES_BINDINGS: u32 = 4;
-pub const SCORES_PUSH_BYTES: u32 = 48;
+pub const SCORES_PUSH_BYTES: u32 = 52;
 pub const OUT_BINDINGS: u32 = 3;
-pub const OUT_PUSH_BYTES: u32 = 32;
+pub const OUT_PUSH_BYTES: u32 = 36;
 
 /// Threads per workgroup for every kernel in this module.
 pub const WG: u32 = 256;
@@ -218,10 +218,15 @@ pub const SCORES: &str = r#"
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> scores: array<f32>;
 
+// `total` is this step's key count, `keys` the row extent of the score buffer.
+// They differ against a resident cache, where the scores cover the cache's whole
+// physical extent to keep the grid step-invariant — so `keys` indexes the score
+// row and `total` still indexes the attention bias, which the graph hands over at
+// its own `[b, 1, s, total]` and knows nothing about the padding.
 struct Push {
     count: u32, nh: u32, kvh: u32, h: u32,
     s: u32, total: u32, past: u32, scale: f32,
-    window: i32, has_bias: u32, stride: u32, gx: u32,
+    window: i32, has_bias: u32, stride: u32, keys: u32, gx: u32,
 }
 var<immediate> pc: Push;
 
@@ -232,8 +237,8 @@ fn main(
 ) {
     let i = (wid.y * pc.gx + wid.x) * 256u + lid.x;
     if (i >= pc.count) { return; }
-    let t = i % pc.total;
-    var rest = i / pc.total;
+    let t = i % pc.keys;
+    var rest = i / pc.keys;
     let sq = rest % pc.s;
     rest = rest / pc.s;
     let head = rest % pc.nh;
@@ -273,7 +278,16 @@ pub const OUT: &str = r#"
 @group(0) @binding(1) var<storage, read> v: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 
-struct Push { count: u32, nh: u32, kvh: u32, h: u32, s: u32, total: u32, stride: u32, gx: u32 }
+// `total` is how many keys this step has, `keys` how many the probability
+// buffer is laid out for: the two differ against a resident cache, where the
+// score and probability scratch cover the cache's whole physical extent so the
+// grid does not change from token to token. The padded probabilities are exactly
+// zero, but the value cache behind them is not initialized, so the sum stops at
+// `total` rather than multiplying zero by whatever is there.
+struct Push {
+    count: u32, nh: u32, kvh: u32, h: u32,
+    s: u32, total: u32, stride: u32, keys: u32, gx: u32,
+}
 var<immediate> pc: Push;
 
 @compute @workgroup_size(256)
@@ -291,7 +305,7 @@ fn main(
     let batch = rest / pc.nh;
 
     let hkv = head / (pc.nh / pc.kvh);
-    let pb = ((batch * pc.nh + head) * pc.s + sq) * pc.total;
+    let pb = ((batch * pc.nh + head) * pc.s + sq) * pc.keys;
     let vb = (batch * pc.kvh + hkv) * pc.stride * pc.h + d;
     var acc = 0.0;
     for (var t = 0u; t < pc.total; t = t + 1u) {

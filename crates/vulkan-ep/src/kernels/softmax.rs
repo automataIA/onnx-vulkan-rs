@@ -78,8 +78,9 @@ unsafe fn compute_impl(kernel: &SoftmaxKernel, ctx_ptr: *mut sys::OrtKernelConte
     if n == 0 {
         return Ok(());
     }
-    let mut push = Vec::with_capacity(16);
-    for v in [c as u32, inner as u32, rows as u32, gx] {
+    let mut push = Vec::with_capacity(SOFTMAX_PUSH_BYTES as usize);
+    // rows are packed: the pitch is the row itself
+    for v in [c as u32, inner as u32, rows as u32, c as u32, gx] {
         push.extend_from_slice(&v.to_le_bytes());
     }
     ctx.stream_dispatch_slices(

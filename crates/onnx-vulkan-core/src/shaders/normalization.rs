@@ -3,7 +3,7 @@
 //! `SkipSimplifiedLayerNormalization`).
 
 pub const SOFTMAX_BINDINGS: u32 = 2;
-pub const SOFTMAX_PUSH_BYTES: u32 = 16;
+pub const SOFTMAX_PUSH_BYTES: u32 = 20;
 pub const LAYERNORM_BINDINGS: u32 = 6;
 pub const LAYERNORM_PUSH_BYTES: u32 = 24;
 
@@ -19,7 +19,14 @@ pub const SOFTMAX: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 
-struct Push { c: u32, inner: u32, rows: u32, gx: u32 }
+// `pitch` is the distance between rows, `c` how many of each row to normalize.
+// They are equal everywhere except attention against a resident cache, where the
+// score buffer is laid out for the whole cache so the grid stays the same from
+// token to token while only `total` keys exist. Normalizing the padding instead
+// — even filled with a masked-out sentinel — is not equivalent: a row whose real
+// keys are *all* masked (a graph can supply a bias that masks everything) then
+// spreads its probability over the padding rather than over the row.
+struct Push { c: u32, inner: u32, rows: u32, pitch: u32, gx: u32 }
 var<immediate> pc: Push;
 
 var<workgroup> sred: array<f32, 256>;
@@ -31,8 +38,8 @@ fn main(
 ) {
     let row = wid.y * pc.gx + wid.x;
     if (row >= pc.rows) { return; }
-    // row r → (outer, inner_idx): base = outer * c * inner + inner_idx
-    let base = (row / pc.inner) * pc.c * pc.inner + (row % pc.inner);
+    // row r → (outer, inner_idx): base = outer * pitch * inner + inner_idx
+    let base = (row / pc.inner) * pc.pitch * pc.inner + (row % pc.inner);
 
     // 1) row max
     var m = -3.4028235e38;

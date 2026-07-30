@@ -403,6 +403,28 @@ fn with_pipeline<R>(
     run(unsafe { &*pipeline })
 }
 
+/// A device buffer holding `bytes`, shared across nodes and across steps when
+/// the payload repeats.
+///
+/// Index and parameter payloads are identical from one call to the next far more
+/// often than not — the same zero index in 74 nodes of qwen2.5-VL, the same
+/// shape block in 8 — and they are constants, so one buffer serves them all.
+/// Past the cache's size cap this falls back to a private buffer, which is what
+/// every caller used to do.
+fn param_buffer<'cache>(
+    env: &Env<'cache, '_>,
+    bytes: &[u8],
+    scratch: &'cache mut Option<GpuBuffer>,
+) -> Result<&'cache GpuBuffer> {
+    if let Some(shared) = env.cache().constant(bytes)? {
+        // the cache owns it for as long as the session lives
+        return Ok(unsafe { &*shared });
+    }
+    let buffer = env.context().create_storage_buffer(bytes.len().max(4) as u64)?;
+    env.context().stream_upload(&buffer, bytes)?;
+    Ok(scratch.insert(buffer))
+}
+
 /// Executes the graph nodes on the provided environment, with no host dependency.
 ///
 /// Internal errors (anyhow, with context chain) are flattened into the core's
@@ -1537,8 +1559,8 @@ fn gather_device(env: &mut Env, node: &NodeIr, axis: i64) -> Result<()> {
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, n)?)?;
 
     let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let idx_buf = ctx.create_storage_buffer(idx_bytes.len().max(4) as u64)?;
-    ctx.stream_upload(&idx_buf, &idx_bytes)?;
+    let mut idx_own = None;
+    let idx_buf = param_buffer(env, &idx_bytes, &mut idx_own)?;
 
     if n > 0 {
         let mut push = Vec::with_capacity(16);
@@ -1552,14 +1574,17 @@ fn gather_device(env: &mut Env, node: &NodeIr, axis: i64) -> Result<()> {
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[d.buffer(), &idx_buf, &out],
+                    &[d.buffer(), idx_buf, &out],
                     &push,
                     [(n as u32).div_ceil(256), 1, 1],
                 )
             },
         )?;
     }
-    ctx.defer_destroy(idx_buf);
+    // only if this call owns one: a shared constant belongs to the cache
+    if let Some(buffer) = idx_own {
+        ctx.defer_destroy(buffer);
+    }
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -1647,8 +1672,8 @@ fn gather_block_quantized(env: &mut Env, node: &NodeIr) -> Result<()> {
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, count)?)?;
 
     let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let idx_buf = ctx.create_storage_buffer(idx_bytes.len().max(4) as u64)?;
-    ctx.stream_upload(&idx_buf, &idx_bytes)?;
+    let mut idx_buf_own = None;
+    let idx_buf = param_buffer(env, &idx_bytes, &mut idx_buf_own)?;
 
     if count > 0 {
         let groups = (count as u32).div_ceil(256);
@@ -1675,7 +1700,7 @@ fn gather_block_quantized(env: &mut Env, node: &NodeIr) -> Result<()> {
                     pipe,
                     &[
                         quant.buffer(),
-                        &idx_buf,
+                        idx_buf,
                         scales.buffer(),
                         zero_points.buffer(),
                         &out,
@@ -1686,7 +1711,10 @@ fn gather_block_quantized(env: &mut Env, node: &NodeIr) -> Result<()> {
             },
         )?;
     }
-    ctx.defer_destroy(idx_buf);
+    // only if this call owns one: a shared constant belongs to the cache
+    if let Some(buffer) = idx_buf_own {
+        ctx.defer_destroy(buffer);
+    }
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -1908,8 +1936,8 @@ fn pad_device(env: &mut Env, node: &NodeIr, begins: &[i64], ends: &[i64]) -> Res
     params.extend(in_shape.iter().map(|&d| d as i32));
     params.extend(in_str.iter().map(|&s| s as i32));
     let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let params_buf = ctx.create_storage_buffer(params_bytes.len().max(4) as u64)?;
-    ctx.stream_upload(&params_buf, &params_bytes)?;
+    let mut params_buf_own = None;
+    let params_buf = param_buffer(env, &params_bytes, &mut params_buf_own)?;
 
     env.ensure_device(data)?;
     let d = env.device(data)?;
@@ -1926,14 +1954,17 @@ fn pad_device(env: &mut Env, node: &NodeIr, begins: &[i64], ends: &[i64]) -> Res
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[d.buffer(), &params_buf, &out],
+                    &[d.buffer(), params_buf, &out],
                     &push,
                     [(n as u32).div_ceil(256), 1, 1],
                 )
             },
         )?;
     }
-    ctx.defer_destroy(params_buf);
+    // only if this call owns one: a shared constant belongs to the cache
+    if let Some(buffer) = params_buf_own {
+        ctx.defer_destroy(buffer);
+    }
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -3079,8 +3110,8 @@ fn where_device(env: &mut Env, node: &NodeIr, out_shape: &[i64]) -> Result<()> {
     params.extend(xstr.iter().map(|&s| s as i32));
     params.extend(ystr.iter().map(|&s| s as i32));
     let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let params_buf = ctx.create_storage_buffer(params_bytes.len().max(4) as u64)?;
-    ctx.stream_upload(&params_buf, &params_bytes)?;
+    let mut params_buf_own = None;
+    let params_buf = param_buffer(env, &params_bytes, &mut params_buf_own)?;
 
     env.ensure_device_dtype(cond)?; // bool → byte-esatto in VRAM
     env.ensure_device(x)?;
@@ -3097,14 +3128,17 @@ fn where_device(env: &mut Env, node: &NodeIr, out_shape: &[i64]) -> Result<()> {
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[c.buffer(), xd.buffer(), yd.buffer(), &out, &params_buf],
+                    &[c.buffer(), xd.buffer(), yd.buffer(), &out, params_buf],
                     &(n as u32).to_le_bytes(),
                     [(n as u32).div_ceil(256), 1, 1],
                 )
             },
         )?;
     }
-    ctx.defer_destroy(params_buf);
+    // only if this call owns one: a shared constant belongs to the cache
+    if let Some(buffer) = params_buf_own {
+        ctx.defer_destroy(buffer);
+    }
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -3178,8 +3212,8 @@ fn slice_device(
     params.extend(st.iter().map(|&s| s as i32));
     params.extend(sp.iter().map(|&s| s as i32));
     let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let params_buf = ctx.create_storage_buffer(params_bytes.len().max(4) as u64)?;
-    ctx.stream_upload(&params_buf, &params_bytes)?;
+    let mut params_buf_own = None;
+    let params_buf = param_buffer(env, &params_bytes, &mut params_buf_own)?;
 
     env.ensure_device(src)?;
     let d = env.device(src)?;
@@ -3195,14 +3229,17 @@ fn slice_device(
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[d.buffer(), &params_buf, &out],
+                    &[d.buffer(), params_buf, &out],
                     &push,
                     [(n as u32).div_ceil(256), 1, 1],
                 )
             },
         )?;
     }
-    ctx.defer_destroy(params_buf);
+    // only if this call owns one: a shared constant belongs to the cache
+    if let Some(buffer) = params_buf_own {
+        ctx.defer_destroy(buffer);
+    }
     Ok(DevTensor {
         dtype: FLOAT,
         shape: out_shape.to_vec(),
@@ -3888,15 +3925,36 @@ fn rotary_embedding(env: &mut Env, node: &NodeIr) -> Result<()> {
     };
     // i64 → i32, and the position indexes a cache row so a negative one is not
     // a wrap-around but a broken graph
-    let positions: Vec<i32> = env
-        .host(&node.inputs[1])?
-        .to_i64()?
-        .into_iter()
+    let host_positions = env.host(&node.inputs[1])?.to_i64()?;
+    let positions: Vec<i32> = host_positions
+        .iter()
         .map(|p| {
-            ensure!(p >= 0, "RotaryEmbedding: negative position {p}");
-            Ok(p as i32)
+            ensure!(*p >= 0, "RotaryEmbedding: negative position {p}");
+            Ok(*p as i32)
         })
         .collect::<Result<_>>()?;
+    // Every layer rotates against the **same** positions: qwen2.5-VL has 72 of
+    // these nodes and they all read one value. Uploading it per node was 72 of
+    // the 90 transfers a decode step made, each with its own buffer, and the
+    // sizes are identical so they cost 72 allocations as well. The converted
+    // tensor is memoized under a derived name, which the value table already
+    // serves for anything not in the graph.
+    let pos_key = format!("{}#i32", node.inputs[1]);
+    if !positions.is_empty() && !env.on_device(&pos_key) {
+        let pos_bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let context = env.context();
+        let buffer = context.create_storage_buffer(pos_bytes.len() as u64)?;
+        context.stream_upload(&buffer, &pos_bytes)?;
+        env.set(
+            &pos_key,
+            Tensor::Device(DevTensor {
+                dtype: INT32,
+                shape: vec![positions.len() as i64],
+                elem_count: positions.len(),
+                buf: BufRef::Owned(buffer),
+            }),
+        );
+    }
 
     let ctx = env.context();
     for index in [0, 2, 3] {
@@ -3968,9 +4026,7 @@ fn rotary_embedding(env: &mut Env, node: &NodeIr) -> Result<()> {
     let (shape, elem_count) = (x.shape.clone(), x.elem_count);
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
     if elem_count > 0 {
-        let pos_bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
-        let pos_buf = ctx.create_storage_buffer(pos_bytes.len().max(4) as u64)?;
-        ctx.stream_upload(&pos_buf, &pos_bytes)?;
+        let pos_buf = env.device(&pos_key)?.buffer();
         let (grid, gx) = attn_grid(elem_count);
         let mut push = Vec::with_capacity(ATTN_ROTARY_PUSH_BYTES as usize);
         for v in [
@@ -3998,7 +4054,7 @@ fn rotary_embedding(env: &mut Env, node: &NodeIr) -> Result<()> {
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[x.buffer(), &pos_buf, cos.buffer(), sin.buffer(), &out],
+                    &[x.buffer(), pos_buf, cos.buffer(), sin.buffer(), &out],
                     &push,
                     grid,
                 )
@@ -4392,27 +4448,6 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         )?;
     }
 
-    static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if std::env::var_os("GQA_PROBE").is_some()
-        && PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
-    {
-        ctx.flush().expect("probe flush");
-        let read = |buf: &GpuBuffer, n: usize| -> Vec<f32> {
-            let bytes = ctx.download(buf).expect("probe download");
-            bytes[..n * 4]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect()
-        };
-        let sc = read(&scores, keys.min(8));
-        let pr = read(&probs, keys.min(8));
-        let sum: f32 = read(&probs, keys).iter().sum();
-        log::warn!(
-            "probe {} keys={keys} total={total} past={past} bias={has_bias} window={window} scale={scale} s={s} nh={nh} scores[..8]={sc:?} \
-             probs[..8]={pr:?} sum={sum}",
-            node.name
-        );
-    }
     let device = |shape: Vec<i64>, buf: GpuBuffer| {
         let elem_count = shape.iter().map(|d| (*d).max(0) as usize).product();
         Tensor::Device(DevTensor {

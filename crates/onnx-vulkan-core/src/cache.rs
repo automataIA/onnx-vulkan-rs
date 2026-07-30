@@ -32,6 +32,8 @@ pub struct KernelCache<'context> {
     packed: Mutex<HashMap<PackedKey, Box<GpuBuffer>>>,
     uploads: Mutex<HashMap<UploadKey, Box<GpuBuffer>>>,
     zero_scalar: Mutex<Option<Box<GpuBuffer>>>,
+    /// Small parameter payloads, keyed by their bytes — see `constant`.
+    constants: Mutex<HashMap<Vec<u8>, Box<GpuBuffer>>>,
     pipeline_builds: AtomicUsize,
     packed_builds: AtomicUsize,
     upload_builds: AtomicUsize,
@@ -45,6 +47,7 @@ impl<'context> KernelCache<'context> {
             packed: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             zero_scalar: Mutex::new(None),
+            constants: Mutex::new(HashMap::new()),
             pipeline_builds: AtomicUsize::new(0),
             packed_builds: AtomicUsize::new(0),
             upload_builds: AtomicUsize::new(0),
@@ -161,6 +164,43 @@ impl<'context> KernelCache<'context> {
         self.upload_builds.load(Ordering::Relaxed)
     }
 
+    /// Largest payload the constant cache holds, and how many it keeps.
+    ///
+    /// The entries are index and shape parameters — tens of bytes each — so the
+    /// caps exist to bound a pathological graph, not to ration anything real.
+    const CONST_MAX_BYTES: usize = 256;
+    const CONST_MAX_ENTRIES: usize = 4096;
+
+    /// A device buffer holding exactly `bytes`, uploaded once and shared by
+    /// every later request for the same content.
+    ///
+    /// Kernels pass indices and shape parameters that do not fit in push
+    /// constants through a small buffer, and they build it per call: qwen2.5-VL
+    /// uploaded the same four zero bytes **74 times per decode step**, plus
+    /// eight copies of one 64-byte parameter block. Keyed by content rather than
+    /// by node, because that is what makes them the same buffer — and the cache
+    /// belongs to the session, so a generation loop pays for them once and not
+    /// once per token.
+    ///
+    /// Returns `None` for payloads past the cap, which the caller uploads
+    /// itself.
+    pub(crate) fn constant(&self, bytes: &[u8]) -> Result<Option<*const GpuBuffer>> {
+        if bytes.is_empty() || bytes.len() > Self::CONST_MAX_BYTES {
+            return Ok(None);
+        }
+        let mut map = self.constants.lock().expect("poisoned constant cache");
+        if let Some(buffer) = map.get(bytes) {
+            return Ok(Some(&**buffer as *const GpuBuffer));
+        }
+        if map.len() >= Self::CONST_MAX_ENTRIES {
+            return Ok(None);
+        }
+        let buffer = self.context.create_storage_buffer(bytes.len() as u64)?;
+        self.context.stream_upload(&buffer, bytes)?;
+        let entry = map.entry(bytes.to_vec()).or_insert(Box::new(buffer));
+        Ok(Some(&**entry as *const GpuBuffer))
+    }
+
     /// Shared zero scalar buffer (4 bytes): missing zero-points read as 0.
     ///
     /// The pointer stays valid as long as the cache lives.
@@ -183,6 +223,9 @@ impl Drop for KernelCache<'_> {
             self.context.destroy_pipeline(*pipeline);
         }
         for (_, buffer) in self.packed.get_mut().expect("packed-weights cache").drain() {
+            self.context.destroy_buffer(*buffer);
+        }
+        for (_, buffer) in self.constants.get_mut().expect("constant cache").drain() {
             self.context.destroy_buffer(*buffer);
         }
         for (_, buffer) in self.uploads.get_mut().expect("upload cache").drain() {

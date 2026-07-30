@@ -29,7 +29,6 @@
 //!   plan is still pointing at.
 
 use crate::{Error, GraphIr, Result, Tensor};
-use std::collections::HashSet;
 use std::ops::Range;
 use vk_compute::StreamOp;
 
@@ -106,7 +105,7 @@ impl StepPlan {
         }
         let (first, second) = (&traces[0], &traces[1]);
         same_structure(ir, first, second)?;
-        let host_nodes = host_nodes(ir, first)?;
+        let host_nodes = host_nodes(first);
         let payloads = payloads(traces)?;
         let push = push_patches(first, second)?;
         let plan = Self {
@@ -229,38 +228,23 @@ fn same_structure(ir: &GraphIr, first: &StepTrace, second: &StepTrace) -> Result
 /// Nodes that issued no command at all: pure host computation, which the plan
 /// re-runs because its results are what the uploads carry.
 ///
-/// They must form a closed set over the graph's inputs and initializers — a
-/// host node reading a device value would download it, and a download is a
-/// flush, which a decode step does exactly once and at the end.
-fn host_nodes(ir: &GraphIr, trace: &StepTrace) -> Result<Vec<usize>> {
-    let mut indices = Vec::new();
-    let mut produced: HashSet<&str> = HashSet::new();
-    for (index, range) in trace.nodes.iter().enumerate() {
-        if !range.is_empty() {
-            continue;
-        }
-        indices.push(index);
-        for output in &ir.nodes[index].outputs {
-            produced.insert(output.as_str());
-        }
-    }
-    let inputs: HashSet<&str> = ir.inputs.iter().map(String::as_str).collect();
-    for &index in &indices {
-        let node = &ir.nodes[index];
-        for name in node.inputs.iter().filter(|n| !n.is_empty()) {
-            let known = produced.contains(name.as_str())
-                || inputs.contains(name.as_str())
-                || ir.initializers.contains_key(name);
-            if !known {
-                return Err(Error::Unsupported(format!(
-                    "host node '{}' reads '{name}', which no other host node produces: replaying \
-                     the step would run it against the value of the step that was captured",
-                    node.name
-                )));
-            }
-        }
-    }
-    Ok(indices)
+/// A host node reading a value some *device* node produced is allowed, and it
+/// happens: qwen2.5-VL's mRoPE path asks for the shape of a projection. Only
+/// the metadata survives the step — the buffer went back to the pool at the
+/// last reader — so a node that wants the shape gets it and a node that wants
+/// the bytes fails, loudly, rather than reading the captured token's data.
+///
+/// Which of the two it is cannot be read off the graph, and is not guessed
+/// here: `verify_against` re-runs these nodes under exactly the conditions a
+/// replay gives them, and that is where the difference shows up.
+fn host_nodes(trace: &StepTrace) -> Vec<usize> {
+    trace
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, range)| range.is_empty())
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// For every upload whose bytes are not the same in all traces, the value whose

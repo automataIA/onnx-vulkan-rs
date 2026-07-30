@@ -22,6 +22,14 @@ pub struct ExecutionEnv<'context, 'values> {
     /// Values whose declared shape is the logical tensor while the buffer holds
     /// it with a longer row stride — see `mark_row_padded`.
     row_padded: HashMap<String, usize>,
+    /// Shape and dtype of values whose memory has gone back to the pool.
+    ///
+    /// `Shape` asks for the dimensions of a tensor, not for its bytes, and a
+    /// graph is free to ask after the last node that read the data — qwen2.5-VL
+    /// does exactly that in its mRoPE path. Freeing the buffer at the last
+    /// *reader* is what bounds a step's memory, so the answer is not to keep
+    /// the memory but to stop conflating it with what is known about it.
+    released: HashMap<String, (i32, Vec<i64>)>,
     /// Hand this run's buffers back to the pool instead of freeing them.
     retain: bool,
 }
@@ -41,6 +49,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             host_cache: RefCell::new(HashMap::new()),
             bound_outputs: HashMap::new(),
             row_padded: HashMap::new(),
+            released: HashMap::new(),
             retain: false,
         }
     }
@@ -210,6 +219,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 .initializers
                 .get(name)
                 .map(|initializer| initializer.dtype)
+                .or_else(|| self.released.get(name).map(|(dtype, _)| *dtype))
                 .ok_or_else(|| Error::InvalidTensor(format!("dtype of '{name}' not available"))),
         }
     }
@@ -222,6 +232,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 .initializers
                 .get(name)
                 .map(|initializer| initializer.shape.clone())
+                .or_else(|| self.released.get(name).map(|(_, shape)| shape.clone()))
                 .ok_or_else(|| Error::InvalidTensor(format!("shape of '{name}' not available"))),
         }
     }
@@ -405,6 +416,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     pub fn set(&mut self, name: &str, tensor: Tensor<'values>) {
         self.values.insert(name.to_owned(), tensor);
         self.host_cache.borrow_mut().remove(name);
+        self.released.remove(name);
     }
 
     /// Drops a value the graph will not read again, returning its VRAM to the
@@ -420,10 +432,21 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     /// flush — the memory would come back after the run that needed it.
     pub fn release(&mut self, name: &str) {
         self.host_cache.borrow_mut().remove(name);
-        if let Some(Tensor::Device(DeviceTensor {
+        let Some(tensor) = self.values.remove(name) else {
+            return;
+        };
+        // What the value *was* outlives where it lived: `Shape` and the other
+        // metadata readers need the dimensions, and a graph may ask for them
+        // after the last node that read the bytes.
+        let (dtype, shape) = match &tensor {
+            Tensor::Device(tensor) => (tensor.dtype, tensor.shape.clone()),
+            Tensor::Host(tensor) => (tensor.dtype, tensor.shape.clone()),
+        };
+        self.released.insert(name.to_owned(), (dtype, shape));
+        if let Tensor::Device(DeviceTensor {
             buf: DeviceBuffer::Owned(buffer),
             ..
-        })) = self.values.remove(name)
+        }) = tensor
         {
             self.context.recycle_storage_buffer(buffer);
         }

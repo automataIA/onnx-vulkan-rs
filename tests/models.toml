@@ -136,8 +136,11 @@ args = [
     "--fill", "attention_mask=1",
     "--tol", "1e-2",
 ]
-iters = 3
-default = false
+# 20, not 3: a decode step is ~10 ms, so the median needs the samples far more
+# than the run needs the time -- and a 3-iteration ratio is not evidence
+# (`CLAUDE.md`, "Performance reality").
+iters = 20
+default = true
 validate = "outputs"
 size_mb = 1000
 
@@ -145,9 +148,20 @@ size_mb = 1000
 name = "qwen25vl-decoder"
 path = "models/zoo/qwen25vl/decoder_model_merged_q4.onnx"
 runner = "model-runner"
-args = []
-iters = 3
-default = false
+# same coupling as gemma3-1b above, for the same reason: this graph also runs
+# `GroupQueryAttention` (36 nodes), so `total = past + sequence` is a constraint
+# ONNX Runtime enforces itself, and `attention_mask` feeds `seqlens_k`. Without
+# these the entry ran with every dimension defaulted to 1, i.e. `total = 1`
+# against `past + sequence = 2`, and failed before reaching a kernel.
+args = [
+    "--dim", "past_sequence_length=127",
+    "--dim", "sequence_length=1",
+    "--dim", "total_sequence_length=128",
+    "--fill", "attention_mask=1",
+    "--tol", "1e-2",
+]
+iters = 20
+default = true
 validate = "outputs"
 size_mb = 1100
 

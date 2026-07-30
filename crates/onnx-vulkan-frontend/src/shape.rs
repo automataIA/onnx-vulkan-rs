@@ -323,6 +323,8 @@ fn infer_node(
         | "Softmax"
         | "LogSoftmax"
         | "LayerNormalization"
+        | "SimplifiedLayerNormalization"
+        | "RotaryEmbedding"
         | "BatchNormalization"
         | "InstanceNormalization"
         | "Clip"
@@ -630,6 +632,15 @@ fn infer_node(
             shape: first.shape,
         }],
         "NonMaxSuppression" => vec![TensorType::of(INT64, vec![Dim::Unknown, Dim::Fixed(3)])],
+        // output 0 and output 3 (`input_skip_bias_sum`) are the input's shape;
+        // `mean` and `inv_std_var` in between are not claimed, so they stay
+        // unknown rather than being given a plausible reduction shape
+        "SkipSimplifiedLayerNormalization" | "SkipLayerNormalization" => vec![
+            first.clone(),
+            TensorType::default(),
+            TensorType::default(),
+            first,
+        ],
 
         _ => vec![TensorType::default(); node.outputs.len().max(1)],
     }

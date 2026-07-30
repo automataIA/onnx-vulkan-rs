@@ -4,6 +4,10 @@
 //! cargo run --release -p onnx-vulkan --example run -- model.onnx [--dim SYM=N] [--fill NAME=V] [--runs N]
 //! ```
 //!
+//! `--decode N` runs N steps against a resident KV cache; `--greedy 1` reduces
+//! each step's logits to a token index **on the device**, which is what a
+//! generation loop wants and what keeps 600 KB per token off the bus.
+//!
 //! `--dim SYM=N` binds a symbolic dimension (default 1); `--fill NAME=V` fills
 //! an integer input with `V` (default 0), because a random length is not a
 //! length. Float inputs get a fixed pseudo-random sequence, so two runs of the
@@ -43,6 +47,7 @@ fn decode(
     session: &Session,
     steps: usize,
     oracle: bool,
+    greedy: bool,
     dims: &HashMap<String, i64>,
     fills: &HashMap<String, i64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -106,18 +111,30 @@ fn decode(
         // would attribute its VRAM to the resident one
         if !oracle {
             let started = Instant::now();
-            let run = session.run_cached(
+            let mut run = session.run_cached(
                 shared.iter().map(|(n, t)| (n.as_str(), t.clone())),
                 &cache,
             )?;
+            // `--greedy 1` is what a generation loop does: the logits are
+            // reduced where they are and only the token index is downloaded
+            let mut picked = Vec::new();
             for name in &logits {
-                run.get(name)?;
+                if greedy {
+                    picked.extend(run.argmax(name)?);
+                } else {
+                    run.get(name)?;
+                }
             }
             run.finish();
             println!(
-                "step {step}: cache {} tokens · resident {:?}",
+                "step {step}: cache {} tokens · resident {:?}{}",
                 cache.len(),
-                started.elapsed()
+                started.elapsed(),
+                if greedy {
+                    format!(" · token {picked:?}")
+                } else {
+                    String::new()
+                }
             );
             if vk_compute::stats::enabled() {
                 println!("  ── resident step {step}");
@@ -153,7 +170,7 @@ fn decode(
         vk_compute::stats::dump_and_reset();
 
         let resident = Instant::now();
-        let run = session.run_cached(
+        let mut run = session.run_cached(
             shared.iter().map(|(n, t)| (n.as_str(), t.clone())),
             &cache,
         )?;
@@ -161,6 +178,31 @@ fn decode(
             .iter()
             .map(|name| Ok(run.get(name)?.to_f32()?))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        // the device reduction against the host one over the same downloaded
+        // values: on a real vocabulary this is the only oracle that covers the
+        // split, and it costs one extra dispatch on a run that is already slow
+        if greedy {
+            for (name, values) in logits.iter().zip(&got) {
+                let rows = run.argmax(name)?;
+                let width = values.len() / rows.len().max(1);
+                for (row, &index) in rows.iter().enumerate() {
+                    let slice = &values[row * width..(row + 1) * width];
+                    let want = slice
+                        .iter()
+                        .enumerate()
+                        .fold((f32::NEG_INFINITY, 0usize), |best, (i, &v)| {
+                            if v > best.0 { (v, i) } else { best }
+                        })
+                        .1;
+                    if index != want as i64 {
+                        return Err(format!(
+                            "{name} row {row}: device argmax {index}, host {want}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
         run.finish();
         let resident = resident.elapsed();
 
@@ -204,12 +246,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runs = 1usize;
     let mut decode_steps = 0usize;
     let mut oracle = true;
+    let mut greedy = false;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(format!("{flag} needs an argument"))?;
         match flag.as_str() {
             "--runs" => runs = value.parse()?,
             "--decode" => decode_steps = value.parse()?,
             "--oracle" => oracle = value != "0",
+            "--greedy" => greedy = value != "0",
             "--dim" | "--fill" => {
                 let (name, number) = value
                     .split_once('=')
@@ -240,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if decode_steps > 0 {
-        return decode(&session, decode_steps, oracle, &dims, &fills);
+        return decode(&session, decode_steps, oracle, greedy, &dims, &fills);
     }
 
     let inputs: Vec<(String, HostTensor)> = session
@@ -264,6 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("run {} of {runs} in {:?}", i + 1, ran.elapsed());
         run.finish();
+        // `live` after each run, which is the leak oracle: identical inputs must
+        // leave identical VRAM held. A kernel that drops a `GpuBuffer` instead
+        // of recycling or destroying it shows up as a `live` that climbs run
+        // over run. `VULKAN_EP_STATS=1 RUST_LOG=info --runs 3` to see it.
+        vk_compute::stats::dump_and_reset();
     }
     Ok(())
 }

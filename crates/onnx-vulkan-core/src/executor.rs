@@ -163,6 +163,16 @@ impl<'a> Outputs<'a> {
         self.env.host(name)
     }
 
+    /// Index of the largest element along the last axis of a value this run
+    /// produced, reduced **on the device**: the dispatches join the command
+    /// buffer the run is still holding, and only the indices are downloaded.
+    ///
+    /// This is what replaces downloading a row of logits per token. It takes
+    /// `&mut self` because it enqueues work and keeps the result in the run.
+    pub fn argmax(&mut self, name: &str) -> Result<Vec<i64>> {
+        crate::interp::argmax_of(&mut self.env, name)
+    }
+
     pub fn on_device(&self, name: &str) -> bool {
         self.env.on_device(name)
     }

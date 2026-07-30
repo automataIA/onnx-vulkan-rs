@@ -190,6 +190,46 @@ fn a_partial_last_block_is_not_read_past_k() {
     });
 }
 
+/// `N` above `shaders::matmul_nbits::DECODE_MIN_N` routes a decode step to the
+/// wide-column kernel — 16 columns per workgroup instead of one — and this is
+/// what says the two agree. Its own reduction and column mapping are different,
+/// so nothing about the small-`N` cases above covers it.
+#[test]
+fn a_wide_decode_step_takes_the_gemv_kernel() {
+    run_case(Case {
+        m: 1,
+        k: 128,
+        n: 4096,
+        block_size: 32,
+    });
+}
+
+/// And above `HEAD_MIN_N` it takes the unembedding kernel, which reads whole
+/// blocks as `vec4<u32>` and unpacks them with four accumulators — a third code
+/// path, with a third mapping from threads to columns.
+#[test]
+fn an_unembedding_width_takes_the_head_kernel() {
+    run_case(Case {
+        m: 1,
+        k: 96,
+        n: 65536,
+        block_size: 32,
+    });
+}
+
+/// The width thresholds apply to a decode step only: with more than one row the
+/// shipped kernel runs whatever `N` is, and a wide prefill must not silently
+/// take a kernel measured only at `M = 1`.
+#[test]
+fn a_wide_prefill_stays_on_the_row_kernel() {
+    run_case(Case {
+        m: 3,
+        k: 128,
+        n: 4096,
+        block_size: 32,
+    });
+}
+
 #[test]
 fn an_odd_block_count_misaligns_the_zero_point_rows() {
     // 7 blocks means 4 bytes of zero points per column, so consecutive columns

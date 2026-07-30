@@ -11,6 +11,8 @@
 use crate::proto;
 use onnx_vulkan_core::{AttrValue, GraphIr, InitializerIr, NodeIr};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,20 +345,39 @@ fn read_external(tensor: &proto::TensorProto, base_dir: Option<&Path>) -> Result
     })?;
 
     let path = base.join(&location);
-    let bytes = std::fs::read(&path)
-        .map_err(|e| Error::ExternalData(format!("reading {}: {e}", path.display())))?;
+    // seek to the tensor's slice instead of reading the whole file: every
+    // initializer of a model points at the *same* external file, so reading it
+    // per tensor is quadratic in the number of weights. Measured on
+    // qwen2.5-VL's q4 decoder — 959 initializers over ~2 GB of external data,
+    // i.e. ~1.9 TB of reads — `load` took **767 s**; with the seek it is
+    // seconds. The whole-file read also made the error message honest for free,
+    // which is why the file length is fetched explicitly below.
+    let mut file = File::open(&path)
+        .map_err(|e| Error::ExternalData(format!("opening {}: {e}", path.display())))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| Error::ExternalData(format!("stat {}: {e}", path.display())))?
+        .len() as usize;
     let offset = number("offset")?.unwrap_or(0) as usize;
     let length = number("length")?
         .map(|n| n as usize)
-        .unwrap_or_else(|| bytes.len().saturating_sub(offset));
+        .unwrap_or_else(|| file_len.saturating_sub(offset));
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::ExternalData(format!("tensor '{name}': offset+length overflow"))
     })?;
-    if end > bytes.len() {
+    if end > file_len {
         return Err(Error::ExternalData(format!(
-            "tensor '{name}': requested bytes {offset}..{end} of a file of {}",
-            bytes.len()
+            "tensor '{name}': requested bytes {offset}..{end} of a file of {file_len}"
         )));
     }
-    Ok(bytes[offset..end].to_vec())
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|e| Error::ExternalData(format!("seeking {} to {offset}: {e}", path.display())))?;
+    let mut bytes = vec![0u8; length];
+    file.read_exact(&mut bytes).map_err(|e| {
+        Error::ExternalData(format!(
+            "reading {length} bytes of {} at {offset}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(bytes)
 }

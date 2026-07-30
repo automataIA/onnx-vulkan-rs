@@ -12,7 +12,7 @@
 //! fused blocks merge and boundaries drop toward ~1.
 
 use crate::KernelCache;
-use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, UINT8};
+use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
 use crate::shaders::conv::{
     BINDINGS as CONV_F32_BINDINGS, BLOCKED_TILE_SIZE as CONV_BLOCKED_TILE_SIZE,
     PUSH_BYTES as CONV_F32_PUSH_BYTES, SPLIT_REDUCE as CONV_SPLIT_REDUCE,
@@ -65,15 +65,20 @@ use crate::shaders::gather_block_quantized::{
     BINDINGS as GBQ_BINDINGS, GATHER_BLOCK_QUANTIZED as GBQ_GATHER, PUSH_BYTES as GBQ_PUSH_BYTES,
 };
 use crate::shaders::matmul_nbits::{
-    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
+    BINDINGS as MMNB_BINDINGS, DECODE_LANES as MMNB_DECODE_LANES,
+    DECODE_MIN_N as MMNB_DECODE_MIN_N, HEAD_LANES as MMNB_HEAD_LANES,
+    HEAD_MIN_N as MMNB_HEAD_MIN_N, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
+    decode_source as mmnb_decode_source, head_source as mmnb_head_source,
 };
 use crate::shaders::attention::{
     OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
     PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
     PACK_PUSH_BYTES as ATTN_PACK_PUSH_BYTES, PAST as ATTN_PAST,
     PAST_BINDINGS as ATTN_PAST_BINDINGS, PAST_PUSH_BYTES as ATTN_PAST_PUSH_BYTES,
-    SCORES as ATTN_SCORES, SCORES_BINDINGS as ATTN_SCORES_BINDINGS,
-    SCORES_PUSH_BYTES as ATTN_SCORES_PUSH_BYTES, WG as ATTN_WG,
+    ROTARY as ATTN_ROTARY, ROTARY_BINDINGS as ATTN_ROTARY_BINDINGS,
+    ROTARY_PUSH_BYTES as ATTN_ROTARY_PUSH_BYTES, SCORES as ATTN_SCORES,
+    SCORES_BINDINGS as ATTN_SCORES_BINDINGS, SCORES_PUSH_BYTES as ATTN_SCORES_PUSH_BYTES,
+    WG as ATTN_WG,
 };
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
@@ -94,7 +99,9 @@ use crate::shaders::quantize_linear::{
     BINDINGS as QDQ_BINDINGS, DEQUANTIZE, DEQUANTIZE_I32, PUSH_BYTES as QDQ_PUSH_BYTES, QUANTIZE,
 };
 use crate::shaders::reduction::{
-    BINDINGS as RED_BINDINGS, MAX_ACC as RED_MAX_ACC, MAX_FIN as RED_MAX_FIN,
+    ARGMAX_BINDINGS, ARGMAX_FINAL, ARGMAX_FINAL_PUSH_BYTES, ARGMAX_PARTIAL,
+    ARGMAX_PARTIAL_PUSH_BYTES, BINDINGS as RED_BINDINGS, MAX_ACC as RED_MAX_ACC,
+    splits as argmax_splits, MAX_FIN as RED_MAX_FIN,
     MAX_INIT as RED_MAX_INIT, MEAN_ACC as RED_MEAN_ACC, MEAN_FIN as RED_MEAN_FIN,
     MEAN_INIT as RED_MEAN_INIT, MIN_ACC as RED_MIN_ACC, MIN_FIN as RED_MIN_FIN,
     MIN_INIT as RED_MIN_INIT, PUSH_BYTES as RED_PUSH_BYTES, SUM_ACC as RED_SUM_ACC,
@@ -125,7 +132,9 @@ pub fn is_implemented(op: &str) -> bool {
             | "Softmax"
             | "LayerNormalization"
             | "SimplifiedLayerNormalization"
+            | "SkipSimplifiedLayerNormalization"
             | "GroupQueryAttention"
+            | "RotaryEmbedding"
             | "Cast"
             | "Mul"
             | "Add"
@@ -175,6 +184,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "ReduceSum"
             | "ReduceMax"
             | "ReduceMin"
+            | "ArgMax"
             | "Flatten"
             | "LeakyRelu"
             | "CumSum"
@@ -246,6 +256,41 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         "SimplifiedLayerNormalization" => {
             node.outputs.iter().filter(|o| !o.is_empty()).count() == 1
         }
+        // the skip form, same kernel plus the residual. `mean` and
+        // `inv_std_var` are refused for the reason above; the fourth output —
+        // the residual sum, which 71 of qwen2.5-VL's 72 nodes consume — is
+        // produced. `beta` and `bias` are not implemented: no export in the
+        // suite carries them, and adding a term nobody exercises is a term
+        // nobody checks.
+        "SkipSimplifiedLayerNormalization" => {
+            let out = |index: usize| node.outputs.get(index).is_some_and(|o| !o.is_empty());
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            present(0)
+                && present(1)
+                && present(2)
+                && !present(3)
+                && !present(4)
+                && out(0)
+                && !out(1)
+                && !out(2)
+        }
+        // half-split rotary only, like `GroupQueryAttention`'s fused one, and
+        // no `scale`: the schema's custom scale is not applied by the kernel,
+        // so claiming a node that asks for one would silently ignore it.
+        "RotaryEmbedding" => {
+            let float_attr = |name: &str, default: f32| {
+                node.attrs
+                    .get(name)
+                    .and_then(AttrValue::as_f32)
+                    .unwrap_or(default)
+            };
+            int_attr("interleaved", 0) == 0
+                && int_attr("is_packed_batching", 0) == 0
+                && float_attr("scale", 1.0) == 1.0
+                && node.inputs.len() == 4
+                && node.inputs.iter().all(|n| !n.is_empty())
+                && node.outputs.len() == 1
+        }
         // the kernel covers the shape gemma3 and qwen2.5-VL export and nothing
         // more: separate Q/K/V (not packed), half-split rotary, no attention
         // softcap, and the KV cache written out of place, which needs both
@@ -314,6 +359,10 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
             .get("axes")
             .and_then(AttrValue::as_ints)
             .is_some_and(|a| a.len() == 1),
+        // `select_last_index = 1` reverses the tie-break, and the kernel keeps
+        // the first occurrence; a graph that asks for the last one is refused
+        // rather than answered with the other index
+        "ArgMax" => int_attr("select_last_index", 0) == 0,
         "GridSample" => {
             string_attr("mode", "bilinear") == "bilinear"
                 && matches!(
@@ -437,9 +486,11 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Sigmoid" => unary(env, node, "sigmoid", "1.0 / (1.0 + exp(-v))"),
         "Relu" => unary(env, node, "relu", "max(v, 0.0)"),
         "Softmax" => softmax(env, node),
-        "LayerNormalization" => layernorm(env, node, false),
-        "SimplifiedLayerNormalization" => layernorm(env, node, true),
+        "LayerNormalization" => layernorm(env, node, Norm::Centered),
+        "SimplifiedLayerNormalization" => layernorm(env, node, Norm::Rms),
+        "SkipSimplifiedLayerNormalization" => layernorm(env, node, Norm::RmsSkip),
         "GroupQueryAttention" => group_query_attention(env, node),
+        "RotaryEmbedding" => rotary_embedding(env, node),
         "Cast" => cast(env, node),
         "Mul" => elementwise_binary(env, node, "a[off_a] * b[off_b]", BinOp::Mul),
         "Add" => elementwise_binary(env, node, "a[off_a] + b[off_b]", BinOp::Add),
@@ -489,6 +540,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "ReduceSum" => reduce(env, node, ReduceKind::Sum),
         "ReduceMax" => reduce(env, node, ReduceKind::Max),
         "ReduceMin" => reduce(env, node, ReduceKind::Min),
+        "ArgMax" => argmax(env, node),
         "Flatten" => flatten(env, node),
         "LeakyRelu" => leaky_relu(env, node),
         "CumSum" => cumsum(env, node),
@@ -3416,8 +3468,36 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
     let elem_count = rows * n;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
 
+    // The decode step is where this op lives: at `rows == 1` every MatMulNBits of
+    // a decoder is a matrix-vector product, 253 of them per token on
+    // qwen2.5-VL's. Which kernel is fastest there depends on `N` and not on `K`,
+    // measured over all 11 geometries of the two q4 decoders
+    // (`example matmulnbits`, RTX 4070):
+    //
+    // | N | kernel | measured |
+    // |---|---|---|
+    // | < 4096 | `MATMUL_NBITS` | the wide-column form is 0.91× here |
+    // | 4096 .. 65536 | `decode_source(16)` | 1.28× .. 1.37× |
+    // | ≥ 65536 (`lm_head`) | `head_source(8)` | 1.46× weighted, 1.60× on gemma3 |
+    //
+    // Below 4096 columns the node runs at the dispatch floor — 0.010 ms, 60 GB/s
+    // of a 0.6 MB weight — so there is nothing to win and a wider kernel loses.
+    // `rows > 1` (prefill) keeps the original kernel: it re-reads the weight per
+    // row, which is the honest cost of not having a tiled form yet, and no
+    // measurement of prefill exists to justify choosing differently.
+    let variant = match (rows, n) {
+        (1, n) if n >= MMNB_HEAD_MIN_N => Some((MMNB_HEAD_LANES, true)),
+        (1, n) if n >= MMNB_DECODE_MIN_N => Some((MMNB_DECODE_LANES, false)),
+        _ => None,
+    };
     if rows > 0 && n > 0 {
-        let gx = (n as u32).clamp(1, 32768);
+        // one workgroup per column in the shipped kernel, one per `256 / lanes`
+        // columns in the decode variants
+        let groups = match variant {
+            Some((lanes, _)) => (n as u32).div_ceil(256 / lanes),
+            None => n as u32,
+        };
+        let gx = groups.clamp(1, 32768);
         let mut push = Vec::with_capacity(MMNB_PUSH_BYTES as usize);
         for v in [
             k as u32,
@@ -3431,10 +3511,17 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
         ] {
             push.extend_from_slice(&v.to_le_bytes());
         }
+        // separate Pareto keys: the three forms cost differently and the split is
+        // the thing to watch when a decoder's profile is read
+        let (key, source) = match variant {
+            Some((lanes, true)) => ("MatMulNBits_head", mmnb_head_source(lanes)),
+            Some((lanes, false)) => ("MatMulNBits_gemv", mmnb_decode_source(lanes)),
+            None => ("MatMulNBits", MMNB_MATMUL.to_string()),
+        };
         with_pipeline(
             env.cache(),
-            "MatMulNBits",
-            || ctx.create_pipeline(&compile_wgsl(MMNB_MATMUL)?, MMNB_BINDINGS, MMNB_PUSH_BYTES),
+            key,
+            || ctx.create_pipeline(&compile_wgsl(&source)?, MMNB_BINDINGS, MMNB_PUSH_BYTES),
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
@@ -3446,7 +3533,7 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
                         &out,
                     ],
                     &push,
-                    [gx, (n as u32).div_ceil(gx), rows as u32],
+                    [gx, groups.div_ceil(gx), rows as u32],
                 )
             },
         )?;
@@ -3629,23 +3716,44 @@ fn softmax(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// Which of the three row normalizations `layernorm` is running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Norm {
+    /// `LayerNormalization`: mean subtracted, optional bias.
+    Centered,
+    /// `SimplifiedLayerNormalization`: RMS, scale only.
+    Rms,
+    /// `SkipSimplifiedLayerNormalization`: RMS over `x + skip`, and the sum
+    /// itself as the optional fourth output.
+    RmsSkip,
+}
+
 /// `LayerNormalization` f32 on the last dimension; scale (+optional bias)
 /// typically a per-channel initializer.
 ///
-/// `simplified` selects `SimplifiedLayerNormalization` (RMS normalization):
-/// same reduction, no mean subtracted, and no bias input in the schema.
-fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
+/// The simplified forms are the same reduction with no mean subtracted
+/// (`Norm::Rms`), optionally over `x` plus a residual (`Norm::RmsSkip`); the
+/// three share one pipeline and differ by push constants.
+fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
     let ctx = env.context();
-    let op = if simplified {
-        "SimplifiedLayerNormalization"
-    } else {
-        "LayerNormalization"
+    let simplified = form != Norm::Centered;
+    let op = match form {
+        Norm::Centered => "LayerNormalization",
+        Norm::Rms => "SimplifiedLayerNormalization",
+        Norm::RmsSkip => "SkipSimplifiedLayerNormalization",
     };
-    let has_bias = !simplified && node.inputs.len() > 2 && !node.inputs[2].is_empty();
+    // the skip form's second input is the residual, not a scale: its scale is
+    // input 2 and there is no bias in the shape this kernel claims
+    let scale_index = if form == Norm::RmsSkip { 2 } else { 1 };
+    let has_bias = form == Norm::Centered && node.inputs.len() > 2 && !node.inputs[2].is_empty();
+    let has_skip = form == Norm::RmsSkip;
     env.ensure_device(&node.inputs[0])?;
-    env.ensure_device(&node.inputs[1])?;
+    env.ensure_device(&node.inputs[scale_index])?;
     if has_bias {
         env.ensure_device(&node.inputs[2])?;
+    }
+    if has_skip {
+        env.ensure_device(&node.inputs[1])?;
     }
     let epsilon = node
         .attrs
@@ -3654,11 +3762,23 @@ fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
         .unwrap_or(1e-5);
 
     let x = env.device(&node.inputs[0])?;
-    let scale = env.device(&node.inputs[1])?;
+    let scale = env.device(&node.inputs[scale_index])?;
     let bias = if has_bias {
         env.device(&node.inputs[2])?
     } else {
         scale
+    };
+    let skip = if has_skip {
+        let skip = env.device(&node.inputs[1])?;
+        ensure!(
+            skip.elem_count == x.elem_count,
+            "{op}: skip elem {} != input {}",
+            skip.elem_count,
+            x.elem_count
+        );
+        skip
+    } else {
+        x
     };
     let (shape, elem_count) = (x.shape.clone(), x.elem_count);
     last_axis(node, shape.len() as i64, op)?;
@@ -3669,13 +3789,23 @@ fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
         scale.elem_count
     );
     let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
+    // the residual sum, only when the graph asks for it: `x + skip` is what the
+    // next layer adds onto, and recomputing it there would be a second pass
+    let has_sum = has_skip && node.outputs.get(3).is_some_and(|o| !o.is_empty());
+    let sum = if has_sum {
+        Some(ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?)
+    } else {
+        None
+    };
     if elem_count > 0 {
         let mut push = Vec::with_capacity(LAYERNORM_PUSH_BYTES as usize);
         push.extend_from_slice(&(c as u32).to_le_bytes());
         push.extend_from_slice(&epsilon.to_le_bytes());
         push.extend_from_slice(&(has_bias as u32).to_le_bytes());
         push.extend_from_slice(&(simplified as u32).to_le_bytes());
-        // separate Pareto keys for the same pipeline: the two forms cost
+        push.extend_from_slice(&(has_skip as u32).to_le_bytes());
+        push.extend_from_slice(&(has_sum as u32).to_le_bytes());
+        // separate Pareto keys for the same pipeline: the forms cost
         // differently and an LLM runs only one of them
         with_pipeline(
             env.cache(),
@@ -3690,9 +3820,186 @@ fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
-                    &[x.buffer(), scale.buffer(), bias.buffer(), &out],
+                    &[
+                        x.buffer(),
+                        scale.buffer(),
+                        bias.buffer(),
+                        &out,
+                        skip.buffer(),
+                        sum.as_ref().unwrap_or(&out),
+                    ],
                     &push,
                     [rows as u32, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: shape.clone(),
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    if let Some(sum) = sum {
+        env.set(
+            &node.outputs[3],
+            Tensor::Device(DevTensor {
+                dtype: FLOAT,
+                shape,
+                elem_count,
+                buf: BufRef::Owned(sum),
+            }),
+        );
+    }
+    Ok(())
+}
+
+/// Workgroups for a flat `count` of threads, folded into 2D because `count`
+/// over the scores tensor easily exceeds 65535 workgroups on one axis.
+/// Returns the grid and its `x` extent, which the shader needs to unfold it.
+fn attn_grid(count: usize) -> ([u32; 3], u32) {
+    let groups = count.div_ceil(ATTN_WG as usize) as u32;
+    let gx = groups.clamp(1, 32768);
+    ([gx, groups.div_ceil(gx), 1], gx)
+}
+
+/// `RotaryEmbedding` (com.microsoft), 72 nodes of qwen2.5-VL's decoder.
+///
+/// The rotation `GroupQueryAttention` fuses, as its own node: the positions
+/// come from `position_ids` rather than from the cache length, and the layout is
+/// untouched. Two shapes are admitted, `[b, n, s, H]` and `[b, s, n·H]`, because
+/// the schema admits both and only the rank tells them apart — which is also why
+/// `num_heads` is read as the attribute for the 3-D form and checked against the
+/// shape for the 4-D one.
+///
+/// `position_ids` is taken to the host and re-uploaded as i32: WGSL has no
+/// 64-bit scalar, and the tensor is already on the host in every graph that
+/// builds it with `Range` — the same route `Gather` takes for its indices.
+fn rotary_embedding(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let int_attr = |name: &str, default: i64| {
+        node.attrs
+            .get(name)
+            .and_then(AttrValue::as_i64)
+            .unwrap_or(default)
+    };
+    // i64 → i32, and the position indexes a cache row so a negative one is not
+    // a wrap-around but a broken graph
+    let positions: Vec<i32> = env
+        .host(&node.inputs[1])?
+        .to_i64()?
+        .into_iter()
+        .map(|p| {
+            ensure!(p >= 0, "RotaryEmbedding: negative position {p}");
+            Ok(p as i32)
+        })
+        .collect::<Result<_>>()?;
+
+    let ctx = env.context();
+    for index in [0, 2, 3] {
+        env.ensure_device(&node.inputs[index])?;
+    }
+    let x = env.device(&node.inputs[0])?;
+    let cos = env.device(&node.inputs[2])?;
+    let sin = env.device(&node.inputs[3])?;
+    ensure!(
+        cos.shape.len() == 2 && cos.shape == sin.shape,
+        "RotaryEmbedding: cos/sin caches must be [positions, rotary_dim/2], got {:?}/{:?}",
+        cos.shape,
+        sin.shape
+    );
+    let cache_half = cos.shape[1].max(0) as usize;
+
+    let bnsh = x.shape.len() == 4;
+    ensure!(
+        bnsh || x.shape.len() == 3,
+        "RotaryEmbedding: input must be [b, n, s, H] or [b, s, n·H], got {:?}",
+        x.shape
+    );
+    let attr_heads = int_attr("num_heads", 0).max(0) as usize;
+    let (b, n, s, head_size) = if bnsh {
+        let n = x.shape[1].max(0) as usize;
+        ensure!(
+            attr_heads == 0 || attr_heads == n,
+            "RotaryEmbedding: num_heads {attr_heads} != {n} heads in {:?}",
+            x.shape
+        );
+        (
+            x.shape[0].max(0) as usize,
+            n,
+            x.shape[2].max(0) as usize,
+            x.shape[3].max(0) as usize,
+        )
+    } else {
+        ensure!(
+            attr_heads > 0,
+            "RotaryEmbedding: a [b, s, n·H] input needs num_heads"
+        );
+        let hidden = x.shape[2].max(0) as usize;
+        ensure!(
+            hidden.is_multiple_of(attr_heads),
+            "RotaryEmbedding: hidden {hidden} is not a multiple of {attr_heads} heads"
+        );
+        (
+            x.shape[0].max(0) as usize,
+            attr_heads,
+            x.shape[1].max(0) as usize,
+            hidden / attr_heads,
+        )
+    };
+    // a zero `rotary_embedding_dim` means the whole head, per the schema
+    let rot_dim = match int_attr("rotary_embedding_dim", 0).max(0) as usize {
+        0 => head_size,
+        dim => dim,
+    };
+    ensure!(
+        rot_dim <= head_size && rot_dim % 2 == 0 && rot_dim / 2 <= cache_half,
+        "RotaryEmbedding: rotary dim {rot_dim} does not fit head {head_size} / cache {cache_half}"
+    );
+    ensure!(
+        positions.len() == b * s,
+        "RotaryEmbedding: {} position ids for {b}×{s} tokens",
+        positions.len()
+    );
+
+    let (shape, elem_count) = (x.shape.clone(), x.elem_count);
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        let pos_bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let pos_buf = ctx.create_storage_buffer(pos_bytes.len().max(4) as u64)?;
+        ctx.stream_upload(&pos_buf, &pos_bytes)?;
+        let (grid, gx) = attn_grid(elem_count);
+        let mut push = Vec::with_capacity(ATTN_ROTARY_PUSH_BYTES as usize);
+        for v in [
+            elem_count as u32,
+            head_size as u32,
+            s as u32,
+            n as u32,
+            (rot_dim / 2) as u32,
+            cache_half as u32,
+            u32::from(bnsh),
+            gx,
+        ] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "RotaryEmbedding",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ATTN_ROTARY)?,
+                    ATTN_ROTARY_BINDINGS,
+                    ATTN_ROTARY_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[x.buffer(), &pos_buf, cos.buffer(), sin.buffer(), &out],
+                    &push,
+                    grid,
                 )
             },
         )?;
@@ -3707,15 +4014,6 @@ fn layernorm(env: &mut Env, node: &NodeIr, simplified: bool) -> Result<()> {
         }),
     );
     Ok(())
-}
-
-/// Workgroups for a flat `count` of threads, folded into 2D because `count`
-/// over the scores tensor easily exceeds 65535 workgroups on one axis.
-/// Returns the grid and its `x` extent, which the shader needs to unfold it.
-fn attn_grid(count: usize) -> ([u32; 3], u32) {
-    let groups = count.div_ceil(ATTN_WG as usize) as u32;
-    let gx = groups.clamp(1, 32768);
-    ([gx, groups.div_ceil(gx), 1], gx)
 }
 
 /// `GroupQueryAttention` (com.microsoft), 26 nodes of gemma3-1b.
@@ -4493,6 +4791,156 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+/// `ArgMax` on one axis, on the device, as an int64 output.
+///
+/// Returned as a tensor and not as a number because it is the ONNX op: a graph
+/// that ends in `ArgMax` gets the same kernel a generation loop asks for through
+/// [`argmax_of`].
+fn argmax(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let x_name = node.inputs[0].clone();
+    let x_shape = env.shape_of(&x_name)?;
+    let rank = x_shape.len() as i64;
+    let raw = node
+        .attrs
+        .get("axis")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0);
+    let axis = if raw < 0 { raw + rank } else { raw };
+    ensure!(
+        (0..rank).contains(&axis),
+        "ArgMax: axis {axis} out of rank {rank}"
+    );
+    let keepdims = node
+        .attrs
+        .get("keepdims")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(1)
+        != 0;
+    let out = argmax_axis(env, &x_name, axis as usize, keepdims)?;
+    env.set(&node.outputs[0], out);
+    Ok(())
+}
+
+/// The index of the largest element along the **last** axis of a value the
+/// current run produced, computed where the value already is.
+///
+/// This is what a decode step needs and the graph does not have: an exported
+/// decoder emits logits, so sampling them means either downloading a row of
+/// 151936 floats to keep one index, or enqueueing this into the same command
+/// buffer the step is still building. Only the indices cross the bus.
+pub fn argmax_of(env: &mut Env<'_, '_>, name: &str) -> crate::Result<Vec<i64>> {
+    argmax_last_axis(env, name).map_err(|e| crate::Error::Backend(format!("{e:#}")))
+}
+
+fn argmax_last_axis(env: &mut Env<'_, '_>, name: &str) -> Result<Vec<i64>> {
+    let shape = env.shape_of(name)?;
+    ensure!(!shape.is_empty(), "{name} is a scalar: it has no axis");
+    let out = argmax_axis(env, name, shape.len() - 1, false)?;
+    let key = format!("{name}#argmax");
+    env.set(&key, out);
+    Ok(env.host(&key)?.to_i64()?)
+}
+
+/// Shared body: two dispatches, one scratch pair, an int64 result.
+///
+/// The input must be f32 on the device. A non-f32 axis (an int64 mask, say) goes
+/// host-side, like the value reductions: the support check looks at the node and
+/// cannot see the dtype, so every dtype needs a path that works.
+fn argmax_axis(env: &mut Env, x_name: &str, axis: usize, keepdims: bool) -> Result<Tensor<'static>> {
+    let x_shape = env.shape_of(x_name)?;
+    let c = x_shape[axis].max(0) as usize;
+    let inner: usize = x_shape[axis + 1..].iter().product::<i64>().max(1) as usize;
+    let mut out_shape = x_shape.clone();
+    if keepdims {
+        out_shape[axis] = 1;
+    } else {
+        out_shape.remove(axis);
+    }
+    let rows: usize = out_shape.iter().map(|d| (*d).max(0) as usize).product();
+
+    if env.dtype_of(x_name)? != FLOAT {
+        let x = env.host(x_name)?.to_f32()?;
+        let mut idx = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let j = r % inner;
+            let base = (r / inner) * c * inner + j;
+            let mut best = f32::NEG_INFINITY;
+            let mut at = 0i64;
+            for k in 0..c {
+                if x[base + k * inner] > best {
+                    best = x[base + k * inner];
+                    at = k as i64;
+                }
+            }
+            idx.push(at);
+        }
+        return Ok(Tensor::Host(HostTensor::from_i64(out_shape, &idx)));
+    }
+
+    let ctx = env.context();
+    env.ensure_device(x_name)?;
+    let x = env.device(x_name)?;
+    let out = ctx.create_storage_buffer(device_storage_bytes(INT64, rows)?)?;
+    if rows > 0 && c > 0 {
+        let splits = argmax_splits(rows, c);
+        let scratch = |elems: usize| ctx.create_storage_buffer(device_storage_bytes(FLOAT, elems)?);
+        let best = scratch(rows * splits)?;
+        let best_idx = scratch(rows * splits)?;
+
+        let grid = |wgs: usize| {
+            // 2D: `rows · splits` passes the 65535 workgroups-per-axis limit as
+            // soon as the batch is not tiny
+            let gx = (wgs as u32).clamp(1, 32768);
+            ([gx, (wgs as u32).div_ceil(gx), 1], gx)
+        };
+        let ([gx, gy, _], stride) = grid(rows * splits);
+        let mut push = Vec::with_capacity(ARGMAX_PARTIAL_PUSH_BYTES as usize);
+        for v in [c as u32, inner as u32, rows as u32, splits as u32, stride] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "ArgMax_partial",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ARGMAX_PARTIAL)?,
+                    ARGMAX_BINDINGS,
+                    ARGMAX_PARTIAL_PUSH_BYTES,
+                )
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[x.buffer(), &best, &best_idx], &push, [gx, gy, 1]),
+        )?;
+
+        let ([fx, fy, _], fstride) = grid(rows);
+        let mut push = Vec::with_capacity(ARGMAX_FINAL_PUSH_BYTES as usize);
+        for v in [rows as u32, splits as u32, fstride] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "ArgMax_final",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(ARGMAX_FINAL)?,
+                    ARGMAX_BINDINGS,
+                    ARGMAX_FINAL_PUSH_BYTES,
+                )
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[&best, &best_idx, &out], &push, [fx, fy, 1]),
+        )?;
+        // back to the pool, not dropped: `destroy_buffer` is what frees an
+        // allocation, and a decode loop calls this once per token
+        ctx.recycle_storage_buffer(best);
+        ctx.recycle_storage_buffer(best_idx);
+    }
+    Ok(Tensor::Device(DevTensor {
+        dtype: INT64,
+        shape: out_shape,
+        elem_count: rows,
+        buf: BufRef::Owned(out),
+    }))
 }
 
 /// `Gemm` (opset ≥7): `Y = alpha · A' · B' + beta · C`, always 2D, with `C`

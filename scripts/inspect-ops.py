@@ -137,6 +137,37 @@ def _simplified_layernorm_ok(node, _consts) -> bool:
     return len([o for o in node.output if o]) == 1
 
 
+def _skip_simplified_layernorm_ok(node, _consts) -> bool:
+    present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
+    out = lambda i: len(node.output) > i and node.output[i] != ""  # noqa: E731
+    # `beta`/`bias` unimplemented; `mean`/`inv_std_var` not produced, the
+    # residual sum (output 3) is
+    return (
+        all(present(i) for i in (0, 1, 2))
+        and not present(3)
+        and not present(4)
+        and out(0)
+        and not out(1)
+        and not out(2)
+    )
+
+
+def _rotary_ok(node, _consts) -> bool:
+    return (
+        _attr(node, "interleaved", 0) == 0
+        and _attr(node, "is_packed_batching", 0) == 0
+        and _attr(node, "scale", 1.0) == 1.0
+        and len(node.input) == 4
+        and all(i != "" for i in node.input)
+        and len(node.output) == 1
+    )
+
+
+def _argmax_ok(node, _consts) -> bool:
+    # the kernel keeps the first occurrence, so the reversed tie-break is refused
+    return _attr(node, "select_last_index", 0) == 0
+
+
 def _gqa_ok(node, _consts) -> bool:
     present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
     rotary = _attr(node, "do_rotary", 0) != 0
@@ -193,10 +224,13 @@ NODE_RULES = {
     "ReduceSum": _one_axis,
     "ReduceMax": _one_axis,
     "ReduceMin": _one_axis,
+    "ArgMax": _argmax_ok,
     "GridSample": _grid_sample_ok,
     "ScatterND": _scatter_nd_ok,
     "Gelu": _gelu_ok,
     "SimplifiedLayerNormalization": _simplified_layernorm_ok,
+    "SkipSimplifiedLayerNormalization": _skip_simplified_layernorm_ok,
+    "RotaryEmbedding": _rotary_ok,
     "GroupQueryAttention": _gqa_ok,
     "MatMulNBits": _matmul_nbits_ok,
     "GatherBlockQuantized": _gather_block_quantized_ok,

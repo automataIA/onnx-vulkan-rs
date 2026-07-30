@@ -475,6 +475,18 @@ impl Run<'_> {
         Ok(self.outputs.host(name)?)
     }
 
+    /// Index of the largest element along the last axis of an output, computed
+    /// on the GPU.
+    ///
+    /// A decoder emits logits and no `argmax`, so greedy sampling would
+    /// otherwise mean downloading a row per token — 151936 floats on gemma3-1b
+    /// — to keep one index. This enqueues the reduction into the command buffer
+    /// the run is still building, so what crosses the bus is one index per row
+    /// and the step keeps a single flush.
+    pub fn argmax(&mut self, name: &str) -> Result<Vec<i64>> {
+        Ok(self.outputs.argmax(name)?)
+    }
+
     /// Releases the run's device buffers.
     ///
     /// Consuming rather than `Drop` because freeing device memory can fail, and

@@ -1,10 +1,11 @@
 //! Shared shaders and dispatch layouts for row normalizations
-//! (`Softmax`, `LayerNormalization`, `SimplifiedLayerNormalization`).
+//! (`Softmax`, `LayerNormalization`, `SimplifiedLayerNormalization`,
+//! `SkipSimplifiedLayerNormalization`).
 
 pub const SOFTMAX_BINDINGS: u32 = 2;
 pub const SOFTMAX_PUSH_BYTES: u32 = 16;
-pub const LAYERNORM_BINDINGS: u32 = 4;
-pub const LAYERNORM_PUSH_BYTES: u32 = 16;
+pub const LAYERNORM_BINDINGS: u32 = 6;
+pub const LAYERNORM_PUSH_BYTES: u32 = 24;
 
 /// Numerically stable f32 Softmax on **any axis**: one workgroup per
 /// row, max → sum of exps → normalization, with shared memory reductions.
@@ -90,14 +91,31 @@ fn main(
 /// reduction is skipped entirely. The two share a kernel because they differ by
 /// that one term; the branch is on a push constant, hence uniform across the
 /// workgroup and free of divergence.
+///
+/// `has_skip` adds the residual **before** normalizing
+/// (`SkipSimplifiedLayerNormalization`, 72 nodes of qwen2.5-VL's decoder), and
+/// `has_sum` writes that sum out as the op's fourth output — which 71 of those
+/// 72 nodes consume as the next layer's residual, so recomputing it as a
+/// separate `Add` would be a second pass over the same memory. Same reason the
+/// branch is on a push constant: `x + skip` is read twice by the reduction and
+/// once more by the write-out, and splitting the op would materialize it twice.
 pub const LAYERNORM: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> skip: array<f32>;
+@group(0) @binding(5) var<storage, read_write> sum_out: array<f32>;
 
-struct Push { c: u32, eps: f32, has_bias: u32, simplified: u32 }
+struct Push { c: u32, eps: f32, has_bias: u32, simplified: u32, has_skip: u32, has_sum: u32 }
 var<immediate> pc: Push;
+
+/// The value the normalization actually sees: `x`, plus the residual when the
+/// skip form is dispatched.
+fn value(i: u32) -> f32 {
+    if (pc.has_skip != 0u) { return x[i] + skip[i]; }
+    return x[i];
+}
 
 var<workgroup> ssum: array<f32, 256>;
 var<workgroup> ssq: array<f32, 256>;
@@ -114,7 +132,7 @@ fn main(
     var sq = 0.0;
     var i = lid.x;
     while (i < pc.c) {
-        let v = x[base + i];
+        let v = value(base + i);
         sum = sum + v;
         sq = sq + v * v;
         i = i + 256u;
@@ -141,7 +159,11 @@ fn main(
     let inv_std = inverseSqrt(variance + pc.eps);
     i = lid.x;
     while (i < pc.c) {
-        var v = (x[base + i] - mean) * inv_std * scale[i];
+        let raw = value(base + i);
+        if (pc.has_sum != 0u) {
+            sum_out[base + i] = raw;
+        }
+        var v = (raw - mean) * inv_std * scale[i];
         if (pc.has_bias != 0u) {
             v = v + bias[i];
         }

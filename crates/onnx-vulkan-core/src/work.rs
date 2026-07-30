@@ -127,7 +127,12 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         | "BatchNormalization"
         | "SkipLayerNormalization"
         | "SimplifiedLayerNormalization" => 5 * out_elems()?,
-        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceL2"
+        // the skip form adds one flop per element to the same five
+        "SkipSimplifiedLayerNormalization" => 6 * out_elems()?,
+        // two multiplies and one add per rotated channel, and the channels past
+        // `rotary_embedding_dim` are a copy
+        "RotaryEmbedding" => 3 * out_elems()?,
+        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceL2" | "ArgMax"
         | "GlobalAveragePool" | "MaxPool" | "AveragePool" => in_elems()?,
         "Add"
         | "Sub"

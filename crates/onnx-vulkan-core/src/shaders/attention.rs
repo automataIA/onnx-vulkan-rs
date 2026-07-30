@@ -34,6 +34,8 @@
 //! of an online rescan. A flash-attention formulation removes it and is the
 //! obvious next kernel — after the arithmetic is proven.
 
+pub const ROTARY_BINDINGS: u32 = 5;
+pub const ROTARY_PUSH_BYTES: u32 = 32;
 pub const PACK_BINDINGS: u32 = 4;
 pub const PACK_PUSH_BYTES: u32 = 40;
 pub const PAST_BINDINGS: u32 = 2;
@@ -50,6 +52,71 @@ pub const WG: u32 = 256;
 /// to a zero probability; a row is never entirely masked because the query
 /// always attends to itself.
 pub const NEG_INF: &str = "-3.4028235e38";
+
+/// Standalone `RotaryEmbedding` (com.microsoft): rotate in place, positions
+/// read from `position_ids` instead of derived from the cache length.
+///
+/// This is the same rotation `PACK` fuses, and it is a separate kernel because
+/// the two differ in everything around the arithmetic: the layout is unchanged
+/// (input shape is output shape, no `[b, s, n·H]` → `[b, n, t, H]` transpose),
+/// and the position of a token is a *value* — qwen2.5-VL's decoder builds it
+/// with a `Range`, and mRoPE means it is not `past + seq`. `pos` arrives as
+/// i32 because WGSL has no 64-bit scalar; the conversion happens on the host,
+/// where the tensor already lives (`Range` is a host op).
+///
+/// `bnsh` selects the input layout: `[b, n, s, H]` when set, `[b, s, n·H]`
+/// otherwise — the schema admits both and the shape is what discriminates.
+/// Channels at or past `rotary_embedding_dim` are copied, which is how a
+/// partial rotation leaves the rest of the head alone.
+pub const ROTARY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> pos: array<i32>;
+@group(0) @binding(2) var<storage, read> cos_cache: array<f32>;
+@group(0) @binding(3) var<storage, read> sin_cache: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+
+struct Push {
+    count: u32, h: u32, s: u32, n: u32,
+    rot_half: u32, cache_half: u32, bnsh: u32, gx: u32,
+}
+var<immediate> pc: Push;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let i = (wid.y * pc.gx + wid.x) * 256u + lid.x;
+    if (i >= pc.count) { return; }
+    let d = i % pc.h;
+    var rest = i / pc.h;
+    var seq = 0u;
+    var batch = 0u;
+    if (pc.bnsh != 0u) {
+        seq = rest % pc.s;
+        batch = (rest / pc.s) / pc.n;
+    } else {
+        rest = rest / pc.n;
+        seq = rest % pc.s;
+        batch = rest / pc.s;
+    }
+
+    // past `rotary_embedding_dim` the channel is untouched
+    if (d >= 2u * pc.rot_half) {
+        out[i] = x[i];
+        return;
+    }
+    let p = u32(max(pos[batch * pc.s + seq], 0));
+    let j = select(d - pc.rot_half, d, d < pc.rot_half);
+    let c = cos_cache[p * pc.cache_half + j];
+    let sn = sin_cache[p * pc.cache_half + j];
+    if (d < pc.rot_half) {
+        out[i] = x[i] * c - x[i + pc.rot_half] * sn;
+    } else {
+        out[i] = x[i] * c + x[i - pc.rot_half] * sn;
+    }
+}
+"#;
 
 /// `[b, s, n·H]` → `[b, n, dst_len, H]` at time offset `dst_off`, applying
 /// rotary embedding when `rotary != 0`.
@@ -238,7 +305,13 @@ fn main(
 mod tests {
     #[test]
     fn sources_compile() {
-        for source in [super::PACK, super::PAST, super::SCORES, super::OUT] {
+        for source in [
+            super::ROTARY,
+            super::PACK,
+            super::PAST,
+            super::SCORES,
+            super::OUT,
+        ] {
             vk_compute::compile_wgsl(source).expect("valid attention shader");
         }
     }

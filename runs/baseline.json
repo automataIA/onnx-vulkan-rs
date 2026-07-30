@@ -1,531 +1,627 @@
 {
-  "tag": "convsplit-1",
+  "tag": "nbits-fork",
   "env": {
     "host": "DESKTOP-K4CMG90",
-    "commit": "06e02de",
+    "commit": "156fb22",
     "dirty": true,
     "ort": "win-x64",
     "gpu": "NVIDIA GeForce RTX 4070",
     "driver": "610.74",
     "sample_ms": 100,
-    "when": "2026-07-27T11:08:39Z"
+    "when": "2026-07-30T11:19:45Z",
+    "peak_tflops_fp32": 29.15,
+    "peak_gb_s": 504.2
   },
   "results": [
     {
-      "model": "mobilenetv2",
+      "model": "gemma3-1b",
       "mode": "compile",
       "runner": "model-runner",
-      "iters": 50,
+      "iters": 20,
       "ok": true,
       "exit_code": 0,
-      "model_size_mb": 14.0,
+      "model_size_mb": 1000.0,
       "perf_tol": 10.0,
       "golden": false,
       "device": "NVIDIA GeForce RTX 4070",
       "perf_valid": true,
       "wall_ms": {
-        "median": 1.6,
-        "min": 1.5,
-        "max": 1.9,
+        "median": 15.1,
+        "min": 13.2,
+        "max": 16.0,
         "iters_used": null
       },
-      "cpu_ep_ms": 1.9,
+      "cpu_ep_ms": 25.2,
       "accuracy": {
         "kind": "outputs",
-        "worst_relative": 9.21e-07,
+        "worst_relative": 2.19e-05,
         "outputs": [
           {
-            "name": "output",
-            "n": 1000,
+            "name": "logits",
+            "n": 262144,
+            "max_abs_delta": 0.0005696,
+            "ref_scale": 31.82,
+            "relative": 1.79e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.0.key",
+            "n": 32768,
+            "max_abs_delta": 1.073e-06,
+            "ref_scale": 5.704,
+            "relative": 1.88e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.0.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001068,
+            "ref_scale": 103.6,
+            "relative": 1.03e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.1.key",
+            "n": 32768,
+            "max_abs_delta": 4.113e-06,
+            "ref_scale": 8.524,
+            "relative": 4.83e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.1.value",
+            "n": 32768,
+            "max_abs_delta": 8.583e-06,
+            "ref_scale": 18.12,
+            "relative": 4.74e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.2.key",
+            "n": 32768,
+            "max_abs_delta": 1.335e-05,
+            "ref_scale": 29.77,
+            "relative": 4.48e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.2.value",
+            "n": 32768,
+            "max_abs_delta": 1.144e-05,
+            "ref_scale": 19.31,
+            "relative": 5.93e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.3.key",
+            "n": 32768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 7.383,
+            "relative": 5.17e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.3.value",
+            "n": 32768,
+            "max_abs_delta": 1.311e-05,
+            "ref_scale": 15.37,
+            "relative": 8.53e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.4.key",
+            "n": 32768,
+            "max_abs_delta": 7.153e-06,
+            "ref_scale": 8.413,
+            "relative": 8.5e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.4.value",
+            "n": 32768,
+            "max_abs_delta": 6.199e-06,
+            "ref_scale": 5.754,
+            "relative": 1.08e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.5.key",
+            "n": 32768,
+            "max_abs_delta": 1.287e-05,
+            "ref_scale": 11.3,
+            "relative": 1.14e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.5.value",
+            "n": 32768,
+            "max_abs_delta": 3.338e-06,
+            "ref_scale": 2.41,
+            "relative": 1.39e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.6.key",
+            "n": 32768,
+            "max_abs_delta": 9.418e-06,
+            "ref_scale": 13.16,
+            "relative": 7.16e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.6.value",
+            "n": 32768,
+            "max_abs_delta": 1.574e-05,
+            "ref_scale": 10.26,
+            "relative": 1.53e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.7.key",
+            "n": 32768,
+            "max_abs_delta": 1.419e-05,
+            "ref_scale": 8.594,
+            "relative": 1.65e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.7.value",
+            "n": 32768,
+            "max_abs_delta": 1.419e-05,
+            "ref_scale": 5.912,
+            "relative": 2.4e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.8.key",
+            "n": 32768,
             "max_abs_delta": 1.24e-05,
-            "ref_scale": 13.47,
-            "relative": 9.21e-07,
+            "ref_scale": 7.755,
+            "relative": 1.6e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.8.value",
+            "n": 32768,
+            "max_abs_delta": 1.335e-05,
+            "ref_scale": 5.436,
+            "relative": 2.46e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.9.key",
+            "n": 32768,
+            "max_abs_delta": 2.527e-05,
+            "ref_scale": 7.43,
+            "relative": 3.4e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.9.value",
+            "n": 32768,
+            "max_abs_delta": 2.074e-05,
+            "ref_scale": 5.292,
+            "relative": 3.92e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.10.key",
+            "n": 32768,
+            "max_abs_delta": 4.196e-05,
+            "ref_scale": 48.21,
+            "relative": 8.7e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.10.value",
+            "n": 32768,
+            "max_abs_delta": 1.681e-05,
+            "ref_scale": 4.69,
+            "relative": 3.58e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.11.key",
+            "n": 32768,
+            "max_abs_delta": 4.458e-05,
+            "ref_scale": 13.01,
+            "relative": 3.43e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.11.value",
+            "n": 32768,
+            "max_abs_delta": 1.597e-05,
+            "ref_scale": 1.957,
+            "relative": 8.16e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.12.key",
+            "n": 32768,
+            "max_abs_delta": 3.767e-05,
+            "ref_scale": 27.83,
+            "relative": 1.35e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.12.value",
+            "n": 32768,
+            "max_abs_delta": 3.362e-05,
+            "ref_scale": 8.298,
+            "relative": 4.05e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.13.key",
+            "n": 32768,
+            "max_abs_delta": 3.958e-05,
+            "ref_scale": 11.15,
+            "relative": 3.55e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.13.value",
+            "n": 32768,
+            "max_abs_delta": 3.123e-05,
+            "ref_scale": 3.835,
+            "relative": 8.14e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.14.key",
+            "n": 32768,
+            "max_abs_delta": 3.445e-05,
+            "ref_scale": 6.995,
+            "relative": 4.93e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.14.value",
+            "n": 32768,
+            "max_abs_delta": 3.684e-05,
+            "ref_scale": 5.101,
+            "relative": 7.22e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.15.key",
+            "n": 32768,
+            "max_abs_delta": 8.965e-05,
+            "ref_scale": 15.85,
+            "relative": 5.65e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.15.value",
+            "n": 32768,
+            "max_abs_delta": 4.721e-05,
+            "ref_scale": 5.543,
+            "relative": 8.52e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.16.key",
+            "n": 32768,
+            "max_abs_delta": 5.46e-05,
+            "ref_scale": 38.87,
+            "relative": 1.4e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.16.value",
+            "n": 32768,
+            "max_abs_delta": 6.208e-05,
+            "ref_scale": 10.26,
+            "relative": 6.05e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.17.key",
+            "n": 32768,
+            "max_abs_delta": 7.629e-05,
+            "ref_scale": 15.22,
+            "relative": 5.01e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.17.value",
+            "n": 32768,
+            "max_abs_delta": 1.374e-05,
+            "ref_scale": 2.502,
+            "relative": 5.49e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.18.key",
+            "n": 32768,
+            "max_abs_delta": 4.101e-05,
+            "ref_scale": 11.04,
+            "relative": 3.71e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.18.value",
+            "n": 32768,
+            "max_abs_delta": 4.452e-05,
+            "ref_scale": 5.406,
+            "relative": 8.24e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.19.key",
+            "n": 32768,
+            "max_abs_delta": 6.282e-05,
+            "ref_scale": 14.19,
+            "relative": 4.43e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.19.value",
+            "n": 32768,
+            "max_abs_delta": 8.225e-05,
+            "ref_scale": 8.93,
+            "relative": 9.21e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.20.key",
+            "n": 32768,
+            "max_abs_delta": 8.368e-05,
+            "ref_scale": 6.178,
+            "relative": 1.35e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.20.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001242,
+            "ref_scale": 13.81,
+            "relative": 9e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.21.key",
+            "n": 32768,
+            "max_abs_delta": 6.819e-05,
+            "ref_scale": 10.28,
+            "relative": 6.64e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.21.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001254,
+            "ref_scale": 17.48,
+            "relative": 7.18e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.22.key",
+            "n": 32768,
+            "max_abs_delta": 0.0001154,
+            "ref_scale": 11.59,
+            "relative": 9.96e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.22.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001564,
+            "ref_scale": 18.06,
+            "relative": 8.66e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.23.key",
+            "n": 32768,
+            "max_abs_delta": 0.0001316,
+            "ref_scale": 12.39,
+            "relative": 1.06e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.23.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001034,
+            "ref_scale": 6.208,
+            "relative": 1.66e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.24.key",
+            "n": 32768,
+            "max_abs_delta": 9.346e-05,
+            "ref_scale": 10.26,
+            "relative": 9.11e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.24.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001788,
+            "ref_scale": 11.86,
+            "relative": 1.51e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.25.key",
+            "n": 32768,
+            "max_abs_delta": 9.094e-05,
+            "ref_scale": 7.885,
+            "relative": 1.15e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.25.value",
+            "n": 32768,
+            "max_abs_delta": 0.0001062,
+            "ref_scale": 4.845,
+            "relative": 2.19e-05,
             "mismatches": 0
           }
         ],
         "tolerated": true
       },
-      "reference": {
-        "backends": {
-          "cpu": {
-            "outputs": [
-              {
-                "output": "output",
-                "worst_abs": 0.0,
-                "mismatches": 0,
-                "argmax_expected": 632,
-                "argmax_got": 632
-              }
-            ],
-            "ok": true
-          },
-          "vulkan": {
-            "outputs": [
-              {
-                "output": "output",
-                "worst_abs": 1.24e-05,
-                "mismatches": 0,
-                "argmax_expected": 632,
-                "argmax_got": 632
-              }
-            ],
-            "ok": true
-          }
-        },
-        "ok": true,
-        "cpu_agrees": true
-      },
-      "gpu": {
-        "pareto": [
-          {
-            "op": "Conv",
-            "ms": 0.316,
-            "pct": 29.6,
-            "dispatches": 17
-          },
-          {
-            "op": "Conv_split",
-            "ms": 0.194,
-            "pct": 18.1,
-            "dispatches": 11
-          },
-          {
-            "op": "Gemm",
-            "ms": 0.136,
-            "pct": 12.8,
-            "dispatches": 1
-          },
-          {
-            "op": "Conv16",
-            "ms": 0.135,
-            "pct": 12.7,
-            "dispatches": 7
-          },
-          {
-            "op": "Conv_grouped",
-            "ms": 0.127,
-            "pct": 11.9,
-            "dispatches": 17
-          },
-          {
-            "op": "Clip",
-            "ms": 0.092,
-            "pct": 8.6,
-            "dispatches": 35
-          },
-          {
-            "op": "Conv_split_reduce",
-            "ms": 0.035,
-            "pct": 3.3,
-            "dispatches": 11
-          },
-          {
-            "op": "AveragePool",
-            "ms": 0.008,
-            "pct": 0.8,
-            "dispatches": 1
-          }
-        ],
-        "compute_ms": 1.066,
-        "sync_ms": 0.184,
-        "flushes": 2,
-        "upload_mb": 0.6,
-        "download_mb": 0.0
-      },
-      "blocks": {
-        "nodes_claimed": 104,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 2,
-        "sm_pct": {
-          "mean": 1.0,
-          "max": 1.0,
-          "p95": 1.0
-        },
-        "fb_peak_mb": 2646.0,
-        "vram_delta_mb": 2.0,
-        "vram_idle_mb": 2644,
-        "vram_source": "global-delta",
-        "rss_mb": 182.0,
-        "cpu_pct": {
-          "mean": 78.0,
-          "max": 156.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "mobilenetv2",
-      "mode": "cpu",
-      "status": "skip",
-      "ok": true,
-      "reason": "model-runner already measures the CPU EP anyway"
-    },
-    {
-      "model": "parakeet",
-      "mode": "compile",
-      "runner": "stt-app",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 700.0,
-      "perf_tol": 10.0,
-      "golden": false,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 44.3,
-        "min": 41.9,
-        "max": 46.7,
-        "iters_used": 19
-      },
-      "cpu_ep_ms": null,
-      "accuracy": {
-        "kind": "transcript",
-        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
-        "expect": "Well, I don't wish to see it any more",
-        "tolerated": true
-      },
+      "parity": null,
       "reference": null,
       "gpu": {
         "pareto": [
           {
-            "op": "MMI_matmul_coop_k32",
-            "ms": 18.274,
-            "pct": 57.4,
-            "dispatches": 267
+            "op": "MatMulNBits",
+            "ms": 1.673,
+            "pct": 26.7,
+            "dispatches": 130,
+            "gflop": 0.5674,
+            "gb": 0.1833,
+            "gflops": 339.15,
+            "gb_s": 109.56,
+            "intensity": 3.0955,
+            "pct_peak_compute": 1.16,
+            "pct_peak_bw": 21.73,
+            "efficiency": 0.2173,
+            "class": "memory"
           },
           {
-            "op": "MatMul",
-            "ms": 1.395,
-            "pct": 4.4,
-            "dispatches": 72
+            "op": "MatMulNBits_gemv",
+            "ms": 1.342,
+            "pct": 21.4,
+            "dispatches": 52,
+            "gflop": 0.8281,
+            "gb": 0.2669,
+            "gflops": 617.06,
+            "gb_s": 198.88,
+            "intensity": 3.1027,
+            "pct_peak_compute": 2.12,
+            "pct_peak_bw": 39.44,
+            "efficiency": 0.3944,
+            "class": "memory"
           },
           {
-            "op": "DQL_partial",
-            "ms": 1.279,
-            "pct": 4.0,
-            "dispatches": 223
+            "op": "SimplifiedLayerNormalization",
+            "ms": 0.81,
+            "pct": 12.9,
+            "dispatches": 157,
+            "gflop": 0.0008,
+            "gb": 0.0018,
+            "gflops": 0.99,
+            "gb_s": 2.22,
+            "intensity": 0.4444,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.44,
+            "efficiency": 0.0044,
+            "class": "latency"
           },
           {
-            "op": "Transpose",
-            "ms": 1.246,
-            "pct": 3.9,
-            "dispatches": 195
+            "op": "GQA_scores",
+            "ms": 0.722,
+            "pct": 11.5,
+            "dispatches": 26
           },
           {
-            "op": "Cast_dev",
-            "ms": 0.821,
-            "pct": 2.6,
-            "dispatches": 294
+            "op": "MatMulNBits_head",
+            "ms": 0.66,
+            "pct": 10.5,
+            "dispatches": 1,
+            "gflop": 0.604,
+            "gb": 0.1945,
+            "gflops": 915.15,
+            "gb_s": 294.7,
+            "intensity": 3.1054,
+            "pct_peak_compute": 3.14,
+            "pct_peak_bw": 58.45,
+            "efficiency": 0.5845,
+            "class": "memory"
           },
           {
-            "op": "Slice",
-            "ms": 0.779,
-            "pct": 2.4,
-            "dispatches": 97
-          },
-          {
-            "op": "DQL_finalize",
-            "ms": 0.636,
-            "pct": 2.0,
-            "dispatches": 223
-          },
-          {
-            "op": "ConvInteger",
-            "ms": 0.628,
-            "pct": 2.0,
-            "dispatches": 27
-          },
-          {
-            "op": "LayerNormalization",
-            "ms": 0.561,
-            "pct": 1.8,
-            "dispatches": 120
-          },
-          {
-            "op": "DQL_quantize",
-            "ms": 0.537,
-            "pct": 1.7,
-            "dispatches": 223
-          },
-          {
-            "op": "Where",
-            "ms": 0.514,
-            "pct": 1.6,
-            "dispatches": 72
-          },
-          {
-            "op": "Pad",
-            "ms": 0.396,
-            "pct": 1.2,
-            "dispatches": 48
-          },
-          {
-            "op": "sigmoid",
-            "ms": 0.289,
-            "pct": 0.9,
-            "dispatches": 96
-          },
-          {
-            "op": "Softmax",
-            "ms": 0.236,
-            "pct": 0.7,
-            "dispatches": 24
-          },
-          {
-            "op": "MMI_pack",
-            "ms": 0.114,
-            "pct": 0.4,
-            "dispatches": 50
-          },
-          {
-            "op": "relu",
-            "ms": 0.111,
-            "pct": 0.3,
-            "dispatches": 3
-          }
-        ],
-        "compute_ms": 31.855,
-        "sync_ms": 0.618,
-        "flushes": 7,
-        "upload_mb": 0.4,
-        "download_mb": 0.4
-      },
-      "blocks": {
-        "nodes_claimed": 3249,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 16,
-        "sm_pct": {
-          "mean": 26.3,
-          "max": 65.0,
-          "p95": 65.0
-        },
-        "fb_peak_mb": 5189.0,
-        "vram_delta_mb": 2624.0,
-        "vram_idle_mb": 2565,
-        "vram_source": "global-delta",
-        "rss_mb": 1457.0,
-        "cpu_pct": {
-          "mean": 88.2,
-          "max": 319.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "parakeet",
-      "mode": "cpu",
-      "runner": "stt-app",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 700.0,
-      "perf_tol": 10.0,
-      "golden": false,
-      "device": null,
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 300.8,
-        "min": 283.7,
-        "max": 317.4,
-        "iters_used": 19
-      },
-      "cpu_ep_ms": null,
-      "accuracy": {
-        "kind": "transcript",
-        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
-        "expect": "Well, I don't wish to see it any more",
-        "tolerated": true
-      },
-      "reference": null,
-      "gpu": null,
-      "blocks": {},
-      "system": {
-        "samples": 46,
-        "sm_pct": {
-          "mean": 8.4,
-          "max": 26.0,
-          "p95": 26.0
-        },
-        "fb_peak_mb": 2603.0,
-        "vram_delta_mb": 50.0,
-        "vram_idle_mb": 2553,
-        "vram_source": "global-delta",
-        "rss_mb": 806.0,
-        "cpu_pct": {
-          "mean": 504.8,
-          "max": 704.0
-        }
-      },
-      "raw": {
-        "stdout": "cpu.stdout.log",
-        "stats": null,
-        "metrics": "cpu.metrics.csv"
-      }
-    },
-    {
-      "model": "resnet50-qdq-golden",
-      "mode": "compile",
-      "runner": "model-runner",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 25.0,
-      "perf_tol": 10.0,
-      "golden": true,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 4.6,
-        "min": 4.5,
-        "max": 5.4,
-        "iters_used": null
-      },
-      "cpu_ep_ms": 6.4,
-      "accuracy": {
-        "kind": "argmax",
-        "outputs": [
-          {
-            "output": "resnetv17_dense0_fwd",
-            "worst_abs": 0.0,
-            "mismatches": 0,
-            "argmax_expected": 489,
-            "argmax_got": 489
-          }
-        ],
-        "tolerated": true,
-        "criterion": "argmax equal to the official reference"
-      },
-      "reference": {
-        "backends": {
-          "cpu": {
-            "outputs": [
-              {
-                "output": "resnetv17_dense0_fwd",
-                "worst_abs": 0.0,
-                "mismatches": 0,
-                "argmax_expected": 489,
-                "argmax_got": 489
-              }
-            ],
-            "ok": true
-          },
-          "vulkan": {
-            "outputs": [
-              {
-                "output": "resnetv17_dense0_fwd",
-                "worst_abs": 0.0,
-                "mismatches": 0,
-                "argmax_expected": 489,
-                "argmax_got": 489
-              }
-            ],
-            "ok": true
-          }
-        },
-        "ok": true,
-        "cpu_agrees": true
-      },
-      "gpu": {
-        "pareto": [
-          {
-            "op": "Conv_split",
-            "ms": 2.186,
-            "pct": 62.0,
-            "dispatches": 43
-          },
-          {
-            "op": "Conv",
-            "ms": 0.377,
-            "pct": 10.7,
-            "dispatches": 10
-          },
-          {
-            "op": "DequantizeLinear",
-            "ms": 0.271,
+            "op": "GQA_out",
+            "ms": 0.48,
             "pct": 7.7,
+            "dispatches": 26
+          },
+          {
+            "op": "GQA_pack",
+            "ms": 0.156,
+            "pct": 2.5,
             "dispatches": 78
           },
           {
-            "op": "QuantizeLinear",
-            "ms": 0.258,
-            "pct": 7.3,
-            "dispatches": 74
+            "op": "GQA_past",
+            "ms": 0.118,
+            "pct": 1.9,
+            "dispatches": 52,
+            "gflop": 0.0136,
+            "gb": 0.8863,
+            "gflops": 115.25,
+            "gb_s": 7511.02,
+            "intensity": 0.0153,
+            "pct_peak_compute": 0.4,
+            "pct_peak_bw": 1489.69,
+            "efficiency": 14.8964,
+            "class": "memory"
           },
           {
-            "op": "Conv_split_reduce",
-            "ms": 0.172,
-            "pct": 4.9,
-            "dispatches": 43
+            "op": "GQA_softmax",
+            "ms": 0.083,
+            "pct": 1.3,
+            "dispatches": 26
           },
           {
-            "op": "relu",
-            "ms": 0.06,
-            "pct": 1.7,
-            "dispatches": 16
+            "op": "GeluTanh",
+            "ms": 0.047,
+            "pct": 0.8,
+            "dispatches": 26,
+            "gflop": 0.0002,
+            "gb": 0.0014,
+            "gflops": 4.26,
+            "gb_s": 29.79,
+            "intensity": 0.1429,
+            "pct_peak_compute": 0.01,
+            "pct_peak_bw": 5.91,
+            "efficiency": 0.0591,
+            "class": "latency"
           },
           {
-            "op": "GEMV",
-            "ms": 0.025,
-            "pct": 0.7,
-            "dispatches": 1
-          },
-          {
-            "op": "MaxPool",
-            "ms": 0.008,
-            "pct": 0.2,
-            "dispatches": 1
-          },
-          {
-            "op": "AveragePool",
-            "ms": 0.008,
-            "pct": 0.2,
-            "dispatches": 1
-          },
-          {
-            "op": "GEMV_reduce",
-            "ms": 0.003,
+            "op": "GatherBlockQuantized",
+            "ms": 0.004,
             "pct": 0.1,
             "dispatches": 1
           }
         ],
-        "compute_ms": 3.526,
-        "sync_ms": 0.183,
-        "flushes": 2,
-        "upload_mb": 0.6,
-        "download_mb": 0.0
+        "compute_ms": 6.267,
+        "sync_ms": 3.938,
+        "flushes": 57,
+        "upload_mb": 6.8,
+        "download_mb": 7.9,
+        "submits": 57,
+        "uploads": 57,
+        "downloads": 56,
+        "allocs": 176,
+        "pool_hits": 643
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
       },
       "blocks": {
-        "nodes_claimed": 349,
+        "nodes_claimed": 596,
         "convex_blocks": 1
       },
       "system": {
-        "samples": 3,
+        "samples": 24,
         "sm_pct": {
-          "mean": 4.7,
-          "max": 6.0,
-          "p95": 6.0
+          "mean": 6.0,
+          "max": 20.0,
+          "p95": 20.0
         },
-        "fb_peak_mb": 3126.0,
-        "vram_delta_mb": 520.0,
-        "vram_idle_mb": 2606,
+        "fb_peak_mb": 4408.0,
+        "vram_delta_mb": 2207.0,
+        "vram_idle_mb": 2201,
         "vram_source": "global-delta",
-        "rss_mb": 314.0,
+        "rss_mb": 2995.0,
         "cpu_pct": {
-          "mean": 86.3,
-          "max": 195.0
+          "mean": 164.4,
+          "max": 594.0
         }
       },
       "raw": {
@@ -535,923 +631,867 @@
       }
     },
     {
-      "model": "resnet50-qdq-golden",
+      "model": "gemma3-1b",
       "mode": "cpu",
       "status": "skip",
       "ok": true,
       "reason": "model-runner already measures the CPU EP anyway"
     },
     {
-      "model": "rfdetr",
+      "model": "qwen25vl-decoder",
       "mode": "compile",
       "runner": "model-runner",
-      "iters": 5,
+      "iters": 20,
       "ok": true,
       "exit_code": 0,
-      "model_size_mb": 129.0,
+      "model_size_mb": 1100.0,
       "perf_tol": 10.0,
       "golden": false,
       "device": "NVIDIA GeForce RTX 4070",
       "perf_valid": true,
       "wall_ms": {
-        "median": 40.5,
-        "min": 37.5,
-        "max": 40.9,
+        "median": 26.8,
+        "min": 24.7,
+        "max": 33.2,
         "iters_used": null
       },
-      "cpu_ep_ms": 364.6,
+      "cpu_ep_ms": 74.7,
       "accuracy": {
         "kind": "outputs",
-        "worst_relative": 0.000184,
+        "worst_relative": 2.6e-05,
         "outputs": [
-          {
-            "name": "pred_boxes",
-            "n": 1200,
-            "max_abs_delta": 0.0001841,
-            "ref_scale": 1.001,
-            "relative": 0.000184,
-            "mismatches": 0
-          },
           {
             "name": "logits",
-            "n": 27300,
-            "max_abs_delta": 0.0001559,
-            "ref_scale": 10.09,
-            "relative": 1.54e-05,
-            "mismatches": 0
-          }
-        ],
-        "tolerated": true
-      },
-      "reference": null,
-      "gpu": {
-        "pareto": [
-          {
-            "op": "MatMul",
-            "ms": 20.509,
-            "pct": 61.3,
-            "dispatches": 133
-          },
-          {
-            "op": "Softmax",
-            "ms": 2.224,
-            "pct": 6.6,
-            "dispatches": 17
-          },
-          {
-            "op": "Transpose",
-            "ms": 1.862,
-            "pct": 5.6,
-            "dispatches": 83
-          },
-          {
-            "op": "Conv_split",
-            "ms": 1.202,
-            "pct": 3.6,
-            "dispatches": 8
-          },
-          {
-            "op": "LayerNormalization",
-            "ms": 0.526,
-            "pct": 1.6,
-            "dispatches": 37
-          },
-          {
-            "op": "ReduceMean",
-            "ms": 0.462,
-            "pct": 1.4,
-            "dispatches": 18
-          },
-          {
-            "op": "Slice",
-            "ms": 0.327,
-            "pct": 1.0,
-            "dispatches": 34
-          },
-          {
-            "op": "Conv",
-            "ms": 0.189,
-            "pct": 0.6,
-            "dispatches": 1
-          },
-          {
-            "op": "Erf",
-            "ms": 0.172,
-            "pct": 0.5,
-            "dispatches": 11
-          },
-          {
-            "op": "Concat",
-            "ms": 0.147,
-            "pct": 0.4,
-            "dispatches": 37
-          },
-          {
-            "op": "Gather",
-            "ms": 0.041,
-            "pct": 0.1,
-            "dispatches": 7
-          },
-          {
-            "op": "Resize",
-            "ms": 0.041,
-            "pct": 0.1,
-            "dispatches": 1
-          },
-          {
-            "op": "Conv_split_reduce",
-            "ms": 0.037,
-            "pct": 0.1,
-            "dispatches": 8
-          },
-          {
-            "op": "MatMul16",
-            "ms": 0.035,
-            "pct": 0.1,
-            "dispatches": 2
-          },
-          {
-            "op": "GridSample",
-            "ms": 0.034,
-            "pct": 0.1,
-            "dispatches": 3
-          },
-          {
-            "op": "relu",
-            "ms": 0.032,
-            "pct": 0.1,
-            "dispatches": 8
-          },
-          {
-            "op": "sigmoid",
-            "ms": 0.027,
-            "pct": 0.1,
-            "dispatches": 8
-          },
-          {
-            "op": "Where",
-            "ms": 0.02,
-            "pct": 0.1,
-            "dispatches": 2
-          },
-          {
-            "op": "Sqrt",
-            "ms": 0.017,
-            "pct": 0.1,
-            "dispatches": 9
-          },
-          {
-            "op": "ReduceMax",
-            "ms": 0.014,
-            "pct": 0.0,
-            "dispatches": 1
-          },
-          {
-            "op": "Cos",
-            "ms": 0.008,
-            "pct": 0.0,
-            "dispatches": 4
-          },
-          {
-            "op": "ReduceSum",
-            "ms": 0.007,
-            "pct": 0.0,
-            "dispatches": 3
-          },
-          {
-            "op": "Sin",
-            "ms": 0.006,
-            "pct": 0.0,
-            "dispatches": 4
-          },
-          {
-            "op": "Exp",
-            "ms": 0.006,
-            "pct": 0.0,
-            "dispatches": 3
-          }
-        ],
-        "compute_ms": 33.451,
-        "sync_ms": 0.697,
-        "flushes": 9,
-        "upload_mb": 4.1,
-        "download_mb": 0.2
-      },
-      "blocks": {
-        "nodes_claimed": 1069,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 16,
-        "sm_pct": {
-          "mean": 1.9,
-          "max": 7.0,
-          "p95": 7.0
-        },
-        "fb_peak_mb": 3336.0,
-        "vram_delta_mb": 698.0,
-        "vram_idle_mb": 2638,
-        "vram_source": "global-delta",
-        "rss_mb": 687.0,
-        "cpu_pct": {
-          "mean": 335.7,
-          "max": 591.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "rfdetr",
-      "mode": "cpu",
-      "status": "skip",
-      "ok": true,
-      "reason": "model-runner already measures the CPU EP anyway"
-    },
-    {
-      "model": "roberta-golden",
-      "mode": "compile",
-      "runner": "model-runner",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 499.0,
-      "perf_tol": 10.0,
-      "golden": true,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 3.3,
-        "min": 3.2,
-        "max": 4.1,
-        "iters_used": null
-      },
-      "cpu_ep_ms": 7.7,
-      "accuracy": {
-        "kind": "outputs",
-        "worst_relative": 9.05e-07,
-        "outputs": [
-          {
-            "name": "output_1",
-            "n": 768,
-            "max_abs_delta": 3.815e-06,
-            "ref_scale": 11.29,
-            "relative": 3.38e-07,
+            "n": 151936,
+            "max_abs_delta": 0.0003175,
+            "ref_scale": 12.23,
+            "relative": 2.6e-05,
             "mismatches": 0
           },
           {
-            "name": "output_2",
-            "n": 768,
-            "max_abs_delta": 5.662e-07,
-            "ref_scale": 0.6258,
-            "relative": 9.05e-07,
-            "mismatches": 0
-          }
-        ],
-        "tolerated": true
-      },
-      "reference": {
-        "backends": {
-          "cpu": {
-            "outputs": [
-              {
-                "output": "output_1",
-                "worst_abs": 9.835e-07,
-                "mismatches": 0,
-                "argmax_expected": 588,
-                "argmax_got": 588
-              },
-              {
-                "output": "output_2",
-                "worst_abs": 3.651e-07,
-                "mismatches": 0,
-                "argmax_expected": 507,
-                "argmax_got": 507
-              }
-            ],
-            "ok": true
-          },
-          "vulkan": {
-            "outputs": [
-              {
-                "output": "output_1",
-                "worst_abs": 3.815e-06,
-                "mismatches": 0,
-                "argmax_expected": 588,
-                "argmax_got": 588
-              },
-              {
-                "output": "output_2",
-                "worst_abs": 7.153e-07,
-                "mismatches": 0,
-                "argmax_expected": 507,
-                "argmax_got": 507
-              }
-            ],
-            "ok": true
-          }
-        },
-        "ok": true,
-        "cpu_agrees": true
-      },
-      "gpu": {
-        "pareto": [
-          {
-            "op": "GEMV",
-            "ms": 1.011,
-            "pct": 45.5,
-            "dispatches": 72
-          },
-          {
-            "op": "Transpose",
-            "ms": 0.226,
-            "pct": 10.2,
-            "dispatches": 48
-          },
-          {
-            "op": "GEMV_reduce",
-            "ms": 0.209,
-            "pct": 9.4,
-            "dispatches": 72
-          },
-          {
-            "op": "LayerNormalization",
-            "ms": 0.103,
-            "pct": 4.7,
-            "dispatches": 25
-          },
-          {
-            "op": "MatMul16",
-            "ms": 0.1,
-            "pct": 4.5,
-            "dispatches": 24
-          },
-          {
-            "op": "Gemm",
-            "ms": 0.087,
-            "pct": 3.9,
-            "dispatches": 1
-          },
-          {
-            "op": "Softmax",
-            "ms": 0.039,
-            "pct": 1.8,
-            "dispatches": 12
-          },
-          {
-            "op": "Erf",
-            "ms": 0.023,
-            "pct": 1.0,
-            "dispatches": 12
-          },
-          {
-            "op": "Gather",
-            "ms": 0.019,
-            "pct": 0.8,
-            "dispatches": 4
-          },
-          {
-            "op": "Tanh",
-            "ms": 0.002,
-            "pct": 0.1,
-            "dispatches": 1
-          }
-        ],
-        "compute_ms": 2.22,
-        "sync_ms": 0.445,
-        "flushes": 4,
-        "upload_mb": 0.0,
-        "download_mb": 0.0
-      },
-      "blocks": {
-        "nodes_claimed": 636,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 9,
-        "sm_pct": {
-          "mean": 4.6,
-          "max": 24.0,
-          "p95": 24.0
-        },
-        "fb_peak_mb": 3868.0,
-        "vram_delta_mb": 1343.0,
-        "vram_idle_mb": 2525,
-        "vram_source": "global-delta",
-        "rss_mb": 2085.0,
-        "cpu_pct": {
-          "mean": 140.0,
-          "max": 479.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "roberta-golden",
-      "mode": "cpu",
-      "status": "skip",
-      "ok": true,
-      "reason": "model-runner already measures the CPU EP anyway"
-    },
-    {
-      "model": "roberta-seq128",
-      "mode": "compile",
-      "runner": "model-runner",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 499.0,
-      "perf_tol": 10.0,
-      "golden": false,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 18.6,
-        "min": 17.5,
-        "max": 21.0,
-        "iters_used": null
-      },
-      "cpu_ep_ms": 51.9,
-      "accuracy": {
-        "kind": "outputs",
-        "worst_relative": 2.22e-06,
-        "outputs": [
-          {
-            "name": "output_1",
-            "n": 98304,
-            "max_abs_delta": 2.67e-05,
-            "ref_scale": 12.0,
-            "relative": 2.22e-06,
+            "name": "present.0.key",
+            "n": 32768,
+            "max_abs_delta": 1.359e-05,
+            "ref_scale": 92.76,
+            "relative": 1.47e-07,
             "mismatches": 0
           },
           {
-            "name": "output_2",
-            "n": 768,
-            "max_abs_delta": 8.345e-07,
-            "ref_scale": 0.5699,
-            "relative": 1.46e-06,
-            "mismatches": 0
-          }
-        ],
-        "tolerated": true
-      },
-      "reference": null,
-      "gpu": {
-        "pareto": [
-          {
-            "op": "MatMul",
-            "ms": 14.467,
-            "pct": 89.0,
-            "dispatches": 96
-          },
-          {
-            "op": "Transpose",
-            "ms": 0.334,
-            "pct": 2.1,
-            "dispatches": 48
-          },
-          {
-            "op": "Softmax",
-            "ms": 0.211,
-            "pct": 1.3,
-            "dispatches": 12
-          },
-          {
-            "op": "LayerNormalization",
-            "ms": 0.103,
-            "pct": 0.6,
-            "dispatches": 25
-          },
-          {
-            "op": "Gemm",
-            "ms": 0.081,
-            "pct": 0.5,
-            "dispatches": 1
-          },
-          {
-            "op": "Erf",
-            "ms": 0.047,
-            "pct": 0.3,
-            "dispatches": 12
-          },
-          {
-            "op": "Gather",
-            "ms": 0.021,
-            "pct": 0.1,
-            "dispatches": 4
-          },
-          {
-            "op": "Tanh",
-            "ms": 0.002,
-            "pct": 0.0,
-            "dispatches": 1
-          }
-        ],
-        "compute_ms": 16.263,
-        "sync_ms": 0.401,
-        "flushes": 4,
-        "upload_mb": 0.0,
-        "download_mb": 0.4
-      },
-      "blocks": {
-        "nodes_claimed": 636,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 16,
-        "sm_pct": {
-          "mean": 10.2,
-          "max": 92.0,
-          "p95": 92.0
-        },
-        "fb_peak_mb": 4018.0,
-        "vram_delta_mb": 1386.0,
-        "vram_idle_mb": 2632,
-        "vram_source": "global-delta",
-        "rss_mb": 1704.0,
-        "cpu_pct": {
-          "mean": 288.4,
-          "max": 644.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "roberta-seq128",
-      "mode": "cpu",
-      "status": "skip",
-      "ok": true,
-      "reason": "model-runner already measures the CPU EP anyway"
-    },
-    {
-      "model": "yolov4-golden",
-      "mode": "compile",
-      "runner": "model-runner",
-      "iters": 20,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 245.0,
-      "perf_tol": 10.0,
-      "golden": true,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 36.1,
-        "min": 35.1,
-        "max": 39.1,
-        "iters_used": null
-      },
-      "cpu_ep_ms": 171.7,
-      "accuracy": {
-        "kind": "outputs",
-        "worst_relative": 4.09e-06,
-        "outputs": [
-          {
-            "name": "Identity:0",
-            "n": 689520,
-            "max_abs_delta": 8.523e-06,
-            "ref_scale": 2.085,
-            "relative": 4.09e-06,
+            "name": "present.0.value",
+            "n": 32768,
+            "max_abs_delta": 5.96e-07,
+            "ref_scale": 2.515,
+            "relative": 2.37e-07,
             "mismatches": 0
           },
           {
-            "name": "Identity_1:0",
-            "n": 172380,
-            "max_abs_delta": 4.262e-06,
-            "ref_scale": 2.898,
+            "name": "present.1.key",
+            "n": 32768,
+            "max_abs_delta": 1.574e-05,
+            "ref_scale": 38.13,
+            "relative": 4.13e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.1.value",
+            "n": 32768,
+            "max_abs_delta": 2.831e-07,
+            "ref_scale": 1.829,
+            "relative": 1.55e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.2.key",
+            "n": 32768,
+            "max_abs_delta": 4.339e-05,
+            "ref_scale": 18.81,
+            "relative": 2.31e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.2.value",
+            "n": 32768,
+            "max_abs_delta": 1.571e-05,
+            "ref_scale": 1.0,
+            "relative": 1.57e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.3.key",
+            "n": 32768,
+            "max_abs_delta": 6.109e-06,
+            "ref_scale": 11.9,
+            "relative": 5.13e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.3.value",
+            "n": 32768,
+            "max_abs_delta": 3.576e-06,
+            "ref_scale": 1.0,
+            "relative": 3.58e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.4.key",
+            "n": 32768,
+            "max_abs_delta": 8.464e-06,
+            "ref_scale": 4.066,
+            "relative": 2.08e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.4.value",
+            "n": 32768,
+            "max_abs_delta": 1.758e-06,
+            "ref_scale": 1.0,
+            "relative": 1.76e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.5.key",
+            "n": 32768,
+            "max_abs_delta": 4.634e-06,
+            "ref_scale": 2.656,
+            "relative": 1.74e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.5.value",
+            "n": 32768,
+            "max_abs_delta": 2.98e-06,
+            "ref_scale": 1.0,
+            "relative": 2.98e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.6.key",
+            "n": 32768,
+            "max_abs_delta": 4.958e-06,
+            "ref_scale": 4.413,
+            "relative": 1.12e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.6.value",
+            "n": 32768,
+            "max_abs_delta": 1.771e-06,
+            "ref_scale": 0.9999,
+            "relative": 1.77e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.7.key",
+            "n": 32768,
+            "max_abs_delta": 6.109e-06,
+            "ref_scale": 2.359,
+            "relative": 2.59e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.7.value",
+            "n": 32768,
+            "max_abs_delta": 2.176e-06,
+            "ref_scale": 0.9999,
+            "relative": 2.18e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.8.key",
+            "n": 32768,
+            "max_abs_delta": 5.245e-06,
+            "ref_scale": 2.308,
+            "relative": 2.27e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.8.value",
+            "n": 32768,
+            "max_abs_delta": 2.459e-06,
+            "ref_scale": 1.0,
+            "relative": 2.46e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.9.key",
+            "n": 32768,
+            "max_abs_delta": 3.949e-06,
+            "ref_scale": 4.034,
+            "relative": 9.79e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.9.value",
+            "n": 32768,
+            "max_abs_delta": 2.027e-06,
+            "ref_scale": 0.9999,
+            "relative": 2.03e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.10.key",
+            "n": 32768,
+            "max_abs_delta": 4.053e-06,
+            "ref_scale": 2.746,
+            "relative": 1.48e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.10.value",
+            "n": 32768,
+            "max_abs_delta": 2.161e-06,
+            "ref_scale": 1.293,
+            "relative": 1.67e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.11.key",
+            "n": 32768,
+            "max_abs_delta": 3.591e-06,
+            "ref_scale": 6.758,
+            "relative": 5.31e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.11.value",
+            "n": 32768,
+            "max_abs_delta": 2.176e-06,
+            "ref_scale": 1.495,
+            "relative": 1.45e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.12.key",
+            "n": 32768,
+            "max_abs_delta": 3.994e-06,
+            "ref_scale": 2.721,
             "relative": 1.47e-06,
             "mismatches": 0
           },
           {
-            "name": "Identity_2:0",
-            "n": 43095,
-            "max_abs_delta": 4.008e-06,
-            "ref_scale": 3.109,
-            "relative": 1.29e-06,
+            "name": "present.12.value",
+            "n": 32768,
+            "max_abs_delta": 2.138e-06,
+            "ref_scale": 1.669,
+            "relative": 1.28e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.13.key",
+            "n": 32768,
+            "max_abs_delta": 4.768e-06,
+            "ref_scale": 3.172,
+            "relative": 1.5e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.13.value",
+            "n": 32768,
+            "max_abs_delta": 2.265e-06,
+            "ref_scale": 1.897,
+            "relative": 1.19e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.14.key",
+            "n": 32768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 2.988,
+            "relative": 1.28e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.14.value",
+            "n": 32768,
+            "max_abs_delta": 2.008e-06,
+            "ref_scale": 2.425,
+            "relative": 8.28e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.15.key",
+            "n": 32768,
+            "max_abs_delta": 5.007e-06,
+            "ref_scale": 3.963,
+            "relative": 1.26e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.15.value",
+            "n": 32768,
+            "max_abs_delta": 3.919e-06,
+            "ref_scale": 1.396,
+            "relative": 2.81e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.16.key",
+            "n": 32768,
+            "max_abs_delta": 4.053e-06,
+            "ref_scale": 10.24,
+            "relative": 3.96e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.16.value",
+            "n": 32768,
+            "max_abs_delta": 2.149e-06,
+            "ref_scale": 0.9999,
+            "relative": 2.15e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.17.key",
+            "n": 32768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 4.185,
+            "relative": 9.11e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.17.value",
+            "n": 32768,
+            "max_abs_delta": 2.742e-06,
+            "ref_scale": 2.808,
+            "relative": 9.76e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.18.key",
+            "n": 32768,
+            "max_abs_delta": 7.629e-06,
+            "ref_scale": 33.09,
+            "relative": 2.31e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.18.value",
+            "n": 32768,
+            "max_abs_delta": 3.099e-06,
+            "ref_scale": 1.956,
+            "relative": 1.58e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.19.key",
+            "n": 32768,
+            "max_abs_delta": 4.292e-06,
+            "ref_scale": 19.33,
+            "relative": 2.22e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.19.value",
+            "n": 32768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 2.636,
+            "relative": 1.45e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.20.key",
+            "n": 32768,
+            "max_abs_delta": 5.096e-06,
+            "ref_scale": 22.7,
+            "relative": 2.24e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.20.value",
+            "n": 32768,
+            "max_abs_delta": 3.368e-06,
+            "ref_scale": 1.553,
+            "relative": 2.17e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.21.key",
+            "n": 32768,
+            "max_abs_delta": 5.722e-06,
+            "ref_scale": 20.73,
+            "relative": 2.76e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.21.value",
+            "n": 32768,
+            "max_abs_delta": 4.768e-06,
+            "ref_scale": 2.362,
+            "relative": 2.02e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.22.key",
+            "n": 32768,
+            "max_abs_delta": 4.768e-06,
+            "ref_scale": 10.07,
+            "relative": 4.74e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.22.value",
+            "n": 32768,
+            "max_abs_delta": 4.292e-06,
+            "ref_scale": 1.762,
+            "relative": 2.44e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.23.key",
+            "n": 32768,
+            "max_abs_delta": 5.722e-06,
+            "ref_scale": 16.67,
+            "relative": 3.43e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.23.value",
+            "n": 32768,
+            "max_abs_delta": 4.768e-06,
+            "ref_scale": 2.521,
+            "relative": 1.89e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.24.key",
+            "n": 32768,
+            "max_abs_delta": 4.798e-06,
+            "ref_scale": 6.949,
+            "relative": 6.9e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.24.value",
+            "n": 32768,
+            "max_abs_delta": 2.98e-06,
+            "ref_scale": 1.803,
+            "relative": 1.65e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.25.key",
+            "n": 32768,
+            "max_abs_delta": 4.47e-06,
+            "ref_scale": 12.0,
+            "relative": 3.73e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.25.value",
+            "n": 32768,
+            "max_abs_delta": 2.831e-06,
+            "ref_scale": 1.488,
+            "relative": 1.9e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.26.key",
+            "n": 32768,
+            "max_abs_delta": 4.768e-06,
+            "ref_scale": 12.12,
+            "relative": 3.93e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.26.value",
+            "n": 32768,
+            "max_abs_delta": 2.98e-06,
+            "ref_scale": 1.785,
+            "relative": 1.67e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.27.key",
+            "n": 32768,
+            "max_abs_delta": 5.722e-06,
+            "ref_scale": 38.44,
+            "relative": 1.49e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.27.value",
+            "n": 32768,
+            "max_abs_delta": 4.053e-06,
+            "ref_scale": 2.264,
+            "relative": 1.79e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.28.key",
+            "n": 32768,
+            "max_abs_delta": 5.722e-06,
+            "ref_scale": 9.339,
+            "relative": 6.13e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.28.value",
+            "n": 32768,
+            "max_abs_delta": 4.292e-06,
+            "ref_scale": 1.211,
+            "relative": 3.54e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.29.key",
+            "n": 32768,
+            "max_abs_delta": 1.144e-05,
+            "ref_scale": 28.39,
+            "relative": 4.03e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "present.29.value",
+            "n": 32768,
+            "max_abs_delta": 3.71e-06,
+            "ref_scale": 1.146,
+            "relative": 3.24e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.30.key",
+            "n": 32768,
+            "max_abs_delta": 8.106e-06,
+            "ref_scale": 5.29,
+            "relative": 1.53e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.30.value",
+            "n": 32768,
+            "max_abs_delta": 7.153e-06,
+            "ref_scale": 1.519,
+            "relative": 4.71e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.31.key",
+            "n": 32768,
+            "max_abs_delta": 5.15e-05,
+            "ref_scale": 11.38,
+            "relative": 4.52e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.31.value",
+            "n": 32768,
+            "max_abs_delta": 3.982e-05,
+            "ref_scale": 4.968,
+            "relative": 8.01e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.32.key",
+            "n": 32768,
+            "max_abs_delta": 5.078e-05,
+            "ref_scale": 11.02,
+            "relative": 4.61e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.32.value",
+            "n": 32768,
+            "max_abs_delta": 6.843e-05,
+            "ref_scale": 4.629,
+            "relative": 1.48e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.33.key",
+            "n": 32768,
+            "max_abs_delta": 4.92e-05,
+            "ref_scale": 6.145,
+            "relative": 8.01e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.33.value",
+            "n": 32768,
+            "max_abs_delta": 7.689e-05,
+            "ref_scale": 3.769,
+            "relative": 2.04e-05,
+            "mismatches": 0
+          },
+          {
+            "name": "present.34.key",
+            "n": 32768,
+            "max_abs_delta": 4.721e-05,
+            "ref_scale": 7.52,
+            "relative": 6.28e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.34.value",
+            "n": 32768,
+            "max_abs_delta": 5.043e-05,
+            "ref_scale": 5.901,
+            "relative": 8.55e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.35.key",
+            "n": 32768,
+            "max_abs_delta": 5.805e-05,
+            "ref_scale": 14.86,
+            "relative": 3.91e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "present.35.value",
+            "n": 32768,
+            "max_abs_delta": 6.95e-05,
+            "ref_scale": 4.699,
+            "relative": 1.48e-05,
             "mismatches": 0
           }
         ],
         "tolerated": true
       },
-      "reference": {
-        "backends": {
-          "cpu": {
-            "outputs": [
-              {
-                "output": "Identity:0",
-                "worst_abs": 4.172e-06,
-                "mismatches": 0,
-                "argmax_expected": 676430,
-                "argmax_got": 676430
-              },
-              {
-                "output": "Identity_1:0",
-                "worst_abs": 2.25e-06,
-                "mismatches": 0,
-                "argmax_expected": 1956,
-                "argmax_got": 1956
-              },
-              {
-                "output": "Identity_2:0",
-                "worst_abs": 1.237e-06,
-                "mismatches": 0,
-                "argmax_expected": 36550,
-                "argmax_got": 36550
-              }
-            ],
-            "ok": true
-          },
-          "vulkan": {
-            "outputs": [
-              {
-                "output": "Identity:0",
-                "worst_abs": 7.629e-06,
-                "mismatches": 0,
-                "argmax_expected": 676430,
-                "argmax_got": 676430
-              },
-              {
-                "output": "Identity_1:0",
-                "worst_abs": 4.768e-06,
-                "mismatches": 0,
-                "argmax_expected": 1956,
-                "argmax_got": 1956
-              },
-              {
-                "output": "Identity_2:0",
-                "worst_abs": 3.532e-06,
-                "mismatches": 0,
-                "argmax_expected": 36550,
-                "argmax_got": 36550
-              }
-            ],
-            "ok": true
-          }
-        },
-        "ok": true,
-        "cpu_agrees": true
-      },
-      "gpu": {
-        "pareto": [
-          {
-            "op": "Conv_split",
-            "ms": 10.815,
-            "pct": 56.3,
-            "dispatches": 78
-          },
-          {
-            "op": "Conv",
-            "ms": 3.87,
-            "pct": 20.1,
-            "dispatches": 32
-          },
-          {
-            "op": "Tanh",
-            "ms": 0.39,
-            "pct": 2.0,
-            "dispatches": 72
-          },
-          {
-            "op": "Conv_split_reduce",
-            "ms": 0.36,
-            "pct": 1.9,
-            "dispatches": 78
-          },
-          {
-            "op": "Log",
-            "ms": 0.358,
-            "pct": 1.9,
-            "dispatches": 72
-          },
-          {
-            "op": "Exp",
-            "ms": 0.347,
-            "pct": 1.8,
-            "dispatches": 72
-          },
-          {
-            "op": "Concat",
-            "ms": 0.141,
-            "pct": 0.7,
-            "dispatches": 31
-          },
-          {
-            "op": "LeakyRelu",
-            "ms": 0.096,
-            "pct": 0.5,
-            "dispatches": 35
-          },
-          {
-            "op": "Slice",
-            "ms": 0.091,
-            "pct": 0.5,
-            "dispatches": 9
-          },
-          {
-            "op": "Transpose",
-            "ms": 0.062,
-            "pct": 0.3,
-            "dispatches": 4
-          },
-          {
-            "op": "MaxPool",
-            "ms": 0.061,
-            "pct": 0.3,
-            "dispatches": 3
-          },
-          {
-            "op": "sigmoid",
-            "ms": 0.014,
-            "pct": 0.1,
-            "dispatches": 6
-          },
-          {
-            "op": "Resize",
-            "ms": 0.008,
-            "pct": 0.0,
-            "dispatches": 2
-          }
-        ],
-        "compute_ms": 19.219,
-        "sync_ms": 7.856,
-        "flushes": 4,
-        "upload_mb": 2.1,
-        "download_mb": 3.6
-      },
-      "blocks": {
-        "nodes_claimed": 589,
-        "convex_blocks": 1
-      },
-      "system": {
-        "samples": 30,
-        "sm_pct": {
-          "mean": 12.9,
-          "max": 84.0,
-          "p95": 78.0
-        },
-        "fb_peak_mb": 3876.0,
-        "vram_delta_mb": 1304.0,
-        "vram_idle_mb": 2572,
-        "vram_source": "global-delta",
-        "rss_mb": 1037.0,
-        "cpu_pct": {
-          "mean": 430.4,
-          "max": 662.0
-        }
-      },
-      "raw": {
-        "stdout": "compile.stdout.log",
-        "stats": "compile.stats.log",
-        "metrics": "compile.metrics.csv"
-      }
-    },
-    {
-      "model": "yolov4-golden",
-      "mode": "cpu",
-      "status": "skip",
-      "ok": true,
-      "reason": "model-runner already measures the CPU EP anyway"
-    },
-    {
-      "model": "yolov8n",
-      "mode": "compile",
-      "runner": "model-runner",
-      "iters": 50,
-      "ok": true,
-      "exit_code": 0,
-      "model_size_mb": 13.0,
-      "perf_tol": 10.0,
-      "golden": false,
-      "device": "NVIDIA GeForce RTX 4070",
-      "perf_valid": true,
-      "wall_ms": {
-        "median": 7.3,
-        "min": 6.7,
-        "max": 9.3,
-        "iters_used": null
-      },
-      "cpu_ep_ms": 25.6,
-      "accuracy": {
-        "kind": "outputs",
-        "worst_relative": 7.65e-07,
-        "outputs": [
-          {
-            "name": "output0",
-            "n": 705600,
-            "max_abs_delta": 0.0004883,
-            "ref_scale": 637.9,
-            "relative": 7.65e-07,
-            "mismatches": 0
-          }
-        ],
-        "tolerated": true
-      },
+      "parity": null,
       "reference": null,
       "gpu": {
         "pareto": [
           {
-            "op": "Conv_split",
-            "ms": 1.965,
-            "pct": 40.3,
-            "dispatches": 41
+            "op": "MatMulNBits_gemv",
+            "ms": 4.969,
+            "pct": 37.2,
+            "dispatches": 72,
+            "gflop": 3.2464,
+            "gb": 1.0436,
+            "gflops": 653.33,
+            "gb_s": 210.02,
+            "intensity": 3.1108,
+            "pct_peak_compute": 2.24,
+            "pct_peak_bw": 41.65,
+            "efficiency": 0.4165,
+            "class": "memory"
           },
           {
-            "op": "Conv",
-            "ms": 1.29,
-            "pct": 26.5,
-            "dispatches": 21
+            "op": "MatMulNBits",
+            "ms": 4.072,
+            "pct": 30.4,
+            "dispatches": 180,
+            "gflop": 2.3027,
+            "gb": 0.7413,
+            "gflops": 565.5,
+            "gb_s": 182.05,
+            "intensity": 3.1063,
+            "pct_peak_compute": 1.94,
+            "pct_peak_bw": 36.11,
+            "efficiency": 0.3611,
+            "class": "memory"
           },
           {
-            "op": "Softmax",
-            "ms": 0.367,
-            "pct": 7.5,
-            "dispatches": 1
+            "op": "MatMulNBits_head",
+            "ms": 0.672,
+            "pct": 5.0,
+            "dispatches": 1,
+            "gflop": 0.6223,
+            "gb": 0.2,
+            "gflops": 926.04,
+            "gb_s": 297.62,
+            "intensity": 3.1115,
+            "pct_peak_compute": 3.18,
+            "pct_peak_bw": 59.03,
+            "efficiency": 0.5903,
+            "class": "memory"
           },
           {
-            "op": "Slice",
-            "ms": 0.191,
-            "pct": 3.9,
-            "dispatches": 20
-          },
-          {
-            "op": "sigmoid",
-            "ms": 0.171,
-            "pct": 3.5,
-            "dispatches": 58
-          },
-          {
-            "op": "Conv_split_reduce",
-            "ms": 0.17,
-            "pct": 3.5,
-            "dispatches": 41
-          },
-          {
-            "op": "Concat",
-            "ms": 0.166,
-            "pct": 3.4,
-            "dispatches": 51
+            "op": "GQA_out",
+            "ms": 0.665,
+            "pct": 5.0,
+            "dispatches": 36
           },
           {
             "op": "Transpose",
-            "ms": 0.026,
-            "pct": 0.5,
+            "ms": 0.549,
+            "pct": 4.1,
+            "dispatches": 145,
+            "gflop": 0.0,
+            "gb": 0.0013,
+            "gflops": 0.0,
+            "gb_s": 2.37,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.47,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "GQA_scores",
+            "ms": 0.545,
+            "pct": 4.1,
+            "dispatches": 36
+          },
+          {
+            "op": "SkipSimplifiedLayerNormalization",
+            "ms": 0.497,
+            "pct": 3.7,
+            "dispatches": 72,
+            "gflop": 0.0009,
+            "gb": 0.0029,
+            "gflops": 1.81,
+            "gb_s": 5.84,
+            "intensity": 0.3103,
+            "pct_peak_compute": 0.01,
+            "pct_peak_bw": 1.16,
+            "efficiency": 0.0116,
+            "class": "latency"
+          },
+          {
+            "op": "RotaryEmbedding",
+            "ms": 0.369,
+            "pct": 2.8,
+            "dispatches": 72,
+            "gflop": 0.0002,
+            "gb": 0.0007,
+            "gflops": 0.54,
+            "gb_s": 1.9,
+            "intensity": 0.2857,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.38,
+            "efficiency": 0.0037,
+            "class": "latency"
+          },
+          {
+            "op": "GQA_pack",
+            "ms": 0.198,
+            "pct": 1.5,
+            "dispatches": 108
+          },
+          {
+            "op": "GQA_past",
+            "ms": 0.162,
+            "pct": 1.2,
+            "dispatches": 72,
+            "gflop": 0.0377,
+            "gb": 0.0195,
+            "gflops": 232.72,
+            "gb_s": 120.37,
+            "intensity": 1.9333,
+            "pct_peak_compute": 0.8,
+            "pct_peak_bw": 23.87,
+            "efficiency": 0.2387,
+            "class": "memory"
+          },
+          {
+            "op": "GQA_softmax",
+            "ms": 0.11,
+            "pct": 0.8,
+            "dispatches": 36
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.059,
+            "pct": 0.4,
+            "dispatches": 36,
+            "gflop": 0.0004,
+            "gb": 0.0032,
+            "gflops": 6.78,
+            "gb_s": 54.24,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.02,
+            "pct_peak_bw": 10.76,
+            "efficiency": 0.1076,
+            "class": "memory"
+          },
+          {
+            "op": "Slice",
+            "ms": 0.04,
+            "pct": 0.3,
+            "dispatches": 8,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "Gather",
+            "ms": 0.028,
+            "pct": 0.2,
+            "dispatches": 6,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "Concat",
+            "ms": 0.018,
+            "pct": 0.1,
+            "dispatches": 8,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "SimplifiedLayerNormalization",
+            "ms": 0.007,
+            "pct": 0.1,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "MatMul16",
+            "ms": 0.005,
+            "pct": 0.0,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "Cos",
+            "ms": 0.004,
+            "pct": 0.0,
             "dispatches": 1
           },
           {
-            "op": "MaxPool",
-            "ms": 0.018,
-            "pct": 0.4,
-            "dispatches": 3
-          },
-          {
-            "op": "Conv16",
-            "ms": 0.015,
-            "pct": 0.3,
-            "dispatches": 2
-          },
-          {
-            "op": "Resize",
-            "ms": 0.013,
-            "pct": 0.3,
-            "dispatches": 2
+            "op": "Sin",
+            "ms": 0.002,
+            "pct": 0.0,
+            "dispatches": 1
           }
         ],
-        "compute_ms": 4.873,
-        "sync_ms": 0.361,
-        "flushes": 2,
-        "upload_mb": 4.9,
-        "download_mb": 2.8
+        "compute_ms": 13.375,
+        "sync_ms": 5.718,
+        "flushes": 77,
+        "upload_mb": 9.4,
+        "download_mb": 10.0,
+        "submits": 77,
+        "uploads": 165,
+        "downloads": 76,
+        "allocs": 338,
+        "pool_hits": 1122
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
       },
       "blocks": {
-        "nodes_claimed": 233,
+        "nodes_claimed": 1493,
         "convex_blocks": 1
       },
       "system": {
-        "samples": 12,
+        "samples": 57,
         "sm_pct": {
-          "mean": 36.8,
-          "max": 44.0,
-          "p95": 44.0
+          "mean": 8.8,
+          "max": 84.0,
+          "p95": 84.0
         },
-        "fb_peak_mb": 2961.0,
-        "vram_delta_mb": 328.0,
-        "vram_idle_mb": 2633,
+        "fb_peak_mb": 7120.0,
+        "vram_delta_mb": 4953.0,
+        "vram_idle_mb": 2167,
         "vram_source": "global-delta",
-        "rss_mb": 292.0,
+        "rss_mb": 7044.0,
         "cpu_pct": {
-          "mean": 361.8,
-          "max": 605.0
+          "mean": 174.8,
+          "max": 645.0
         }
       },
       "raw": {
@@ -1461,7 +1501,7 @@
       }
     },
     {
-      "model": "yolov8n",
+      "model": "qwen25vl-decoder",
       "mode": "cpu",
       "status": "skip",
       "ok": true,

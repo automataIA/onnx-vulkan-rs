@@ -85,12 +85,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  VK_KHR_vulkan_memory_model        {}",
             has(vk::KHR_VULKAN_MEMORY_MODEL_NAME)
         );
-        println!("  VK_KHR_16bit_storage              {}", has(vk::KHR_16BIT_STORAGE_NAME));
+        println!(
+            "  VK_KHR_16bit_storage              {}",
+            has(vk::KHR_16BIT_STORAGE_NAME)
+        );
         println!(
             "  VK_KHR_shader_float16_int8        {}",
             has(vk::KHR_SHADER_FLOAT16_INT8_NAME)
         );
-        println!("  VK_KHR_8bit_storage               {}", has(vk::KHR_8BIT_STORAGE_NAME));
+        println!(
+            "  VK_KHR_8bit_storage               {}",
+            has(vk::KHR_8BIT_STORAGE_NAME)
+        );
         if !has_coop {
             println!("  -> no cooperative matrix on this device\n");
             continue;
@@ -104,7 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .push_next(&mut f16i8)
             .push_next(&mut memmodel);
         unsafe { instance.get_physical_device_features2(pd, &mut feats2) };
-        println!("  cooperativeMatrix     {}", feat.cooperative_matrix == vk::TRUE);
+        println!(
+            "  cooperativeMatrix     {}",
+            feat.cooperative_matrix == vk::TRUE
+        );
         println!(
             "  ...RobustBufferAccess {}",
             feat.cooperative_matrix_robust_buffer_access == vk::TRUE
@@ -113,7 +122,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  supportedStages       {:?}",
             coop_props.cooperative_matrix_supported_stages
         );
-        println!("  shaderFloat16         {}", f16i8.shader_float16 == vk::TRUE);
+        println!(
+            "  shaderFloat16         {}",
+            f16i8.shader_float16 == vk::TRUE
+        );
         println!("  shaderInt8            {}", f16i8.shader_int8 == vk::TRUE);
         println!(
             "  vulkanMemoryModel     {}",
@@ -122,7 +134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let combos = unsafe { coop.get_physical_device_cooperative_matrix_properties(pd) }?;
         println!("  {} combinations:", combos.len());
-        println!("    {:>3} {:>3} {:>3}  {:>4} {:>4} {:>4} {:>4}  {:<9} sat", "M", "N", "K", "A", "B", "C", "R", "scope");
+        println!(
+            "    {:>3} {:>3} {:>3}  {:>4} {:>4} {:>4} {:>4}  {:<9} sat",
+            "M", "N", "K", "A", "B", "C", "R", "scope"
+        );
         for c in &combos {
             println!(
                 "    {:>3} {:>3} {:>3}  {:>4} {:>4} {:>4} {:>4}  {:<9} {}",

@@ -23,8 +23,13 @@ const SHAPES: &[(u32, u32, u32, u32, u32, &str)] = &[
 ];
 
 /// (rows/thread, cols/thread, stage B as vec4). Tile is 16*MM × 16*MN.
-const VARIANTS: &[(u32, u32, bool)] =
-    &[(4, 4, false), (8, 4, false), (4, 4, true), (8, 4, true), (2, 4, true)];
+const VARIANTS: &[(u32, u32, bool)] = &[
+    (4, 4, false),
+    (8, 4, false),
+    (4, 4, true),
+    (8, 4, true),
+    (2, 4, true),
+];
 
 fn source(mm: u32, mn: u32, vec4_b: bool) -> String {
     let (tm, tn, ks) = (16 * mm, 16 * mn, 16u32);
@@ -40,7 +45,10 @@ fn source(mm: u32, mn: u32, vec4_b: bool) -> String {
         inner += &format!("            let av{i} = as_tile[(arow + {i}u) * {ks}u + kk];\n");
     }
     if vec4_b {
-        inner += &format!("            let bvec = bs_tile[kk * {}u + lid.x];\n", tn / 4);
+        inner += &format!(
+            "            let bvec = bs_tile[kk * {}u + lid.x];\n",
+            tn / 4
+        );
         for j in 0..mn {
             inner += &format!("            let bv{j} = bvec[{j}u];\n");
         }
@@ -124,7 +132,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = VkContext::new()?;
-    println!("shape                     flops   {}", VARIANTS.iter().map(|(a, b, v)| format!("{a}x{b}{:<6}", if *v { "v" } else { "" })).collect::<String>());
+    println!(
+        "shape                     flops   {}",
+        VARIANTS
+            .iter()
+            .map(|(a, b, v)| format!("{a}x{b}{:<6}", if *v { "v" } else { "" }))
+            .collect::<String>()
+    );
 
     let mut totals = vec![0.0f64; VARIANTS.len()];
     for &(m, k, n, batch, count, name) in SHAPES {
@@ -161,7 +175,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nmodel MatMul total (ms), all 64 nodes:");
     for (vi, &(mm, mn, v4)) in VARIANTS.iter().enumerate() {
-        println!("  {mm}x{mn}{}  {:8.1}", if v4 { "v" } else { " " }, totals[vi]);
+        println!(
+            "  {mm}x{mn}{}  {:8.1}",
+            if v4 { "v" } else { " " },
+            totals[vi]
+        );
     }
     Ok(())
 }

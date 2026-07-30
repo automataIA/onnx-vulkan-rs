@@ -57,6 +57,10 @@ pub struct VkContext {
     /// Device-local storage buffers freed by their owner and reusable by the
     /// next allocation of the same size (see `buffer.rs`).
     pub(crate) storage_pool: Mutex<crate::buffer::StoragePool>,
+    /// Commands recorded into the stream while a capture is open (see
+    /// `capture.rs`). `None` when nothing is being captured, which is the
+    /// steady state: the check is one uncontended lock per command.
+    pub(crate) capture: Mutex<Option<Vec<crate::StreamOp>>>,
 }
 
 /// Timestamp slot in profiling query pool.
@@ -229,6 +233,7 @@ impl VkContext {
             submit_lock: Mutex::new(()),
             stream: Mutex::new(Default::default()),
             descriptors: Mutex::new(Default::default()),
+            capture: Mutex::new(None),
             // timestampValidBits==0 → timestamps not reliable on this queue
             timestamp_period: if timestamp_valid_bits > 0 {
                 props.limits.timestamp_period

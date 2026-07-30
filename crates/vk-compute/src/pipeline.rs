@@ -21,9 +21,9 @@ impl<'a> From<&'a GpuBuffer> for BufferSlice<'a> {
 }
 
 pub struct ComputePipeline {
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    set_layout: vk::DescriptorSetLayout,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) layout: vk::PipelineLayout,
+    pub(crate) set_layout: vk::DescriptorSetLayout,
     shader_module: vk::ShaderModule,
     num_buffers: u32,
     push_const_size: u32,
@@ -161,6 +161,58 @@ impl VkContext {
             device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             Ok(())
         }
+    }
+
+    /// Records a dispatch whose bindings are already resolved to handles.
+    ///
+    /// The validation `record_dispatch` performs — binding count, push size,
+    /// offset alignment — was done when the op was captured, on the buffers
+    /// themselves. Here there is nothing left to check against: the op holds
+    /// handles, and a handle carries neither a size nor a layout.
+    pub(crate) fn record_dispatch_op(
+        &self,
+        cmd: vk::CommandBuffer,
+        op: &crate::DispatchOp,
+    ) -> Result<()> {
+        let set = self.acquire_descriptor_set(op.set_layout)?;
+        let device = &self.device;
+        unsafe {
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
+                op.bindings.iter().map(|info| [*info]).collect();
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                })
+                .collect();
+            device.update_descriptor_sets(&writes, &[]);
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, op.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                op.layout,
+                0,
+                &[set],
+                &[],
+            );
+            if !op.push.is_empty() {
+                device.cmd_push_constants(
+                    cmd,
+                    op.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &op.push,
+                );
+            }
+            device.cmd_dispatch(cmd, op.groups[0], op.groups[1], op.groups[2]);
+        }
+        Ok(())
     }
 
     /// Synchronous dispatch (test/standalone use): enqueues into the stream and flushes.

@@ -195,6 +195,10 @@ impl VkContext {
                 .cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &[region]);
         }
         state.staging.push(staging);
+        drop(state);
+        self.capture_op(|| {
+            crate::StreamOp::Upload(crate::UploadOp::new(dst.buffer, dst_offset, data))
+        });
         Ok(())
     }
 
@@ -230,6 +234,24 @@ impl VkContext {
         );
         self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
         self.write_timestamp(cmd, &mut state);
+        drop(state);
+        self.capture_op(|| {
+            let bindings = buffers
+                .iter()
+                .map(|b| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(b.buf.buffer)
+                        .offset(b.offset)
+                        .range(vk::WHOLE_SIZE)
+                })
+                .collect();
+            crate::StreamOp::Dispatch(crate::DispatchOp::new(
+                pipeline,
+                bindings,
+                push_constants,
+                groups,
+            ))
+        });
         if let Some(started) = started {
             crate::stats::record_recording(started.elapsed().as_nanos() as u64);
         }
@@ -277,6 +299,104 @@ impl VkContext {
                 .size(bytes);
             self.device
                 .cmd_copy_buffer(cmd, src.buffer, dst.buffer, &[region]);
+        }
+        drop(state);
+        self.capture_op(|| {
+            crate::StreamOp::Copy(crate::CopyOp {
+                src: src.buffer,
+                src_offset,
+                dst: dst.buffer,
+                dst_offset,
+                bytes,
+            })
+        });
+        Ok(())
+    }
+
+    /// Records the ops of the next commands instead of only issuing them.
+    ///
+    /// A capture already in progress is replaced: the caller that opened it is
+    /// the one that closes it, and nesting two would make the inner one steal
+    /// the outer one's commands.
+    pub fn begin_capture(&self) {
+        *self.capture.lock().unwrap() = Some(Vec::new());
+    }
+
+    /// Closes the capture and returns what was recorded, `None` if none was open.
+    pub fn end_capture(&self) -> Option<Vec<crate::StreamOp>> {
+        self.capture.lock().unwrap().take()
+    }
+
+    fn capture_op(&self, build: impl FnOnce() -> crate::StreamOp) {
+        let mut guard = self.capture.lock().unwrap();
+        if let Some(ops) = guard.as_mut() {
+            ops.push(build());
+        }
+    }
+
+    /// Issues captured commands again, in order.
+    ///
+    /// The barriers are the ones the original calls placed, because they are a
+    /// property of the command and not of how it was decided: every dispatch is
+    /// preceded by a full memory barrier, every transfer by a transfer one.
+    ///
+    /// # Safety of the handles
+    ///
+    /// The ops hold `VkBuffer` and `VkPipeline` handles, and nothing here can
+    /// tell whether they still name live objects. See `capture.rs`: keeping
+    /// them alive is the caller's contract.
+    pub fn replay(&self, ops: &[crate::StreamOp]) -> Result<()> {
+        let mut state = self.stream.lock().unwrap();
+        let cmd = self.stream_cmd(&mut state)?;
+        for op in ops {
+            match op {
+                crate::StreamOp::Dispatch(dispatch) => {
+                    crate::stats::record_dispatch_count();
+                    self.stream_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    );
+                    self.record_dispatch_op(cmd, dispatch)?;
+                    self.write_timestamp(cmd, &mut state);
+                }
+                crate::StreamOp::Upload(upload) => {
+                    if upload.bytes.is_empty() {
+                        continue;
+                    }
+                    crate::stats::record_up(upload.bytes.len() as u64);
+                    let mut staging = self.acquire_staging_upload(upload.bytes.len() as u64)?;
+                    staging.write_mapped(&upload.bytes)?;
+                    self.stream_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    unsafe {
+                        let region = vk::BufferCopy::default()
+                            .dst_offset(upload.dst_offset)
+                            .size(upload.bytes.len() as u64);
+                        self.device
+                            .cmd_copy_buffer(cmd, staging.buffer, upload.dst, &[region]);
+                    }
+                    state.staging.push(staging);
+                }
+                crate::StreamOp::Copy(copy) => {
+                    self.stream_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                    );
+                    unsafe {
+                        let region = vk::BufferCopy::default()
+                            .src_offset(copy.src_offset)
+                            .dst_offset(copy.dst_offset)
+                            .size(copy.bytes);
+                        self.device
+                            .cmd_copy_buffer(cmd, copy.src, copy.dst, &[region]);
+                    }
+                }
+            }
         }
         Ok(())
     }

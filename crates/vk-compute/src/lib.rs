@@ -5,6 +5,7 @@
 //! synchronous dispatch with staging upload/readback.
 
 mod buffer;
+mod capture;
 mod context;
 mod descriptor;
 mod pipeline;
@@ -13,6 +14,7 @@ pub mod stats;
 mod stream;
 
 pub use buffer::GpuBuffer;
+pub use capture::{CopyOp, DispatchOp, StreamOp, UploadOp};
 pub use context::{CoopMatU8, VkContext};
 pub use pipeline::{BufferSlice, ComputePipeline};
 pub use shader::compile_wgsl;

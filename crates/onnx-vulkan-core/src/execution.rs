@@ -22,6 +22,8 @@ pub struct ExecutionEnv<'context, 'values> {
     /// Values whose declared shape is the logical tensor while the buffer holds
     /// it with a longer row stride — see `mark_row_padded`.
     row_padded: HashMap<String, usize>,
+    /// Hand this run's buffers back to the pool instead of freeing them.
+    retain: bool,
 }
 
 impl<'context, 'values> ExecutionEnv<'context, 'values> {
@@ -39,6 +41,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             host_cache: RefCell::new(HashMap::new()),
             bound_outputs: HashMap::new(),
             row_padded: HashMap::new(),
+            retain: false,
         }
     }
 
@@ -363,6 +366,18 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         }
     }
 
+    /// Keeps this run's buffers pooled for the next one instead of freeing them.
+    ///
+    /// A decode step allocates the same sizes in the same order as the step
+    /// before it, so a pool that survives the run hands the **same** buffers back
+    /// in the same order — which is what makes a recorded descriptor set still
+    /// valid a token later. The cost is that the working set stays resident
+    /// between steps, which for a generation loop is the point and for a
+    /// one-shot run would be a leak; hence opt-in, set by the cached path.
+    pub fn retain_buffers(&mut self) {
+        self.retain = true;
+    }
+
     /// Releases owned intermediate buffers; borrowed buffers stay with the
     /// host that provided them.
     pub fn finish(mut self) {
@@ -370,6 +385,30 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     }
 
     fn release_owned(&mut self) {
+        if self.retain {
+            // by name, not in `HashMap` order: the pool hands out the last
+            // buffer pushed for a size, so the order these go back in decides
+            // which buffer each request gets next time. `HashMap` iteration is
+            // seeded per instance, so draining it directly would shuffle the
+            // pool differently on every step and the stability this exists for
+            // would not survive the first token.
+            let mut owned: Vec<(String, vk_compute::GpuBuffer)> = self
+                .values
+                .drain()
+                .filter_map(|(name, tensor)| match tensor {
+                    Tensor::Device(DeviceTensor {
+                        buf: DeviceBuffer::Owned(buffer),
+                        ..
+                    }) => Some((name, buffer)),
+                    _ => None,
+                })
+                .collect();
+            owned.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, buffer) in owned {
+                self.context.recycle_storage_buffer(buffer);
+            }
+            return;
+        }
         for (_, tensor) in self.values.drain() {
             if let Tensor::Device(DeviceTensor {
                 buf: DeviceBuffer::Owned(buffer),

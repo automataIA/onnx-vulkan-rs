@@ -20,18 +20,25 @@ pub(crate) struct StagingPool {
 /// best-fit would hand a 98 MB allocation to a request for a few hundred bytes.
 /// Repeated shapes — every layer of a transformer or a CNN produces the same
 /// sizes as the previous one — make the exact match hit anyway.
+/// **First in, first out**, and that is a correctness property for a decode
+/// loop, not a preference. A step asks for the same sizes in the same order as
+/// the step before it; taking from the back hands the requests their buffers in
+/// reverse each time, so a given tensor alternates between two buffers with
+/// period two and a descriptor set recorded on one step points at the wrong
+/// memory on the next. Taking from the front reproduces the previous step's
+/// assignment exactly.
 #[derive(Default)]
 pub(crate) struct StoragePool {
-    free: std::collections::HashMap<u64, Vec<GpuBuffer>>,
+    free: std::collections::HashMap<u64, std::collections::VecDeque<GpuBuffer>>,
 }
 
 impl StoragePool {
     fn take(&mut self, size: u64) -> Option<GpuBuffer> {
-        self.free.get_mut(&size)?.pop()
+        self.free.get_mut(&size)?.pop_front()
     }
 
     fn put(&mut self, buffer: GpuBuffer) {
-        self.free.entry(buffer.size).or_default().push(buffer);
+        self.free.entry(buffer.size).or_default().push_back(buffer);
     }
 
     fn drain(&mut self) -> Vec<GpuBuffer> {

@@ -211,6 +211,7 @@ fn resident(
     let capacity = kvh * MAX_SEQ * H;
     let executor = Executor::new(context, graph(kvh, bias)).expect("executor");
     let mut steps = Vec::new();
+    let mut served = Vec::new();
     for t in 0..STEPS {
         let host = step_inputs(t, kvh, bias);
         let mut inputs: Vec<(&str, Tensor<'_>)> = host
@@ -241,6 +242,15 @@ fn resident(
                 "{name} at step {t} is not the buffer that was bound"
             );
         }
+        // Which buffer served this step's `out`. A step that binds outputs keeps
+        // its buffers pooled instead of freeing them, so the next step's
+        // identical sequence of requests must be served the identical buffers —
+        // the property a recorded descriptor set stands on, asserted here rather
+        // than assumed by whoever records one.
+        let Some(Tensor::Device(tensor)) = outputs.value("out") else {
+            panic!("out is not on the device");
+        };
+        served.push(tensor.buffer().buffer);
         // `out` first: reading it is the flush, so the cache buffers hold this
         // step's tokens by the time they are downloaded
         let out = outputs.host("out").expect("out").to_f32().unwrap();
@@ -255,6 +265,13 @@ fn resident(
         outputs.finish();
         steps.push((out, key, value));
     }
+    // step 0 allocates into an empty pool, so it is the pair after it that says
+    // whether the pool is deterministic
+    assert_eq!(
+        served[1], served[2],
+        "the same request was served a different buffer on the next step, \
+         so a recorded descriptor set would point at the wrong memory"
+    );
     steps
 }
 

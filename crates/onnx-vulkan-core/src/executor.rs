@@ -121,6 +121,11 @@ impl<'context> Executor<'context> {
         bound: Vec<(&str, &'a GpuBuffer, usize)>,
     ) -> Result<Outputs<'a>> {
         let mut env = ExecutionEnv::new(&self.cache, &self.ir.initializers);
+        // a run that binds outputs is a step of a sequence: it will be followed
+        // by another one asking for the same buffers in the same order
+        if !bound.is_empty() {
+            env.retain_buffers();
+        }
         for (name, tensor) in inputs {
             env.set(name, tensor);
         }

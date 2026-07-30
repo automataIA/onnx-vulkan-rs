@@ -371,3 +371,71 @@ fn a_bias_survives_the_padded_score_row() {
 fn a_fully_masked_row_keeps_its_probability_out_of_the_padding() {
     resident_matches_stateless(1, Bias::Masking);
 }
+
+/// A prefill of two tokens: the only shape where the bias has more than one
+/// row, and so the only one where its row stride is observable.
+///
+/// The bias arrives `[b, 1, s, total]` and is uploaded into a buffer laid out
+/// for the whole cache, so that its `VkBuffer` stops changing with the token.
+/// Its rows are then `stride` apart and not `total` apart, and a kernel that
+/// keeps indexing them at `total` reads row 1 out of row 0's padding. Every
+/// other test here decodes one token at a time, where the two indices coincide
+/// and nothing can tell them apart.
+#[test]
+fn the_bias_rows_follow_the_padded_buffer_and_not_the_sequence() {
+    let context: &'static VkContext = Box::leak(Box::new(VkContext::new().expect("Vulkan")));
+    let (kvh, s) = (1usize, 2usize);
+    let executor = Executor::new(context, graph(kvh, Bias::Values)).expect("executor");
+
+    // one prefill step, s = 2: a distinct bias row per query
+    let mut host = step_inputs(0, kvh, Bias::Values);
+    let prefill = |width: usize, seed: usize| {
+        HostTensor::from_f32(vec![1, s as i64, width as i64], &ramp(s * width, seed))
+    };
+    for (name, tensor) in host.iter_mut() {
+        *tensor = match *name {
+            "query" => prefill(NH * H, 1),
+            "key" => prefill(kvh * H, 5),
+            "value" => prefill(kvh * H, 9),
+            "bias" => HostTensor::from_f32(vec![1, 1, s as i64, s as i64], &ramp(s * s, 13)),
+            _ => continue,
+        };
+    }
+    let empty = vec![1, kvh as i64, 0, H as i64];
+    let inputs = |extra: Vec<(&'static str, Tensor<'static>)>| {
+        let mut all: Vec<(&str, Tensor<'_>)> = host
+            .iter()
+            .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone())))
+            .collect();
+        all.extend(extra);
+        all
+    };
+
+    let past = || {
+        vec![
+            ("past_key", Tensor::Host(HostTensor::from_f32(empty.clone(), &[]))),
+            ("past_value", Tensor::Host(HostTensor::from_f32(empty.clone(), &[]))),
+        ]
+    };
+    let stateless = executor.run(inputs(past())).expect("stateless prefill");
+    let want = stateless.host("out").expect("out").to_f32().unwrap();
+    stateless.finish();
+
+    let bytes = (kvh * MAX_SEQ * H * 4) as u64;
+    let key_buf = context.create_storage_buffer(bytes).expect("key cache");
+    let value_buf = context.create_storage_buffer(bytes).expect("value cache");
+    let capacity = kvh * MAX_SEQ * H;
+    let resident = executor
+        .run_with_outputs(
+            inputs(past()),
+            vec![
+                ("present_key", &key_buf, capacity),
+                ("present_value", &value_buf, capacity),
+            ],
+        )
+        .expect("resident prefill");
+    let got = resident.host("out").expect("out").to_f32().unwrap();
+    resident.finish();
+
+    close("out", 0, &want, &got);
+}

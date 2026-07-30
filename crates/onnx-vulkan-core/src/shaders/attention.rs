@@ -221,8 +221,9 @@ pub const SCORES: &str = r#"
 // `total` is this step's key count, `keys` the row extent of the score buffer.
 // They differ against a resident cache, where the scores cover the cache's whole
 // physical extent to keep the grid step-invariant — so `keys` indexes the score
-// row and `total` still indexes the attention bias, which the graph hands over at
-// its own `[b, 1, s, total]` and knows nothing about the padding.
+// row and `total` still indexes the attention bias. The bias buffer is padded to
+// the cache as well, so that its size stops moving with the token, but the
+// padding is all at the end: the rows the graph wrote stay `total` apart.
 struct Push {
     count: u32, nh: u32, kvh: u32, h: u32,
     s: u32, total: u32, past: u32, scale: f32,
@@ -262,7 +263,7 @@ fn main(
     }
     acc = acc * pc.scale;
     if (pc.has_bias != 0u) {
-        // attention bias is [b, 1, s, total]: broadcast over heads
+        // attention bias is [b, 1, s, ·]: broadcast over heads
         acc = acc + bias[(batch * pc.s + sq) * pc.total + t];
     }
     scores[i] = acc;

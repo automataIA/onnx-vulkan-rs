@@ -339,6 +339,59 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         Ok(())
     }
 
+    /// Uploads a host f32 value into a buffer laid out for `capacity` elements.
+    ///
+    /// Same as `ensure_device` except the buffer does not follow the tensor's
+    /// length. A decoder's attention bias is `[b, 1, s, total]` and grows by one
+    /// element per token, so a buffer sized to its shape is a new allocation —
+    /// and a new `VkBuffer` — at every step, which is the one thing a recorded
+    /// descriptor set cannot survive. Sized to the cache's capacity it is the
+    /// same buffer for the whole generation.
+    ///
+    /// The value keeps its own layout inside the buffer — the padding is all at
+    /// the end — and the tail is left as the pool handed it over: the caller is
+    /// the one that knows it is never read, and says so by asking for the
+    /// padding. A value already on device is left alone, at whatever size
+    /// produced it.
+    pub fn ensure_device_padded(&mut self, name: &str, capacity: usize) -> Result<()> {
+        if self.on_device(name) {
+            return Ok(());
+        }
+        let host = self.host(name)?;
+        host.validate()?;
+        if host.dtype != FLOAT {
+            return Err(Error::InvalidTensor(format!(
+                "ensure_device_padded '{name}': dtype {}, expected f32",
+                host.dtype
+            )));
+        }
+        if host.elem_count() > capacity {
+            return Err(Error::InvalidTensor(format!(
+                "ensure_device_padded '{name}': {} elements do not fit a capacity of {capacity}",
+                host.elem_count()
+            )));
+        }
+        let buffer = self
+            .context
+            .create_storage_buffer(device_storage_bytes(FLOAT, capacity.max(1))?)
+            .map_err(backend_error)?;
+        if !host.data.is_empty() {
+            self.context
+                .stream_upload(&buffer, &host.data)
+                .map_err(backend_error)?;
+        }
+        self.set(
+            name,
+            Tensor::Device(DeviceTensor {
+                dtype: FLOAT,
+                shape: host.shape.clone(),
+                elem_count: host.elem_count(),
+                buf: DeviceBuffer::Owned(buffer),
+            }),
+        );
+        Ok(())
+    }
+
     pub fn set(&mut self, name: &str, tensor: Tensor<'values>) {
         self.values.insert(name.to_owned(), tensor);
         self.host_cache.borrow_mut().remove(name);

@@ -260,3 +260,8 @@ pub fn dump_and_reset() {
         pool_hits,
     );
 }
+
+/// Storage-buffer allocations so far (probe hook, see interp's ALLOC_PROBE).
+pub fn allocs() -> u64 {
+    ALLOCS.load(Ordering::Relaxed)
+}

@@ -435,8 +435,20 @@ pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
 
 fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
     let dead = dead_after(ir);
+    let probe = std::env::var_os("ALLOC_PROBE").is_some();
     for (index, node) in ir.nodes.iter().enumerate() {
+        let before = probe.then(vk_compute::stats::allocs);
         exec_node(env, node)?;
+        if let Some(before) = before {
+            let delta = vk_compute::stats::allocs() - before;
+            if delta > 0 {
+                let shape = env.shape_of(&node.outputs[0]).unwrap_or_default();
+                eprintln!(
+                    "ALLOC {delta} {} '{}' out {} {shape:?}",
+                    node.op, node.name, node.outputs[0]
+                );
+            }
+        }
         for name in &dead[index] {
             env.release(name);
         }
@@ -4093,6 +4105,29 @@ fn rotary_embedding(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// every sequence in the batch has the same length. That holds trivially at
 /// `b = 1` and cannot be checked without a readback otherwise, so `b > 1` is
 /// refused rather than guessed.
+/// Elements an attention bias must cover to stay the same buffer across a
+/// generation: the bound cache's physical time extent, one row per query.
+///
+/// `None` when the cache is not bound — a stateless run rebuilds it at the
+/// step's own length, where the bias already has the right size.
+fn bias_capacity(env: &Env<'_, '_>, node: &NodeIr) -> Result<Option<usize>> {
+    let Some((_, cap)) = env.bound_output(&node.outputs[1]) else {
+        return Ok(None);
+    };
+    let past = env.device(&node.inputs[3])?;
+    let query = env.device(&node.inputs[0])?;
+    if past.shape.len() != 4 || query.shape.len() != 3 {
+        return Ok(None);
+    }
+    let b = past.shape[0].max(0) as usize;
+    let row = b * past.shape[1].max(0) as usize * past.shape[3].max(0) as usize;
+    let s = query.shape[1].max(0) as usize;
+    if row == 0 {
+        return Ok(None);
+    }
+    Ok(Some(b * s * (cap / row)))
+}
+
 fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> Result<()> {
     let int_attr = |name: &str, default: i64| {
         node.attrs
@@ -4118,8 +4153,21 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
         env.ensure_device(&node.inputs[7])?;
         env.ensure_device(&node.inputs[8])?;
     }
+    // The bias is `[b, 1, s, total]` and gains one element per token, so a
+    // buffer sized to it is a fresh allocation — and a fresh `VkBuffer` — at
+    // every decode step: the last value in a decoder whose identity moves.
+    // Against a bound cache it goes into a buffer laid out for the cache's whole
+    // physical extent instead. The rows stay where the graph put them, `total`
+    // apart, so nothing about the addressing changes; the padding is all at the
+    // end, past the last key, and `GQA_scores` masks every key at or past this
+    // step's length before it ever reads the bias.
     if has_bias {
-        env.ensure_device(&node.inputs[10])?;
+        match bias_capacity(env, node)? {
+            Some(capacity) => {
+                env.ensure_device_padded(&node.inputs[10], capacity)?;
+            }
+            None => env.ensure_device(&node.inputs[10])?,
+        }
     }
 
     let q = env.device(&node.inputs[0])?;

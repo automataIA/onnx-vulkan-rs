@@ -41,6 +41,12 @@ impl StoragePool {
         self.free.entry(buffer.size).or_default().push_back(buffer);
     }
 
+    fn canonicalize(&mut self) {
+        for list in self.free.values_mut() {
+            list.make_contiguous().sort_by_key(|buffer| buffer.id);
+        }
+    }
+
     fn drain(&mut self) -> Vec<GpuBuffer> {
         self.free.drain().flat_map(|(_, list)| list).collect()
     }
@@ -49,6 +55,17 @@ impl StoragePool {
 pub struct GpuBuffer {
     pub buffer: vk::Buffer,
     pub size: u64,
+    /// Identity, assigned once when the buffer is created and never reused.
+    ///
+    /// A decode step must be served the same buffers, in the same order, as the
+    /// step before it, or a recorded binding points at the wrong memory. FIFO
+    /// alone does not give that: a step acquires and releases in different
+    /// orders — a kernel frees its scratch before the graph frees the kernel's
+    /// input — so the queue comes out of a step permuted, and two live tensors
+    /// of the same size swap buffers with period two. The identity is what
+    /// `reset_pool_order` sorts by, so that every step starts from the same
+    /// pool and the same sequence of requests gets the same answers.
+    id: u64,
     allocation: Option<Allocation>,
     /// Device-local tensor buffer, and so counted in the VRAM statistics —
     /// staging buffers live in host memory and are not.
@@ -56,6 +73,11 @@ pub struct GpuBuffer {
 }
 
 impl GpuBuffer {
+    /// This buffer's identity, see the field.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Writes to mapped bytes (host-visible buffers only).
     pub(crate) fn write_mapped(&mut self, data: &[u8]) -> Result<()> {
         self.allocation
@@ -110,6 +132,7 @@ impl VkContext {
         Ok(GpuBuffer {
             buffer,
             size,
+            id: self.next_id(),
             allocation: Some(allocation),
             storage: false,
         })
@@ -134,6 +157,21 @@ impl VkContext {
         Ok(buffer)
     }
 
+    fn next_id(&self) -> u64 {
+        self.buffer_serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Puts every free buffer back in a canonical order.
+    ///
+    /// Called at the start of a step that has to be served exactly like the one
+    /// before it. Within a step the pool is a queue and the order of requests
+    /// decides everything; between steps the queue is left permuted by the
+    /// interleaving of acquisitions and releases, and this undoes that.
+    pub fn reset_pool_order(&self) {
+        self.storage_pool.lock().unwrap().canonicalize();
+    }
+
     /// Returns a storage buffer to the pool instead of destroying it.
     ///
     /// Safe while the command buffer is open: every dispatch and every copy in
@@ -155,6 +193,15 @@ impl VkContext {
         for buffer in buffers {
             self.defer_destroy(buffer);
         }
+    }
+
+    /// Hands the free buffers to the caller, leaving the pool empty.
+    ///
+    /// Unlike `drain_storage_pool` these are not destroyed: the caller becomes
+    /// their owner, which is how a replay plan keeps the buffers its bindings
+    /// name out of everyone else's reach.
+    pub fn take_storage_pool(&self) -> Vec<GpuBuffer> {
+        self.storage_pool.lock().unwrap().drain()
     }
 
     /// Empties the pool (called on context destruction).

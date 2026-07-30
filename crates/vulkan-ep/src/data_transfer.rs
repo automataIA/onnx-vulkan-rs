@@ -163,7 +163,7 @@ unsafe fn copy_tensors(
             (D::OrtMemoryInfoDeviceType_CPU, D::OrtMemoryInfoDeviceType_GPU) => {
                 let dst = unsafe { region_from_ptr(dst_ptr)? };
                 let data = unsafe { std::slice::from_raw_parts(src_ptr.cast::<u8>(), bytes) };
-                ctx.stream_upload_at(dst.buffer(), dst.offset, data)?;
+                ctx.stream_upload_at(dst.buffer(), dst.offset, data, None)?;
             }
             (D::OrtMemoryInfoDeviceType_GPU, D::OrtMemoryInfoDeviceType_CPU) => {
                 let src = unsafe { region_from_ptr(src_ptr)? };

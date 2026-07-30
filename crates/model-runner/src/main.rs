@@ -378,8 +378,7 @@ fn load_reference(dir: &Path, session: &Session) -> Result<Reference> {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes =
-            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(Some((path.display().to_string(), bytes)))
     };
 
@@ -600,7 +599,9 @@ fn kv_pairs(session: &Session) -> Vec<(String, String)> {
         .filter_map(|out| {
             let suffix = out.name.strip_prefix("present")?;
             let name = format!("past_key_values{suffix}");
-            inputs.contains(&name.as_str()).then_some((out.name.clone(), name))
+            inputs
+                .contains(&name.as_str())
+                .then_some((out.name.clone(), name))
         })
         .collect()
 }
@@ -670,11 +671,7 @@ fn decode_loop(
     }
     let cached: Vec<&str> = pairs.iter().map(|(_, to)| to.as_str()).collect();
     let seq = args.dims.get("sequence_length").copied().unwrap_or(1);
-    let mut past = args
-        .dims
-        .get("past_sequence_length")
-        .copied()
-        .unwrap_or(0);
+    let mut past = args.dims.get("past_sequence_length").copied().unwrap_or(0);
     println!(
         "decode: {} steps of {seq} token(s), cache from {past} to {}, {} tensors fed back",
         args.decode,
@@ -738,7 +735,11 @@ fn decode_loop(
                     println!("  {name}: different lengths ({} vs {})", a.len(), b.len());
                     return (0.0, 1);
                 }
-                let diff = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+                let diff = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f64::max);
                 let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
                 let bad = a
                     .iter()
@@ -767,11 +768,19 @@ fn compare(label: &str, a: &Outputs, b: &Outputs, tol: f64, rtol: f64) -> (f64, 
     let (mut worst, mut total_mismatches) = (0.0f64, 0usize);
     for ((name, x), (_, y)) in a.iter().zip(b) {
         if x.len() != y.len() {
-            println!("  {label} {name}: different lengths ({} vs {})", x.len(), y.len());
+            println!(
+                "  {label} {name}: different lengths ({} vs {})",
+                x.len(),
+                y.len()
+            );
             total_mismatches += 1;
             continue;
         }
-        let diff = x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+        let diff = x
+            .iter()
+            .zip(y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0, f64::max);
         let scale = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let rel = if scale > 0.0 { diff / scale } else { 0.0 };
         let mismatches = x
@@ -903,7 +912,7 @@ fn main() -> Result<()> {
                     args.fill.get(&input.name).copied(),
                     &mut rng,
                 )
-                    .with_context(|| format!("input '{}'", input.name))?;
+                .with_context(|| format!("input '{}'", input.name))?;
                 let ValueType::Tensor { shape, .. } = value.dtype() else {
                     unreachable!("make_input produces tensors")
                 };
@@ -968,9 +977,12 @@ fn main() -> Result<()> {
         let (out, times) = run_standalone(&args.model, &inputs, args.iters)?;
         let (ms, min, max) = steady(&times);
         println!("standalone: {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
-        let (rel_ep, mismatches) = compare("standalone vs EP  ", &vk_out, &out, args.tol, args.rtol);
+        let (rel_ep, mismatches) =
+            compare("standalone vs EP  ", &vk_out, &out, args.tol, args.rtol);
         let (rel_cpu, _) = compare("standalone vs CPU ", &cpu_out, &out, args.tol, args.rtol);
-        println!("parity: standalone vs EP relative={rel_ep:.2e}, vs CPU EP relative={rel_cpu:.2e}");
+        println!(
+            "parity: standalone vs EP relative={rel_ep:.2e}, vs CPU EP relative={rel_cpu:.2e}"
+        );
         // the two hosts run the same kernels: a divergence here is ours
         failed |= mismatches > 0;
         Some(out)

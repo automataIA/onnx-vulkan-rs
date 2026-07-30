@@ -245,7 +245,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             .map_err(backend_error)?;
         if !host.data.is_empty() {
             self.context
-                .stream_upload(&buffer, &host.data)
+                .stream_upload_labeled(&buffer, &host.data, name)
                 .map_err(backend_error)?;
         }
         self.set(
@@ -334,7 +334,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 host.dtype
             )));
         }
-        let tensor = upload_float(self.context, &host.shape, &host.data)?;
+        let tensor = upload_float(self.context, &host.shape, &host.data, name)?;
         self.set(name, Tensor::Device(tensor));
         Ok(())
     }
@@ -377,7 +377,7 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             .map_err(backend_error)?;
         if !host.data.is_empty() {
             self.context
-                .stream_upload(&buffer, &host.data)
+                .stream_upload_labeled(&buffer, &host.data, name)
                 .map_err(backend_error)?;
         }
         self.set(
@@ -390,6 +390,16 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             }),
         );
         Ok(())
+    }
+
+    /// Forgets the host copies memoized by `host`.
+    ///
+    /// The memo is keyed by name and assumes a value is written once, which
+    /// holds inside a run. A replayed step writes new data into the very same
+    /// buffers under the very same names, so at a step boundary every memo is
+    /// a copy of the previous token's answer.
+    pub fn forget_host_cache(&mut self) {
+        self.host_cache.borrow_mut().clear();
     }
 
     pub fn set(&mut self, name: &str, tensor: Tensor<'values>) {
@@ -439,25 +449,24 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
 
     fn release_owned(&mut self) {
         if self.retain {
-            // by name, not in `HashMap` order: the pool hands out the last
-            // buffer pushed for a size, so the order these go back in decides
-            // which buffer each request gets next time. `HashMap` iteration is
-            // seeded per instance, so draining it directly would shuffle the
-            // pool differently on every step and the stability this exists for
-            // would not survive the first token.
-            let mut owned: Vec<(String, vk_compute::GpuBuffer)> = self
+            // By buffer identity, not in `HashMap` order: iteration order is
+            // seeded per instance, so draining directly would return the
+            // buffers differently on every step. Which order in particular does
+            // not matter — `reset_pool_order` canonicalizes the pool at the
+            // start of the next step — only that it is the same one every time.
+            let mut owned: Vec<vk_compute::GpuBuffer> = self
                 .values
                 .drain()
-                .filter_map(|(name, tensor)| match tensor {
+                .filter_map(|(_, tensor)| match tensor {
                     Tensor::Device(DeviceTensor {
                         buf: DeviceBuffer::Owned(buffer),
                         ..
-                    }) => Some((name, buffer)),
+                    }) => Some(buffer),
                     _ => None,
                 })
                 .collect();
-            owned.sort_by(|a, b| a.0.cmp(&b.0));
-            for (_, buffer) in owned {
+            owned.sort_by_key(|buffer| buffer.id());
+            for buffer in owned {
                 self.context.recycle_storage_buffer(buffer);
             }
             return;
@@ -496,14 +505,19 @@ pub fn device_storage_bytes(dtype: i32, element_count: usize) -> Result<u64> {
         .map_err(|_| Error::InvalidTensor("buffer size not representable".into()))
 }
 
-fn upload_float(context: &VkContext, shape: &[i64], bytes: &[u8]) -> Result<DeviceTensor<'static>> {
+fn upload_float(
+    context: &VkContext,
+    shape: &[i64],
+    bytes: &[u8],
+    label: &str,
+) -> Result<DeviceTensor<'static>> {
     let element_count = bytes.len() / elem_size(FLOAT);
     let buffer = context
         .create_storage_buffer(device_storage_bytes(FLOAT, element_count)?)
         .map_err(backend_error)?;
     if !bytes.is_empty() {
         context
-            .stream_upload(&buffer, bytes)
+            .stream_upload_labeled(&buffer, bytes, label)
             .map_err(backend_error)?;
     }
     Ok(DeviceTensor {

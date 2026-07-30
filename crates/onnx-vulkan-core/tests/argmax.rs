@@ -125,7 +125,10 @@ fn a_classifier_row_stays_in_one_workgroup() {
 fn a_repeated_maximum_answers_its_first_index() {
     let flat = vec![0.5f32; 4096];
     let (got, _) = run(
-        &graph(node(&[("keepdims", AttrValue::Int(0)), ("axis", AttrValue::Int(0))])),
+        &graph(node(&[
+            ("keepdims", AttrValue::Int(0)),
+            ("axis", AttrValue::Int(0)),
+        ])),
         HostTensor::from_f32(vec![4096], &flat),
     );
     assert_eq!(got, vec![0], "all equal: the first index wins");
@@ -134,7 +137,10 @@ fn a_repeated_maximum_answers_its_first_index() {
     twice[700] = 3.0;
     twice[3000] = 3.0;
     let (got, _) = run(
-        &graph(node(&[("keepdims", AttrValue::Int(0)), ("axis", AttrValue::Int(0))])),
+        &graph(node(&[
+            ("keepdims", AttrValue::Int(0)),
+            ("axis", AttrValue::Int(0)),
+        ])),
         HostTensor::from_f32(vec![4096], &twice),
     );
     assert_eq!(got, vec![700], "two maxima: the earlier one");
@@ -171,7 +177,11 @@ fn an_integer_input_goes_host_side() {
         HostTensor::from_i64(vec![2, 4], &x),
     );
     assert_eq!(out_shape, vec![2]);
-    assert_eq!(got, vec![1, 3], "row 0 ties at 1 and 3; row 1 max is 7 at 3");
+    assert_eq!(
+        got,
+        vec![1, 3],
+        "row 0 ties at 1 and 3; row 1 max is 7 at 3"
+    );
 }
 
 /// `select_last_index = 1` asks for the other index of a tie, which this kernel

@@ -61,6 +61,8 @@ pub struct VkContext {
     /// `capture.rs`). `None` when nothing is being captured, which is the
     /// steady state: the check is one uncontended lock per command.
     pub(crate) capture: Mutex<Option<Vec<crate::StreamOp>>>,
+    /// Hands each storage buffer an order of issue (see `GpuBuffer::serial`).
+    pub(crate) buffer_serial: std::sync::atomic::AtomicU64,
 }
 
 /// Timestamp slot in profiling query pool.
@@ -234,6 +236,7 @@ impl VkContext {
             stream: Mutex::new(Default::default()),
             descriptors: Mutex::new(Default::default()),
             capture: Mutex::new(None),
+            buffer_serial: std::sync::atomic::AtomicU64::new(0),
             // timestampValidBits==0 → timestamps not reliable on this queue
             timestamp_period: if timestamp_valid_bits > 0 {
                 props.limits.timestamp_period

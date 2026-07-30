@@ -111,10 +111,8 @@ fn decode(
         // would attribute its VRAM to the resident one
         if !oracle {
             let started = Instant::now();
-            let mut run = session.run_cached(
-                shared.iter().map(|(n, t)| (n.as_str(), t.clone())),
-                &cache,
-            )?;
+            let mut run =
+                session.run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
             // `--greedy 1` is what a generation loop does: the logits are
             // reduced where they are and only the token index is downloaded
             let mut picked = Vec::new();
@@ -170,10 +168,8 @@ fn decode(
         vk_compute::stats::dump_and_reset();
 
         let resident = Instant::now();
-        let mut run = session.run_cached(
-            shared.iter().map(|(n, t)| (n.as_str(), t.clone())),
-            &cache,
-        )?;
+        let mut run =
+            session.run_cached(shared.iter().map(|(n, t)| (n.as_str(), t.clone())), &cache)?;
         let got: Vec<Vec<f32>> = logits
             .iter()
             .map(|name| Ok(run.get(name)?.to_f32()?))
@@ -209,7 +205,9 @@ fn decode(
         let mut worst = 0.0f32;
         for (name, (want, got)) in logits.iter().zip(want.iter().zip(&got)) {
             if want.len() != got.len() {
-                return Err(format!("{name}: {} values, expected {}", got.len(), want.len()).into());
+                return Err(
+                    format!("{name}: {} values, expected {}", got.len(), want.len()).into(),
+                );
             }
             worst = want
                 .iter()

@@ -110,7 +110,7 @@ unsafe fn compute_impl(kernel: &MemcpyKernel, ctx_ptr: *mut sys::OrtKernelContex
                 // input: CPU data; output: device region
                 let dst = region_from_ptr(out_data.cast_const())?;
                 let src = std::slice::from_raw_parts(view.data, bytes);
-                ctx.stream_upload_at(dst.buffer(), dst.offset, src)?;
+                ctx.stream_upload_at(dst.buffer(), dst.offset, src, None)?;
             }
             Direction::ToHost => {
                 // input: device region; output: CPU data → flush

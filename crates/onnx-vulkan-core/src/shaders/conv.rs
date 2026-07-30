@@ -319,9 +319,9 @@ fn main(
     }
 }
 "#
-    .replace("{batch}", batch)
-    .replace("{bounds}", bounds)
-    .replace("{store}", store)
+        .replace("{batch}", batch)
+        .replace("{bounds}", bounds)
+        .replace("{store}", store)
     )
 }
 

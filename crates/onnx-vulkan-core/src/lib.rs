@@ -12,6 +12,7 @@ pub mod fusion;
 pub mod graph;
 pub mod host_ops;
 pub mod interp;
+pub mod plan;
 pub mod rewrite;
 pub mod shaders;
 pub mod shape;
@@ -29,5 +30,6 @@ pub use graph::{
 };
 pub use host_ops::HostTensor;
 pub use interp::{argmax_of, execute, is_implemented, is_implemented_node};
+pub use plan::{StepPlan, StepTrace};
 pub use rewrite::{fold_constants, fuse_layernorm, prune_dead_initializers, prune_dead_nodes};
 pub use shape::{Broadcast, broadcast, element_count};

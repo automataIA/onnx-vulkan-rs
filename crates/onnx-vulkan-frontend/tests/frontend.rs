@@ -199,8 +199,8 @@ fn a_file_that_is_not_a_model_is_refused() {
 /// reference is again the ONNX implementation, not our own reading of the spec.
 #[test]
 fn inferred_shapes_agree_with_onnx_shape_inference() {
-    let model = onnx_vulkan_frontend::load(models().join("shapes.onnx"))
-        .expect("loading shapes.onnx");
+    let model =
+        onnx_vulkan_frontend::load(models().join("shapes.onnx")).expect("loading shapes.onnx");
     assert!(
         model.conflicts.is_empty(),
         "divergences from ONNX shape inference: {:?}",

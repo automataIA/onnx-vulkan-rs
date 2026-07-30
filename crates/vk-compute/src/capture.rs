@@ -48,6 +48,15 @@ pub struct UploadOp {
     pub(crate) dst: vk::Buffer,
     pub(crate) dst_offset: u64,
     pub bytes: Vec<u8>,
+    /// What was uploaded, when the caller knew a name for it.
+    ///
+    /// A replay has to refresh the payloads that change from token to token —
+    /// the mask, the positions — and refreshing means asking whoever owns the
+    /// values for the current bytes of *this* one. Guessing the value from the
+    /// node that issued the upload does not work: a node uploads several of its
+    /// inputs and they are indistinguishable once they are bytes. So the label
+    /// is attached where the name is still in hand.
+    pub label: Option<String>,
 }
 
 /// A device→device copy. Nothing in it varies with the step.
@@ -100,11 +109,20 @@ impl StreamOp {
     }
 
     /// A one-line description, for the message a rejected plan prints.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> String {
         match self {
-            StreamOp::Dispatch(_) => "dispatch",
-            StreamOp::Upload(_) => "upload",
-            StreamOp::Copy(_) => "copy",
+            StreamOp::Dispatch(op) => format!(
+                "dispatch of {:?} on {:?}",
+                op.groups,
+                op.bindings.iter().map(|b| b.buffer).collect::<Vec<_>>()
+            ),
+            StreamOp::Upload(op) => format!(
+                "upload of {} bytes into {:?} ({})",
+                op.bytes.len(),
+                op.dst,
+                op.label.as_deref().unwrap_or("unnamed")
+            ),
+            StreamOp::Copy(op) => format!("copy of {} bytes {:?}->{:?}", op.bytes, op.src, op.dst),
         }
     }
 }
@@ -128,11 +146,12 @@ impl DispatchOp {
 }
 
 impl UploadOp {
-    pub(crate) fn new(dst: vk::Buffer, dst_offset: u64, bytes: &[u8]) -> Self {
+    pub(crate) fn new(dst: vk::Buffer, dst_offset: u64, bytes: &[u8], label: Option<&str>) -> Self {
         Self {
             dst,
             dst_offset,
             bytes: bytes.to_vec(),
+            label: label.map(str::to_owned),
         }
     }
 }

@@ -25,7 +25,8 @@
 
 use onnx_vulkan_core::host_ops::HostTensor;
 use onnx_vulkan_core::{
-    AttrValue, DeviceBuffer, DeviceTensor, Executor, GraphIr, NodeIr, Tensor, host_ops,
+    AttrValue, DeviceBuffer, DeviceTensor, Executor, GraphIr, NodeIr, Outputs, StepPlan, Tensor,
+    host_ops,
 };
 use std::collections::HashMap;
 use vk_compute::{GpuBuffer, VkContext};
@@ -167,7 +168,10 @@ fn stateless(
         let host = step_inputs(t, kvh, bias);
         let cache_shape = vec![1, kvh as i64, t as i64, H as i64];
         let past = [
-            ("past_key", HostTensor::from_f32(cache_shape.clone(), &past_k)),
+            (
+                "past_key",
+                HostTensor::from_f32(cache_shape.clone(), &past_k),
+            ),
             ("past_value", HostTensor::from_f32(cache_shape, &past_v)),
         ];
         let bound: Vec<(&str, Tensor<'_>)> = host
@@ -413,8 +417,14 @@ fn the_bias_rows_follow_the_padded_buffer_and_not_the_sequence() {
 
     let past = || {
         vec![
-            ("past_key", Tensor::Host(HostTensor::from_f32(empty.clone(), &[]))),
-            ("past_value", Tensor::Host(HostTensor::from_f32(empty.clone(), &[]))),
+            (
+                "past_key",
+                Tensor::Host(HostTensor::from_f32(empty.clone(), &[])),
+            ),
+            (
+                "past_value",
+                Tensor::Host(HostTensor::from_f32(empty.clone(), &[])),
+            ),
         ]
     };
     let stateless = executor.run(inputs(past())).expect("stateless prefill");
@@ -438,4 +448,117 @@ fn the_bias_rows_follow_the_padded_buffer_and_not_the_sequence() {
     resident.finish();
 
     close("out", 0, &want, &got);
+}
+
+/// The same decode loop, driven by a plan instead of by the interpreter.
+///
+/// Three steps are captured and turned into a `StepPlan`; every step after
+/// that issues its commands from the plan alone — the graph is not walked, no
+/// kernel decides anything — and must still agree with the stateless oracle.
+/// The interesting steps are therefore the replayed ones: if the plan carried
+/// the captured token's cache length, or bound the captured token's buffers,
+/// the numbers would drift exactly there and nowhere earlier.
+#[test]
+fn a_planned_step_agrees_with_the_step_the_interpreter_would_have_run() {
+    const RUN: usize = 7;
+    let context: &'static VkContext = Box::leak(Box::new(VkContext::new().expect("Vulkan")));
+    let kvh = 1;
+    let bytes = (kvh * MAX_SEQ * H * 4) as u64;
+    let key_buf = context.create_storage_buffer(bytes).expect("key cache");
+    let value_buf = context.create_storage_buffer(bytes).expect("value cache");
+    let capacity = kvh * MAX_SEQ * H;
+    let executor = Executor::new(context, graph(kvh, Bias::Values)).expect("executor");
+
+    let want = stateless_steps(context, kvh, Bias::Values, RUN);
+
+    // The captured steps have to be steps 1.., not step 0: the first token of a
+    // decode loop warms the pool, so its buffers are not the ones the steps
+    // after it are served.
+    let mut traces = Vec::new();
+    let mut held: Option<(Outputs<'_>, StepPlan)> = None;
+    let mut got = Vec::new();
+    for t in 0..RUN {
+        let host = step_inputs(t, kvh, Bias::Values);
+        let mut inputs: Vec<(&str, Tensor<'_>)> = host
+            .iter()
+            .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone())))
+            .collect();
+        if let Some((outputs, plan)) = held.as_mut() {
+            executor
+                .replay_step(plan, t as i64, outputs.env_mut(), inputs)
+                .expect("replayed step");
+            got.push(outputs.host("out").expect("out").to_f32().unwrap());
+            continue;
+        }
+        inputs.push(("past_key", past_view(&key_buf, t, kvh)));
+        inputs.push(("past_value", past_view(&value_buf, t, kvh)));
+        let bound = vec![
+            ("present_key", &key_buf, capacity),
+            ("present_value", &value_buf, capacity),
+        ];
+        let (outputs, trace) = executor
+            .run_traced(inputs, bound)
+            .expect("captured resident step");
+        got.push(outputs.host("out").expect("out").to_f32().unwrap());
+        traces.push(trace);
+        if traces.len() == 4 {
+            // step 0 is not part of the plan: it warms the pool, so it is
+            // served different buffers from every step after it. The plan is
+            // built on steps 1, 2 and 3 — and it says so by rejecting step 0
+            // outright if it is included.
+            let mut plan = StepPlan::build(executor.graph(), &traces[1..], 1)
+                .expect("the three captured steps agree on a plan");
+            plan.hold_pool(context);
+            held = Some((outputs, plan));
+        } else {
+            outputs.finish();
+        }
+    }
+
+    for (step, (w, g)) in want.iter().zip(&got).enumerate() {
+        close("out", step, w, g);
+    }
+    let (outputs, plan) = held.expect("a plan");
+    outputs.finish();
+    plan.release(context);
+}
+
+/// The stateless oracle, for an arbitrary number of steps.
+fn stateless_steps(
+    context: &'static VkContext,
+    kvh: usize,
+    bias: Bias,
+    steps: usize,
+) -> Vec<Vec<f32>> {
+    let executor = Executor::new(context, graph(kvh, bias)).expect("executor");
+    let mut past_k: Vec<f32> = Vec::new();
+    let mut past_v: Vec<f32> = Vec::new();
+    let mut outs = Vec::new();
+    for t in 0..steps {
+        let host = step_inputs(t, kvh, bias);
+        let cache_shape = vec![1, kvh as i64, t as i64, H as i64];
+        let mut inputs: Vec<(&str, Tensor<'_>)> = host
+            .iter()
+            .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone())))
+            .collect();
+        let past = [
+            (
+                "past_key",
+                HostTensor::from_f32(cache_shape.clone(), &past_k),
+            ),
+            ("past_value", HostTensor::from_f32(cache_shape, &past_v)),
+        ];
+        inputs.extend(
+            past.iter()
+                .map(|(name, tensor)| (*name, Tensor::Host(tensor.clone()))),
+        );
+        let outputs = executor.run(inputs).expect("stateless run");
+        let read = |name: &str| outputs.host(name).expect(name).to_f32().unwrap();
+        let (out, key, value) = (read("out"), read("present_key"), read("present_value"));
+        outputs.finish();
+        past_k = key;
+        past_v = value;
+        outs.push(out);
+    }
+    outs
 }

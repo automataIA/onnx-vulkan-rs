@@ -430,7 +430,12 @@ fn geometry(ctx: &VkContext, k: usize, n: usize, label: &str) -> Result<(f64, Ve
     let tb = bench(&|reps| {
         let t = Instant::now();
         for _ in 0..reps {
-            ctx.stream_dispatch(&pipe, &[&a_buf, &q_buf, &s_buf, &z_buf, &out_ref], &pc, grid)?;
+            ctx.stream_dispatch(
+                &pipe,
+                &[&a_buf, &q_buf, &s_buf, &z_buf, &out_ref],
+                &pc,
+                grid,
+            )?;
         }
         ctx.flush()?;
         Ok(t.elapsed().as_secs_f64() / reps as f64)
@@ -472,7 +477,12 @@ fn geometry(ctx: &VkContext, k: usize, n: usize, label: &str) -> Result<(f64, Ve
         let t = bench(&|reps| {
             let t = Instant::now();
             for _ in 0..reps {
-                ctx.stream_dispatch(&pipe, &[&a_buf, &q_buf, &s_buf, &z_buf, &out_got], &pc, grid)?;
+                ctx.stream_dispatch(
+                    &pipe,
+                    &[&a_buf, &q_buf, &s_buf, &z_buf, &out_got],
+                    &pc,
+                    grid,
+                )?;
             }
             ctx.flush()?;
             Ok(t.elapsed().as_secs_f64() / reps as f64)

@@ -16,7 +16,12 @@ use std::collections::HashMap;
 use vk_compute::VkContext;
 
 /// Packs `[n][k]` nibbles into `[N, n_blocks, block_size/2]` bytes.
-fn pack_weights(n: usize, k: usize, block_size: usize, nibble: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+fn pack_weights(
+    n: usize,
+    k: usize,
+    block_size: usize,
+    nibble: impl Fn(usize, usize) -> u8,
+) -> Vec<u8> {
     let n_blocks = k.div_ceil(block_size);
     let mut out = vec![0u8; n * n_blocks * block_size / 2];
     for col in 0..n {
@@ -77,7 +82,8 @@ fn run_case(case: Case) {
             let mut acc = 0.0;
             for kk in 0..k {
                 let b = kk / block_size;
-                let w = (f32::from(nibble(col, kk)) - f32::from(zero_point(col, b))) * scale(col, b);
+                let w =
+                    (f32::from(nibble(col, kk)) - f32::from(zero_point(col, b))) * scale(col, b);
                 acc += a[row * k + kk] * w;
             }
             want[row * n + col] = acc;

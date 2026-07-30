@@ -240,7 +240,11 @@ mod tests {
     #[test]
     fn the_split_is_bounded_on_both_sides() {
         assert_eq!(super::splits(1, 151936), 149, "one long row: fill the grid");
-        assert_eq!(super::splits(1, 1000), 1, "a classifier row is one workgroup");
+        assert_eq!(
+            super::splits(1, 1000),
+            1,
+            "a classifier row is one workgroup"
+        );
         assert_eq!(super::splits(4096, 8), 1, "many rows already fill it");
         assert_eq!(super::splits(0, 0), 1);
     }

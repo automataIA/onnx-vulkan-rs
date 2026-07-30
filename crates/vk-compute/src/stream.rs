@@ -158,11 +158,23 @@ impl VkContext {
 
     /// Upload enqueued into the stream (no submit).
     pub fn stream_upload(&self, dst: &GpuBuffer, data: &[u8]) -> Result<()> {
-        self.stream_upload_at(dst, 0, data)
+        self.stream_upload_at(dst, 0, data, None)
+    }
+
+    /// Upload of a value that has a name, which a capture keeps so a replay can
+    /// refresh the payload from the same value at the next step.
+    pub fn stream_upload_labeled(&self, dst: &GpuBuffer, data: &[u8], label: &str) -> Result<()> {
+        self.stream_upload_at(dst, 0, data, Some(label))
     }
 
     /// Upload into a target buffer **region**.
-    pub fn stream_upload_at(&self, dst: &GpuBuffer, dst_offset: u64, data: &[u8]) -> Result<()> {
+    pub fn stream_upload_at(
+        &self,
+        dst: &GpuBuffer,
+        dst_offset: u64,
+        data: &[u8],
+        label: Option<&str>,
+    ) -> Result<()> {
         anyhow::ensure!(
             dst_offset + data.len() as u64 <= dst.size,
             "upload out of bounds: {dst_offset}+{} on {}",
@@ -197,7 +209,7 @@ impl VkContext {
         state.staging.push(staging);
         drop(state);
         self.capture_op(|| {
-            crate::StreamOp::Upload(crate::UploadOp::new(dst.buffer, dst_offset, data))
+            crate::StreamOp::Upload(crate::UploadOp::new(dst.buffer, dst_offset, data, label))
         });
         Ok(())
     }
@@ -325,6 +337,14 @@ impl VkContext {
     /// Closes the capture and returns what was recorded, `None` if none was open.
     pub fn end_capture(&self) -> Option<Vec<crate::StreamOp>> {
         self.capture.lock().unwrap().take()
+    }
+
+    /// How many commands the open capture holds, `None` if none is open.
+    ///
+    /// A caller that walks a graph uses it to record which ops each node
+    /// produced, which is what lets a plan re-run one node and replay another.
+    pub fn capture_len(&self) -> Option<usize> {
+        self.capture.lock().unwrap().as_ref().map(Vec::len)
     }
 
     fn capture_op(&self, build: impl FnOnce() -> crate::StreamOp) {

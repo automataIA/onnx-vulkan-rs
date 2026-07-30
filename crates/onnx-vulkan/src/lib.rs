@@ -294,13 +294,7 @@ impl Session {
             cache
                 .entries
                 .iter()
-                .map(|e| {
-                    (
-                        e.present.as_str(),
-                        &e.buffer,
-                        e.row() * cache.max_seq_len,
-                    )
-                })
+                .map(|e| (e.present.as_str(), &e.buffer, e.row() * cache.max_seq_len))
                 .collect(),
         )?;
         // the graph decides how many tokens went in; reading it back from the
@@ -332,7 +326,12 @@ impl CacheEntry {
     /// address through the stride and a host download does not.
     fn cache_shape(&self, tokens: usize) -> Vec<i64> {
         let [batch, kv_heads, head_size] = self.dims;
-        vec![batch as i64, kv_heads as i64, tokens as i64, head_size as i64]
+        vec![
+            batch as i64,
+            kv_heads as i64,
+            tokens as i64,
+            head_size as i64,
+        ]
     }
 
     /// Elements per token.

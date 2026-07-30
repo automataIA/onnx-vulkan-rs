@@ -13,6 +13,16 @@
 
 use crate::KernelCache;
 use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
+use crate::shaders::attention::{
+    OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
+    PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
+    PACK_PUSH_BYTES as ATTN_PACK_PUSH_BYTES, PAST as ATTN_PAST,
+    PAST_BINDINGS as ATTN_PAST_BINDINGS, PAST_PUSH_BYTES as ATTN_PAST_PUSH_BYTES,
+    ROTARY as ATTN_ROTARY, ROTARY_BINDINGS as ATTN_ROTARY_BINDINGS,
+    ROTARY_PUSH_BYTES as ATTN_ROTARY_PUSH_BYTES, SCORES as ATTN_SCORES,
+    SCORES_BINDINGS as ATTN_SCORES_BINDINGS, SCORES_PUSH_BYTES as ATTN_SCORES_PUSH_BYTES,
+    WG as ATTN_WG,
+};
 use crate::shaders::conv::{
     BINDINGS as CONV_F32_BINDINGS, BLOCKED_TILE_SIZE as CONV_BLOCKED_TILE_SIZE,
     PUSH_BYTES as CONV_F32_PUSH_BYTES, SPLIT_REDUCE as CONV_SPLIT_REDUCE,
@@ -36,6 +46,9 @@ use crate::shaders::elementwise::{
     BINARY as BINARY_TEMPLATE, CAST_DEV, CAST_DEV_BINDINGS, CAST_DEV_PUSH_BYTES, CLIP,
     CLIP_BINDINGS, CLIP_PUSH_BYTES, MAX_RANK, POW_EXPR, UNARY as UNARY_TEMPLATE, UNARY_HELPERS_ERF,
     WHERE, WHERE_BINDINGS, WHERE_PUSH_BYTES,
+};
+use crate::shaders::gather_block_quantized::{
+    BINDINGS as GBQ_BINDINGS, GATHER_BLOCK_QUANTIZED as GBQ_GATHER, PUSH_BYTES as GBQ_PUSH_BYTES,
 };
 use crate::shaders::gemm::{
     BINDINGS as GEMM_BINDINGS, GEMM, PUSH_BYTES as GEMM_PUSH_BYTES, TILE_SIZE as GEMM_TILE_SIZE,
@@ -61,24 +74,11 @@ use crate::shaders::matmul_integer::{
     TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
-use crate::shaders::gather_block_quantized::{
-    BINDINGS as GBQ_BINDINGS, GATHER_BLOCK_QUANTIZED as GBQ_GATHER, PUSH_BYTES as GBQ_PUSH_BYTES,
-};
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, DECODE_LANES as MMNB_DECODE_LANES,
     DECODE_MIN_N as MMNB_DECODE_MIN_N, HEAD_LANES as MMNB_HEAD_LANES,
     HEAD_MIN_N as MMNB_HEAD_MIN_N, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
     decode_source as mmnb_decode_source, head_source as mmnb_head_source,
-};
-use crate::shaders::attention::{
-    OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
-    PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
-    PACK_PUSH_BYTES as ATTN_PACK_PUSH_BYTES, PAST as ATTN_PAST,
-    PAST_BINDINGS as ATTN_PAST_BINDINGS, PAST_PUSH_BYTES as ATTN_PAST_PUSH_BYTES,
-    ROTARY as ATTN_ROTARY, ROTARY_BINDINGS as ATTN_ROTARY_BINDINGS,
-    ROTARY_PUSH_BYTES as ATTN_ROTARY_PUSH_BYTES, SCORES as ATTN_SCORES,
-    SCORES_BINDINGS as ATTN_SCORES_BINDINGS, SCORES_PUSH_BYTES as ATTN_SCORES_PUSH_BYTES,
-    WG as ATTN_WG,
 };
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
@@ -101,11 +101,11 @@ use crate::shaders::quantize_linear::{
 use crate::shaders::reduction::{
     ARGMAX_BINDINGS, ARGMAX_FINAL, ARGMAX_FINAL_PUSH_BYTES, ARGMAX_PARTIAL,
     ARGMAX_PARTIAL_PUSH_BYTES, BINDINGS as RED_BINDINGS, MAX_ACC as RED_MAX_ACC,
-    splits as argmax_splits, MAX_FIN as RED_MAX_FIN,
-    MAX_INIT as RED_MAX_INIT, MEAN_ACC as RED_MEAN_ACC, MEAN_FIN as RED_MEAN_FIN,
-    MEAN_INIT as RED_MEAN_INIT, MIN_ACC as RED_MIN_ACC, MIN_FIN as RED_MIN_FIN,
-    MIN_INIT as RED_MIN_INIT, PUSH_BYTES as RED_PUSH_BYTES, SUM_ACC as RED_SUM_ACC,
-    SUM_FIN as RED_SUM_FIN, SUM_INIT as RED_SUM_INIT, source as reduce_source,
+    MAX_FIN as RED_MAX_FIN, MAX_INIT as RED_MAX_INIT, MEAN_ACC as RED_MEAN_ACC,
+    MEAN_FIN as RED_MEAN_FIN, MEAN_INIT as RED_MEAN_INIT, MIN_ACC as RED_MIN_ACC,
+    MIN_FIN as RED_MIN_FIN, MIN_INIT as RED_MIN_INIT, PUSH_BYTES as RED_PUSH_BYTES,
+    SUM_ACC as RED_SUM_ACC, SUM_FIN as RED_SUM_FIN, SUM_INIT as RED_SUM_INIT,
+    source as reduce_source, splits as argmax_splits,
 };
 use crate::shaders::resize::{
     BINDINGS as RESIZE_BINDINGS, COORD_ALIGN_CORNERS, COORD_ASYMMETRIC, COORD_HALF_PIXEL,
@@ -117,7 +117,7 @@ use crate::{
     Tensor, broadcast, device_storage_bytes, elem_size,
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use vk_compute::{ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
 
 type Env<'context, 'values> = ExecutionEnv<'context, 'values>;
@@ -420,7 +420,9 @@ fn param_buffer<'cache>(
         // the cache owns it for as long as the session lives
         return Ok(unsafe { &*shared });
     }
-    let buffer = env.context().create_storage_buffer(bytes.len().max(4) as u64)?;
+    let buffer = env
+        .context()
+        .create_storage_buffer(bytes.len().max(4) as u64)?;
     env.context().stream_upload(&buffer, bytes)?;
     Ok(scratch.insert(buffer))
 }
@@ -433,7 +435,47 @@ pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
     execute_nodes(ir, env).map_err(|e| crate::Error::Backend(format!("{e:#}")))
 }
 
+/// Runs the graph while a capture is open, reporting which commands each node
+/// issued.
+///
+/// The ranges are what lets a plan tell a node it can replay from one it has to
+/// run again: a node that issued nothing is host computation, and its result is
+/// what the uploads of the next step will carry.
+pub fn execute_traced(
+    ir: &GraphIr,
+    env: &mut Env<'_, '_>,
+) -> crate::Result<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::with_capacity(ir.nodes.len());
+    execute_nodes_inner(ir, env, Some(&mut ranges))
+        .map_err(|e| crate::Error::Backend(format!("{e:#}")))?;
+    Ok(ranges)
+}
+
+/// Runs the host-only nodes of a plan, in graph order.
+///
+/// Everything else the step does is issued from the plan, so this is the only
+/// interpretation a replayed token pays for: the mask, the positions and the
+/// shapes, which change with every token and which nothing can record.
+pub fn execute_host_nodes(
+    ir: &GraphIr,
+    env: &mut Env<'_, '_>,
+    nodes: &[usize],
+) -> crate::Result<()> {
+    for &index in nodes {
+        exec_node(env, &ir.nodes[index]).map_err(|e| crate::Error::Backend(format!("{e:#}")))?;
+    }
+    Ok(())
+}
+
 fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
+    execute_nodes_inner(ir, env, None)
+}
+
+fn execute_nodes_inner(
+    ir: &GraphIr,
+    env: &mut Env<'_, '_>,
+    mut trace: Option<&mut Vec<std::ops::Range<usize>>>,
+) -> Result<()> {
     let dead = dead_after(ir);
     let probe = std::env::var_os("ALLOC_PROBE").is_some();
     // Host time per op, against the dispatches each op issued: what says whether
@@ -446,7 +488,12 @@ fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
         let before = probe.then(vk_compute::stats::allocs);
         let clock = timing.then(std::time::Instant::now);
         let dispatched = timing.then(vk_compute::stats::dispatches);
+        let issued = env.context().capture_len();
         exec_node(env, node)?;
+        if let Some(trace) = trace.as_mut() {
+            let start = issued.unwrap_or(0);
+            trace.push(start..env.context().capture_len().unwrap_or(start));
+        }
         if let (Some(clock), Some(dispatched)) = (clock, dispatched) {
             let entry = by_op.entry(node.op.as_str()).or_default();
             entry.0 += clock.elapsed().as_nanos() as u64;
@@ -499,9 +546,20 @@ fn dead_after(ir: &GraphIr) -> Vec<Vec<&str>> {
     for name in ir.initializers.keys() {
         last.remove(name.as_str());
     }
+    // Built by walking the nodes and their inputs in order, not by draining
+    // `last`: the order a value is released in is the order its buffer goes
+    // back to the pool, and the pool hands them out again in that same order.
+    // Draining a `HashMap` would shuffle two values of the same size against
+    // each other from one step to the next — measured, and it is exactly how a
+    // replayed step ends up reading the wrong tensor.
     let mut dead = vec![Vec::new(); ir.nodes.len()];
-    for (name, index) in last {
-        dead[index].push(name);
+    let mut placed: HashSet<&str> = HashSet::new();
+    for (index, node) in ir.nodes.iter().enumerate() {
+        for name in node.inputs.iter().filter(|n| !n.is_empty()) {
+            if last.get(name.as_str()) == Some(&index) && placed.insert(name.as_str()) {
+                dead[index].push(name.as_str());
+            }
+        }
     }
     dead
 }
@@ -2233,7 +2291,11 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
         // from the 64×64 tile; see `conv::prefer_blocked`.
         let blocked = gemm && conv_prefer_blocked(pixels as usize, g.c_out as usize);
         let (key, source, tile) = match (gemm, split.is_some(), blocked) {
-            (true, true, _) => ("Conv_split", conv_blocked_splitk_source(), CONV_BLOCKED_TILE_SIZE),
+            (true, true, _) => (
+                "Conv_split",
+                conv_blocked_splitk_source(),
+                CONV_BLOCKED_TILE_SIZE,
+            ),
             (true, false, true) => ("Conv", conv_blocked_source(), CONV_BLOCKED_TILE_SIZE),
             (true, false, false) => ("Conv16", conv_gemm_source(), CONV_TILE_SIZE),
             _ => ("Conv_grouped", conv_direct_source(), 0),
@@ -3492,7 +3554,12 @@ fn matmul_fp32(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// there is nothing to broadcast against.
 fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
     let ctx = env.context();
-    let int_attr = |name: &str| node.attrs.get(name).and_then(AttrValue::as_i64).unwrap_or(0);
+    let int_attr = |name: &str| {
+        node.attrs
+            .get(name)
+            .and_then(AttrValue::as_i64)
+            .unwrap_or(0)
+    };
     let k = int_attr("K") as usize;
     let n = int_attr("N") as usize;
     let block_size = int_attr("block_size") as usize;
@@ -3530,10 +3597,7 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
         "MatMulNBits: packed weight is short for K={k} N={n} block_size={block_size}"
     );
 
-    let rows: usize = a_shape[..a_shape.len() - 1]
-        .iter()
-        .product::<i64>()
-        .max(0) as usize;
+    let rows: usize = a_shape[..a_shape.len() - 1].iter().product::<i64>().max(0) as usize;
     // one workgroup per output element, and `rows` is a grid dimension
     ensure!(rows <= 65535, "MatMulNBits: {rows} rows of A is too many");
     let mut out_shape = a_shape[..a_shape.len() - 1].to_vec();
@@ -4268,7 +4332,9 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
     ) {
         (Some(key), Some(value)) => Some((key, value)),
         (None, None) => None,
-        _ => bail!("GroupQueryAttention: bind present_key and present_value together or not at all"),
+        _ => {
+            bail!("GroupQueryAttention: bind present_key and present_value together or not at all")
+        }
     };
     let (present_k, present_v, kv_stride, padded_rows) = match bound {
         Some(((k_buf, k_cap), (v_buf, v_cap))) => {
@@ -4330,7 +4396,8 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
     //    A caller that bound the cache and passed it back as `past_*` is
     //    handing us the same memory for source and destination, so the copy is
     //    a no-op that would race with itself.
-    let aliased = |past: &DevTensor<'_>, present: &GpuBuffer| past.buffer().buffer == present.buffer;
+    let aliased =
+        |past: &DevTensor<'_>, present: &GpuBuffer| past.buffer().buffer == present.buffer;
     let in_place = aliased(past_k, present_k_buf);
     ensure!(
         in_place == aliased(past_v, present_v_buf),
@@ -4405,19 +4472,28 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
                     ATTN_PACK_PUSH_BYTES,
                 )
             },
-            |pipe| {
-                ctx.stream_dispatch(
-                    pipe,
-                    &[x, cos.buffer(), sin.buffer(), dst],
-                    &push,
-                    grid,
-                )
-            },
+            |pipe| ctx.stream_dispatch(pipe, &[x, cos.buffer(), sin.buffer(), dst], &push, grid),
         )
     };
     pack(env.cache(), q.buffer(), &q_rot, nh, s, 0, do_rotary)?;
-    pack(env.cache(), k.buffer(), present_k_buf, kvh, kv_stride, past, do_rotary)?;
-    pack(env.cache(), v.buffer(), present_v_buf, kvh, kv_stride, past, false)?;
+    pack(
+        env.cache(),
+        k.buffer(),
+        present_k_buf,
+        kvh,
+        kv_stride,
+        past,
+        do_rotary,
+    )?;
+    pack(
+        env.cache(),
+        v.buffer(),
+        present_v_buf,
+        kvh,
+        kv_stride,
+        past,
+        false,
+    )?;
 
     let score_count = b * nh * s * keys;
     if score_count > 0 {
@@ -4551,10 +4627,7 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
     // the cache keeps whichever ownership it came with: `Owned` when this call
     // allocated it, `Borrowed` when the caller did — and `Borrowed` is exactly
     // what `release`/`release_owned` step over, so a bound cache survives the run
-    for (name, buf) in [
-        (&node.outputs[1], present_k),
-        (&node.outputs[2], present_v),
-    ] {
+    for (name, buf) in [(&node.outputs[1], present_k), (&node.outputs[2], present_v)] {
         let shape = vec![b, kvh, total, head_size];
         env.set(
             name,
@@ -5010,7 +5083,12 @@ fn argmax_last_axis(env: &mut Env<'_, '_>, name: &str) -> Result<Vec<i64>> {
 /// The input must be f32 on the device. A non-f32 axis (an int64 mask, say) goes
 /// host-side, like the value reductions: the support check looks at the node and
 /// cannot see the dtype, so every dtype needs a path that works.
-fn argmax_axis(env: &mut Env, x_name: &str, axis: usize, keepdims: bool) -> Result<Tensor<'static>> {
+fn argmax_axis(
+    env: &mut Env,
+    x_name: &str,
+    axis: usize,
+    keepdims: bool,
+) -> Result<Tensor<'static>> {
     let x_shape = env.shape_of(x_name)?;
     let c = x_shape[axis].max(0) as usize;
     let inner: usize = x_shape[axis + 1..].iter().product::<i64>().max(1) as usize;

@@ -125,6 +125,7 @@ impl<'context> Executor<'context> {
         // by another one asking for the same buffers in the same order
         if !bound.is_empty() {
             env.retain_buffers();
+            self.context().reset_pool_order();
         }
         for (name, tensor) in inputs {
             env.set(name, tensor);
@@ -134,6 +135,74 @@ impl<'context> Executor<'context> {
         }
         execute(&self.ir, &mut env)?;
         Ok(Outputs { env })
+    }
+
+    /// Runs a step while recording it, returning the trace a plan is built
+    /// from alongside the outputs.
+    ///
+    /// The recording does not change what the step does: the commands are
+    /// issued exactly as they would have been, and copied into the trace on the
+    /// way past.
+    pub fn run_traced<'a>(
+        &'a self,
+        inputs: Vec<(&str, Tensor<'a>)>,
+        bound: Vec<(&str, &'a GpuBuffer, usize)>,
+    ) -> Result<(Outputs<'a>, crate::StepTrace)> {
+        self.context().begin_capture();
+        let mut env = ExecutionEnv::new(&self.cache, &self.ir.initializers);
+        if !bound.is_empty() {
+            env.retain_buffers();
+            self.context().reset_pool_order();
+        }
+        for (name, tensor) in inputs {
+            env.set(name, tensor);
+        }
+        for (name, buffer, capacity) in bound {
+            env.bind_output(name, buffer, capacity);
+        }
+        let nodes = match crate::interp::execute_traced(&self.ir, &mut env) {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                self.context().end_capture();
+                return Err(error);
+            }
+        };
+        let ops = self
+            .context()
+            .end_capture()
+            .ok_or_else(|| crate::Error::Backend("the capture was closed mid-step".into()))?;
+        Ok((Outputs { env }, crate::StepTrace::new(ops, nodes)))
+    }
+
+    /// Issues a step from a plan: the host nodes run, the rest is replayed.
+    ///
+    /// `env` is the environment of the step the plan was captured on, kept
+    /// alive — its device tensors name the buffers the replay writes into, so
+    /// the caller reads this step's outputs through it.
+    pub fn replay_step<'values>(
+        &self,
+        plan: &crate::StepPlan,
+        step: i64,
+        env: &mut ExecutionEnv<'_, 'values>,
+        inputs: Vec<(&str, Tensor<'values>)>,
+    ) -> Result<()> {
+        env.forget_host_cache();
+        for (name, tensor) in inputs {
+            env.set(name, tensor);
+        }
+        crate::interp::execute_host_nodes(&self.ir, env, plan.host_nodes())?;
+        let ops = plan.ops_for(step, &|name| {
+            env.value(name)
+                .and_then(crate::plan::host_bytes)
+                .ok_or_else(|| {
+                    crate::Error::InvalidTensor(format!(
+                        "the plan uploads '{name}' every step, but this step left it on the device"
+                    ))
+                })
+        })?;
+        self.context()
+            .replay(&ops)
+            .map_err(|error| crate::Error::Backend(error.to_string()))
     }
 }
 
@@ -180,6 +249,15 @@ impl<'a> Outputs<'a> {
 
     pub fn on_device(&self, name: &str) -> bool {
         self.env.on_device(name)
+    }
+
+    /// The run's environment, for a caller that keeps it alive across steps.
+    ///
+    /// A replayed step writes into the buffers this environment already names,
+    /// so it is also how its outputs are read. Nothing else has a reason to
+    /// reach in here.
+    pub fn env_mut(&mut self) -> &mut ExecutionEnv<'a, 'a> {
+        &mut self.env
     }
 
     /// Releases the run's buffers. Consuming instead of `Drop` because freeing

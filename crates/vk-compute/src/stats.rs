@@ -135,6 +135,22 @@ pub fn record_work(op: &'static str, flops: u64, bytes: u64) {
     e.1 += bytes;
 }
 
+/// Host time spent recording commands, as opposed to waiting for them.
+///
+/// The decode step of an LLM is one flush, so its wall clock is GPU compute plus
+/// whatever the host spent getting there, and that term is invisible in the
+/// numbers above: `sync/overhead` charges it to the fence. This separates the
+/// part a pre-recorded command buffer could remove (descriptor writes and
+/// `vkCmd*`) from the part only a shorter interpreter path could — the rest of
+/// the step's host time is graph walking, shape math and allocation.
+static RECORD_NS: AtomicU64 = AtomicU64::new(0);
+static RECORDED: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_recording(ns: u64) {
+    RECORD_NS.fetch_add(ns, Ordering::Relaxed);
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_flush(wall_ns: u64) {
     FLUSH_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
     FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -169,6 +185,8 @@ pub fn dump_and_reset() {
     let downloads = DOWNLOADS.swap(0, Ordering::Relaxed);
     let allocs = ALLOCS.swap(0, Ordering::Relaxed);
     let pool_hits = POOL_HITS.swap(0, Ordering::Relaxed);
+    let record_ns = RECORD_NS.swap(0, Ordering::Relaxed);
+    let recorded = RECORDED.swap(0, Ordering::Relaxed);
 
     let gpu_total: u64 = map.values().map(|(ns, _)| *ns).sum();
     if gpu_total == 0 && flush_wall == 0 {
@@ -206,6 +224,13 @@ pub fn dump_and_reset() {
         "TOTAL GPU compute",
         gpu_total as f64 / 1e6
     );
+    if recorded > 0 {
+        log::info!(
+            "  {:<22} {:>8.3} ms         ({recorded} commands, host side)",
+            "recording",
+            record_ns as f64 / 1e6
+        );
+    }
     log::info!(
         "  sync/overhead ~{:.3} ms across {} flushes; transfer up {:.1} MB / down {:.1} MB",
         sync_ns as f64 / 1e6,

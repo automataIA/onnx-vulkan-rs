@@ -219,6 +219,7 @@ impl VkContext {
         push_constants: &[u8],
         groups: [u32; 3],
     ) -> Result<()> {
+        let started = crate::stats::enabled().then(std::time::Instant::now);
         let mut state = self.stream.lock().unwrap();
         let cmd = self.stream_cmd(&mut state)?;
         self.stream_barrier(
@@ -228,6 +229,9 @@ impl VkContext {
         );
         self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
         self.write_timestamp(cmd, &mut state);
+        if let Some(started) = started {
+            crate::stats::record_recording(started.elapsed().as_nanos() as u64);
+        }
         Ok(())
     }
 

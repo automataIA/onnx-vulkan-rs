@@ -198,6 +198,86 @@ def _matmul_nbits_ok(node, _consts) -> bool:
     )
 
 
+def _qlinear_params_ok(node, consts, pairs, weights=None, bias=None) -> bool:
+    """The QOperator constraints, mirroring `unsupported_quantization`.
+
+    Unlike the other rules this one reads *values*, which is why the Rust half
+    of it does not live in `is_implemented_node`: a `NodeIr` has no
+    initializers. Here they are one attribute away, so both halves are checked
+    together and the coverage number stays the truth.
+    """
+    quant = consts.params
+    for scale, zero, _slot in pairs:
+        s, z = quant.get(_input(node, scale)), quant.get(_input(node, zero))
+        if s is None or z is None:
+            return False
+        if s[0] != TensorProto.FLOAT or len(s[1]) != 1 or len(z[1]) != 1:
+            return False
+    if weights is not None:
+        scale, zero = weights
+        s, z = quant.get(_input(node, scale)), quant.get(_input(node, zero))
+        if s is None or z is None or s[0] != TensorProto.FLOAT:
+            return False
+        if len(s[1]) != len(z[1]):
+            return False
+        # per-channel weights must be symmetric: no `w_zp[c]·Σx` correction
+        if len(z[1]) > 1 and any(v != 0 for v in z[1]):
+            return False
+    if bias is not None:
+        b = quant.get(_input(node, bias))
+        if b is not None and b[0] != TensorProto.INT32:
+            return False
+    return True
+
+
+def _input(node, index: int) -> str:
+    return node.input[index] if len(node.input) > index else ""
+
+
+def _qlinear_conv_ok(node, consts) -> bool:
+    v = _attr(node, "auto_pad", "NOTSET")
+    v = v.decode() if isinstance(v, bytes) else v
+    return (
+        v in {"NOTSET", "VALID", "SAME_UPPER", "SAME_LOWER"}
+        and 8 <= len(node.input) <= 9
+        and all(node.input[i] for i in range(8))
+        and len(node.output) == 1
+        and _qlinear_params_ok(
+            node, consts, [(1, 2, "x"), (6, 7, "y")], weights=(4, 5), bias=8
+        )
+    )
+
+
+def _qlinear_matmul_ok(node, consts) -> bool:
+    return (
+        len(node.input) == 8
+        and all(node.input)
+        and len(node.output) == 1
+        and _qlinear_params_ok(node, consts, [(1, 2, "a"), (6, 7, "y")], weights=(4, 5))
+    )
+
+
+def _qlinear_add_ok(node, consts) -> bool:
+    return (
+        len(node.input) == 8
+        and all(node.input)
+        and len(node.output) == 1
+        and _qlinear_params_ok(
+            node, consts, [(1, 2, "A"), (4, 5, "B"), (6, 7, "C")]
+        )
+    )
+
+
+def _qlinear_global_average_pool_ok(node, consts) -> bool:
+    return (
+        _attr(node, "channels_last", 0) == 0
+        and len(node.input) == 5
+        and all(node.input)
+        and len(node.output) == 1
+        and _qlinear_params_ok(node, consts, [(1, 2, "x"), (3, 4, "y")])
+    )
+
+
 def _gather_block_quantized_ok(node, _consts) -> bool:
     present = lambda i: len(node.input) > i and node.input[i] != ""  # noqa: E731
     block_size = _attr(node, "block_size", 0)
@@ -234,6 +314,10 @@ NODE_RULES = {
     "GroupQueryAttention": _gqa_ok,
     "MatMulNBits": _matmul_nbits_ok,
     "GatherBlockQuantized": _gather_block_quantized_ok,
+    "QLinearConv": _qlinear_conv_ok,
+    "QLinearMatMul": _qlinear_matmul_ok,
+    "QLinearAdd": _qlinear_add_ok,
+    "QLinearGlobalAveragePool": _qlinear_global_average_pool_ok,
 }
 
 
@@ -248,6 +332,41 @@ def check_rules_in_sync() -> None:
     if here - rust:
         lines.append(f"  constraints here but not in Rust: {sorted(here - rust)}")
     sys.exit("\n".join(lines))
+
+
+class Constants(dict):
+    """Integer constants, plus the quantization parameters keyed separately.
+
+    A plain `dict` for the rules that resolve an `axes` input, with `.params`
+    carrying `(dtype, values)` for the QOperator rules — those need the element
+    type and the length, not just the numbers.
+    """
+
+    def __init__(self, ints: dict, params: dict):
+        super().__init__(ints)
+        self.params = params
+
+
+def quant_params(graph) -> dict[str, tuple[int, list]]:
+    """Every small numeric initializer, as `(dtype, values)`.
+
+    "Small" is the point: scales and zero points are one value or one per
+    output channel, and reading their contents is what tells a symmetric
+    quantization from an asymmetric one. The weight tensor itself is skipped.
+    """
+    out: dict[str, tuple[int, list]] = {}
+    for init in graph.initializer:
+        # the model is loaded without external data, so a tensor stored outside
+        # the file has no values to read here; quantization parameters never are
+        if init.data_location == TensorProto.EXTERNAL:
+            continue
+        size = 1
+        for d in init.dims:
+            size *= d
+        if size > 1 << 16:
+            continue
+        out[init.name] = (init.data_type, numpy_helper.to_array(init).ravel().tolist())
+    return out
 
 
 def int_constants(graph) -> dict[str, list[int]]:
@@ -284,7 +403,7 @@ def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
     stack = [model.graph]
     while stack:
         graph = stack.pop()
-        consts = int_constants(graph)
+        consts = Constants(int_constants(graph), quant_params(graph))
         for node in graph.node:
             name = node.op_type if not node.domain else f"{node.domain}::{node.op_type}"
             counts[name] += 1

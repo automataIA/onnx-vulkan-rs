@@ -95,6 +95,10 @@ use crate::shaders::pooling::{
     MAX_INIT as POOL_MAX_INIT, PUSH_BYTES as POOL_PUSH_BYTES, source as pool_source,
 };
 use crate::shaders::push_vec4s;
+use crate::shaders::qlinear::{
+    MAXPOOL_Q, MAXPOOL_Q_BINDINGS, MAXPOOL_Q_PUSH_BYTES, QLINEAR_ADD, QLINEAR_ADD_BINDINGS,
+    QLINEAR_ADD_PUSH_BYTES, REQUANTIZE, REQUANTIZE_BINDINGS, REQUANTIZE_PUSH_BYTES,
+};
 use crate::shaders::quantize_linear::{
     BINDINGS as QDQ_BINDINGS, DEQUANTIZE, DEQUANTIZE_I32, PUSH_BYTES as QDQ_PUSH_BYTES, QUANTIZE,
 };
@@ -157,6 +161,10 @@ pub fn is_implemented(op: &str) -> bool {
             | "Conv"
             | "ConvInteger"
             | "ConvTranspose"
+            | "QLinearConv"
+            | "QLinearMatMul"
+            | "QLinearAdd"
+            | "QLinearGlobalAveragePool"
             | "Mod"
             | "QuantizeLinear"
             | "DequantizeLinear"
@@ -377,6 +385,42 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
             string_attr("auto_pad", "NOTSET").as_str(),
             "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
         ),
+        // The QOperator (static int8) family. What is checked here is what the
+        // node carries; the constraints that live in the **values** — which
+        // quantization parameters are constants, which are per-channel, and
+        // whether a per-channel zero point is zero — are in
+        // [`unsupported_quantization`], because a `NodeIr` does not carry its
+        // initializers. Both refuse at load time; neither is a runtime check.
+        "QLinearConv" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            matches!(
+                string_attr("auto_pad", "NOTSET").as_str(),
+                "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
+            ) && (8..=9).contains(&node.inputs.len())
+                && (0..8).all(present)
+                && node.outputs.len() == 1
+        }
+        "QLinearMatMul" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            node.inputs.len() == 8 && (0..8).all(present) && node.outputs.len() == 1
+        }
+        // contrib op: `A`, `B` and the three (scale, zero-point) pairs. The
+        // schema makes the zero points optional; every export measured carries
+        // all of them, and defaulting a missing one to zero is an assumption
+        // nothing would check.
+        "QLinearAdd" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            node.inputs.len() == 8 && (0..8).all(present) && node.outputs.len() == 1
+        }
+        // contrib op. `channels_last = 1` is NHWC, a different reduction and a
+        // different output layout: refused rather than transposed underneath.
+        "QLinearGlobalAveragePool" => {
+            let present = |index: usize| node.inputs.get(index).is_some_and(|n| !n.is_empty());
+            int_attr("channels_last", 0) == 0
+                && node.inputs.len() == 5
+                && (0..5).all(present)
+                && node.outputs.len() == 1
+        }
         // `output_shape` inverts the relationship — pads are derived from the
         // requested output — and `SAME_*` is meaningful only in those terms
         "ConvTranspose" => {
@@ -387,6 +431,95 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         }
         _ => true,
     }
+}
+
+/// Why a QOperator node cannot be run, when the reason is in its **values**.
+///
+/// `is_implemented_node` sees a `NodeIr`: op, attributes, input names. The
+/// static-int8 family puts the rest of its contract in the operands — a scale
+/// is per-tensor or per-channel depending on its *length*, a zero point is
+/// symmetric or not depending on its *content* — and neither is knowable from
+/// the node alone. This is the other half of the same refusal, and it runs
+/// where the initializers are: `Executor::new`, before anything executes.
+///
+/// The constraints are the ones measured on the QOperator exports in the
+/// matrix (`scripts/qlinear-census.py`), not the ones the schema allows:
+///
+/// - every quantization parameter is a **constant**. A scale computed at
+///   runtime would have to be read back to build the epilogue.
+/// - activation scales and zero points are **per-tensor scalars**.
+/// - the weight scale may be **per-channel**, and then the weight zero point
+///   must match it in length and be **identically zero** — symmetric weights.
+///   All 105 `QLinearConv` nodes of resnet50-int8 and mobilenetv2-int8 are.
+///   A non-zero per-channel zero point would add a `w_zp[c]·Σx` correction
+///   along the reduction axis; no model in reach exercises it, so it is
+///   refused loudly instead of written blind.
+pub fn unsupported_quantization(
+    node: &NodeIr,
+    initializers: &HashMap<String, crate::InitializerIr>,
+) -> Option<String> {
+    let constant = |index: usize| {
+        node.inputs
+            .get(index)
+            .filter(|name| !name.is_empty())
+            .and_then(|name| initializers.get(name))
+    };
+    let elems = |init: &crate::InitializerIr| init.shape.iter().product::<i64>().max(1);
+    let refuse = |slot: &str, why: &str| Some(format!("{}: {slot} {why}", node.op));
+
+    // (scale, zero point) pairs that must be per-tensor scalars, by input index
+    let scalar_pairs: &[(usize, usize, &str)] = match node.op.as_str() {
+        "QLinearConv" => &[(1, 2, "x"), (6, 7, "y")],
+        "QLinearMatMul" => &[(1, 2, "a"), (6, 7, "y")],
+        "QLinearAdd" => &[(1, 2, "A"), (4, 5, "B"), (6, 7, "C")],
+        "QLinearGlobalAveragePool" => &[(1, 2, "x"), (3, 4, "y")],
+        _ => return None,
+    };
+    for &(scale, zero, slot) in scalar_pairs {
+        let (Some(scale), Some(zero)) = (constant(scale), constant(zero)) else {
+            return refuse(slot, "scale or zero point is not a constant");
+        };
+        if scale.dtype != FLOAT {
+            return refuse(slot, "scale is not float32");
+        }
+        if elems(scale) != 1 || elems(zero) != 1 {
+            return refuse(slot, "scale or zero point is not per-tensor");
+        }
+    }
+
+    // the weight side, where per-channel is allowed and asymmetry is not
+    let weights: Option<(usize, usize, &str)> = match node.op.as_str() {
+        "QLinearConv" => Some((4, 5, "w")),
+        "QLinearMatMul" => Some((4, 5, "b")),
+        _ => None,
+    };
+    if let Some((scale, zero, slot)) = weights {
+        let (Some(scale), Some(zero)) = (constant(scale), constant(zero)) else {
+            return refuse(slot, "scale or zero point is not a constant");
+        };
+        if scale.dtype != FLOAT {
+            return refuse(slot, "scale is not float32");
+        }
+        if elems(scale) != elems(zero) {
+            return refuse(slot, "scale and zero point have different lengths");
+        }
+        if elems(zero) > 1 && zero.data.iter().any(|byte| *byte != 0) {
+            return refuse(
+                slot,
+                "per-channel zero point is not zero (asymmetric weights)",
+            );
+        }
+    }
+
+    // `QLinearConv`'s bias lives in the accumulator's domain, already scaled by
+    // `x_scale · w_scale`: an f32 bias would mean a different epilogue
+    if node.op == "QLinearConv"
+        && let Some(bias) = constant(8)
+        && bias.dtype != INT32
+    {
+        return refuse("B", "bias is not int32");
+    }
+    None
 }
 
 /// Runs a closure with the pipeline (cached in the session) for an op key.
@@ -628,6 +761,10 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Where" => where_op(env, node),
         "Conv" => conv_f32(env, node),
         "ConvInteger" => conv_integer(env, node),
+        "QLinearConv" => qlinear_conv(env, node),
+        "QLinearMatMul" => qlinear_matmul(env, node),
+        "QLinearAdd" => qlinear_add(env, node),
+        "QLinearGlobalAveragePool" => qlinear_global_average_pool(env, node),
         "ConvTranspose" => conv_transpose(env, node),
         "Mod" => host_mod(env, node),
         "QuantizeLinear" => quantize_linear(env, node),
@@ -2872,6 +3009,333 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// A node that exists only for the duration of one lowering.
+///
+/// The QOperator ops are an integer kernel plus an epilogue, and the integer
+/// kernel is one this interpreter already has. Rather than duplicate
+/// `conv_integer` — pointwise fast path, groups, padding and all — the
+/// quantized op builds the `ConvInteger` node it *is* and runs it into a
+/// private value. Nothing of this reaches the graph: the names are derived
+/// from the node's own, so two nodes cannot collide, and the value is released
+/// as soon as the epilogue has read it.
+fn lowered(node: &NodeIr, op: &str, inputs: &[&str], outputs: &[&str]) -> NodeIr {
+    NodeIr {
+        domain: String::new(),
+        op: op.to_string(),
+        since_version: node.since_version,
+        name: format!("{}__{op}", node.name),
+        inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
+        outputs: outputs.iter().map(|s| (*s).to_string()).collect(),
+        attrs: node.attrs.clone(),
+    }
+}
+
+/// The host-side half of the epilogue: `ratio[c] = x_scale · w_scale[c] / y_scale`.
+///
+/// One f32 per output channel, computed once from constants the graph carries
+/// and uploaded through the content-keyed parameter cache, so identical
+/// channel counts across nodes do not each get their own buffer. Doing the
+/// division here rather than in the shader is not an optimization of the inner
+/// loop — the epilogue is outside it — but of the *constant*: `y_scale` is one
+/// number and dividing by it per element would be work with no result.
+fn requantize_ratio(env: &Env, x_scale: &str, w_scale: &str, y_scale: &str) -> Result<Vec<f32>> {
+    let x = env.host(x_scale)?.to_f32()?;
+    let w = env.host(w_scale)?.to_f32()?;
+    let y = env.host(y_scale)?.to_f32()?;
+    ensure!(
+        x.len() == 1 && y.len() == 1,
+        "QLinear: activation scales must be per-tensor (x {}, y {})",
+        x.len(),
+        y.len()
+    );
+    ensure!(y[0] != 0.0, "QLinear: y_scale is zero");
+    Ok(w.iter().map(|w| x[0] * w / y[0]).collect())
+}
+
+/// A zero point as a number, from the constant the graph carries.
+fn zp_value(env: &Env, name: &str) -> Result<i32> {
+    let values = env.host(name)?.to_i64()?;
+    ensure!(
+        values.len() == 1,
+        "QLinear: zero point of {name} is not per-tensor ({} values)",
+        values.len()
+    );
+    Ok(values[0] as i32)
+}
+
+/// The epilogue: int32 accumulator → quantized output.
+///
+/// `inner` and `axis_len` place the channel: `H·W` and `C_out` for a
+/// convolution, `1` and `N` for a matmul. `bias` is the `int32` bias of
+/// `QLinearConv`, already in the accumulator's domain — it is added before the
+/// scaling, not after, which is what makes it int32 in the first place.
+#[allow(clippy::too_many_arguments)]
+fn requantize(
+    env: &mut Env,
+    node: &NodeIr,
+    acc_name: &str,
+    bias: Option<&str>,
+    ratio: &[f32],
+    inner: usize,
+    y_zp_name: &str,
+    out_dtype: i32,
+) -> Result<()> {
+    let ctx = env.context();
+    let shape = env.shape_of(acc_name)?;
+    let n: usize = shape.iter().product::<i64>().max(0) as usize;
+    let y_zp = zp_value(env, y_zp_name)?;
+    let axis_len = ratio.len();
+    ensure!(axis_len > 0, "{}: empty scale", node.op);
+
+    if let Some(bias) = bias {
+        env.ensure_device_dtype(bias)?;
+    }
+    let out = ctx.create_storage_buffer(device_storage_bytes(out_dtype, n)?)?;
+    if n > 0 {
+        let fields = [
+            n as u32,
+            inner.max(1) as u32,
+            axis_len as u32,
+            u32::from(out_dtype == INT8),
+            u32::from(bias.is_some()),
+            y_zp as u32,
+        ];
+        let mut push = Vec::with_capacity(REQUANTIZE_PUSH_BYTES as usize);
+        for value in fields {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        let ratio_bytes: Vec<u8> = ratio.iter().flat_map(|r| r.to_le_bytes()).collect();
+        let mut scratch = None;
+        let ratio_buffer = param_buffer(env, &ratio_bytes, &mut scratch)?;
+        let acc = env.device(acc_name)?;
+        // no bias ⇒ the shader never reads the binding, but a descriptor set
+        // still needs a buffer there: the accumulator itself serves
+        let bias_buffer = match bias {
+            Some(name) => env.device(name)?.buffer(),
+            None => acc.buffer(),
+        };
+        with_pipeline(
+            env.cache(),
+            "Requantize",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(REQUANTIZE)?,
+                    REQUANTIZE_BINDINGS,
+                    REQUANTIZE_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[acc.buffer(), bias_buffer, ratio_buffer, &out],
+                    &push,
+                    [(n as u32).div_ceil(4).div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: out_dtype,
+            shape,
+            elem_count: n,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `QLinearConv`: `ConvInteger` on the same operands, then the epilogue.
+///
+/// Splitting it this way is not a shortcut around a fused kernel — it is the
+/// operator's own definition. The integer part is bit-for-bit the convolution
+/// `ConvInteger` computes, and the epilogue is outside its loop over `K`, so
+/// fusing the two would save one pass over the output and change no number.
+fn qlinear_conv(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let acc = format!("{}__acc", node.name);
+    let ratio = requantize_ratio(env, &node.inputs[1], &node.inputs[4], &node.inputs[6])?;
+    let out_dtype = env.dtype_of(&node.inputs[7])?;
+    let conv = lowered(
+        node,
+        "ConvInteger",
+        &[
+            &node.inputs[0],
+            &node.inputs[3],
+            &node.inputs[2],
+            &node.inputs[5],
+        ],
+        &[&acc],
+    );
+    conv_integer(env, &conv)?;
+
+    let shape = env.shape_of(&acc)?;
+    let inner: usize = shape[2..].iter().product::<i64>().max(1) as usize;
+    let bias = node.inputs.get(8).filter(|n| !n.is_empty()).cloned();
+    requantize(
+        env,
+        node,
+        &acc,
+        bias.as_deref(),
+        &ratio,
+        inner,
+        &node.inputs[7],
+        out_dtype,
+    )?;
+    env.release(&acc);
+    Ok(())
+}
+
+/// `QLinearMatMul`: `MatMulInteger`, then the epilogue on the columns.
+///
+/// The channel is the column, so `inner = 1` and `axis_len = N` — and `N` is
+/// where the two models in the matrix disagree: resnet50 passes one scale for
+/// the whole tensor, mobilenetv2 one per column. Both are the same shader with
+/// a different `axis_len`.
+fn qlinear_matmul(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let acc = format!("{}__acc", node.name);
+    let mut ratio = requantize_ratio(env, &node.inputs[1], &node.inputs[4], &node.inputs[6])?;
+    let out_dtype = env.dtype_of(&node.inputs[7])?;
+    let matmul = lowered(
+        node,
+        "MatMulInteger",
+        &[
+            &node.inputs[0],
+            &node.inputs[3],
+            &node.inputs[2],
+            &node.inputs[5],
+        ],
+        &[&acc],
+    );
+    matmul_integer(env, &matmul)?;
+
+    let shape = env.shape_of(&acc)?;
+    let columns = *shape.last().unwrap_or(&1) as usize;
+    ensure!(
+        ratio.len() == 1 || ratio.len() == columns,
+        "QLinearMatMul: {} scales for {columns} columns",
+        ratio.len()
+    );
+    if ratio.len() == 1 {
+        ratio = vec![ratio[0]; 1];
+    }
+    requantize(env, node, &acc, None, &ratio, 1, &node.inputs[7], out_dtype)?;
+    env.release(&acc);
+    Ok(())
+}
+
+/// `com.microsoft::QLinearAdd`: one pass, on the output's scale.
+fn qlinear_add(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let (a_name, b_name) = (node.inputs[0].clone(), node.inputs[3].clone());
+    let scale = |name: &str| -> Result<f32> {
+        let values = env.host(name)?.to_f32()?;
+        ensure!(values.len() == 1, "QLinearAdd: {name} is not per-tensor");
+        Ok(values[0])
+    };
+    let c_scale = scale(&node.inputs[6])?;
+    ensure!(c_scale != 0.0, "QLinearAdd: C_scale is zero");
+    let ra = scale(&node.inputs[1])? / c_scale;
+    let rb = scale(&node.inputs[4])? / c_scale;
+    let (a_zp, b_zp) = (
+        zp_value(env, &node.inputs[2])?,
+        zp_value(env, &node.inputs[5])?,
+    );
+    let c_zp = zp_value(env, &node.inputs[7])?;
+    let out_dtype = env.dtype_of(&node.inputs[7])?;
+
+    env.ensure_device_dtype(&a_name)?;
+    env.ensure_device_dtype(&b_name)?;
+    let ctx = env.context();
+    let a = env.device(&a_name)?;
+    let b = env.device(&b_name)?;
+    let bc = broadcast(&a.shape, &b.shape)?;
+    ensure!(
+        bc.out_shape.len() <= MAX_RANK,
+        "QLinearAdd: rank {} > {MAX_RANK}",
+        bc.out_shape.len()
+    );
+    let elem_count: usize = bc.out_shape.iter().product::<i64>().max(0) as usize;
+    let out = ctx.create_storage_buffer(device_storage_bytes(out_dtype, elem_count)?)?;
+    if elem_count > 0 {
+        let mut push = Vec::with_capacity(QLINEAR_ADD_PUSH_BYTES as usize);
+        push.extend_from_slice(&(elem_count as u32).to_le_bytes());
+        push.extend_from_slice(&(bc.out_shape.len() as u32).to_le_bytes());
+        push.extend_from_slice(&0u32.to_le_bytes());
+        push.extend_from_slice(&0u32.to_le_bytes());
+        push_vec4s(&mut push, &bc.out_strides);
+        push_vec4s(&mut push, &bc.a_strides);
+        push_vec4s(&mut push, &bc.b_strides);
+        push.extend_from_slice(&ra.to_le_bytes());
+        push.extend_from_slice(&rb.to_le_bytes());
+        for value in [a_zp, b_zp, c_zp] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        push.extend_from_slice(&u32::from(out_dtype == INT8).to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "QLinearAdd",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(QLINEAR_ADD)?,
+                    QLINEAR_ADD_BINDINGS,
+                    QLINEAR_ADD_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[a.buffer(), b.buffer(), &out],
+                    &push,
+                    [(elem_count as u32).div_ceil(4).div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: out_dtype,
+            shape: bc.out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `com.microsoft::QLinearGlobalAveragePool`: dequantize, pool, quantize.
+///
+/// The one node of the family that is *not* given its own kernel, and
+/// deliberately: both models have exactly one, on a tensor the convolutions
+/// have already reduced to 7×7, and the three steps are three kernels this
+/// interpreter already has. Writing a fused reduction here would add a shader
+/// to save microseconds on two nodes in the whole suite — and a fused one
+/// would have to write single bytes from separate workgroups, which is the
+/// awkward part, not the reduction.
+fn qlinear_global_average_pool(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let real = format!("{}__f32", node.name);
+    let pooled = format!("{}__pooled", node.name);
+    let dequantize = lowered(
+        node,
+        "DequantizeLinear",
+        &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],
+        &[&real],
+    );
+    dequantize_linear(env, &dequantize)?;
+    let pooled_node = lowered(node, "GlobalAveragePool", &[&real], &[&pooled]);
+    pool(env, &pooled_node, PoolKind::GlobalAverage)?;
+    env.release(&real);
+    let quantize = lowered(
+        node,
+        "QuantizeLinear",
+        &[&pooled, &node.inputs[3], &node.inputs[4]],
+        &[&node.outputs[0]],
+    );
+    quantize_linear(env, &quantize)?;
+    env.release(&pooled);
+    Ok(())
+}
+
 /// Layout of the quantization parameters: `inner` is the stride below the
 /// quantized axis and `axis_len` the number of scales. Per-tensor is the
 /// degenerate case `axis_len = 1`, so a single shader covers both forms.
@@ -4767,6 +5231,13 @@ fn pool(env: &mut Env, node: &NodeIr, kind: PoolKind) -> Result<()> {
         .and_then(AttrValue::as_i64)
         .unwrap_or(0);
 
+    // A QOperator graph pools without leaving the quantized domain: the input
+    // is packed u8/i8 and the f32 kernel would read the bytes as floats.
+    let x_dtype = env.dtype_of(&x_name)?;
+    if x_dtype == UINT8 || x_dtype == INT8 {
+        return quantized_max_pool(env, &node, &g, x_dtype, kind);
+    }
+
     env.ensure_device(&x_name)?;
     let x = env.device(&x_name)?;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, g.total)?)?;
@@ -4818,6 +5289,83 @@ fn pool(env: &mut Env, node: &NodeIr, kind: PoolKind) -> Result<()> {
         &node.outputs[0],
         Tensor::Device(DevTensor {
             dtype: FLOAT,
+            shape: g.out_shape.clone(),
+            elem_count: g.total,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `MaxPool` on packed u8/i8, staying in the quantized domain.
+///
+/// Quantization is monotone, so the maximum of the codes is the code of the
+/// maximum: no scale, no zero point, and the result is bit-identical to
+/// dequantizing, pooling and quantizing back with the same parameters.
+/// Averaging is a different matter — it would need the zero point — and the
+/// QOperator family gives it its own operator, so it is refused here.
+fn quantized_max_pool(
+    env: &mut Env,
+    node: &NodeIr,
+    g: &ConvGeom,
+    dtype: i32,
+    kind: PoolKind,
+) -> Result<()> {
+    ensure!(
+        kind == PoolKind::Max,
+        "{}: a quantized input is implemented for MaxPool only",
+        node.op
+    );
+    let ctx = env.context();
+    let x_name = node.inputs[0].clone();
+    env.ensure_device_dtype(&x_name)?;
+    let x = env.device(&x_name)?;
+    let out = ctx.create_storage_buffer(device_storage_bytes(dtype, g.total)?)?;
+    if g.total > 0 {
+        let mut push = Vec::with_capacity(MAXPOOL_Q_PUSH_BYTES as usize);
+        for v in [
+            g.total as u32,
+            g.c_out as u32,
+            g.h_in as u32,
+            g.w_in as u32,
+            g.h_out as u32,
+            g.w_out as u32,
+            g.kh as u32,
+            g.kw as u32,
+            g.sh as u32,
+            g.sw as u32,
+            g.phb as u32,
+            g.pwb as u32,
+            g.dh as u32,
+            g.dw as u32,
+            u32::from(dtype == INT8),
+        ] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "MaxPool_q",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(MAXPOOL_Q)?,
+                    MAXPOOL_Q_BINDINGS,
+                    MAXPOOL_Q_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[x.buffer(), &out],
+                    &push,
+                    [(g.total as u32).div_ceil(4).div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype,
             shape: g.out_shape.clone(),
             elem_count: g.total,
             buf: BufRef::Owned(out),

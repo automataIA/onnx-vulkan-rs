@@ -281,10 +281,59 @@ size_mb = 25
 # of parakeet and rfdetr-int8, where ±1 LSB amplifies and the final outputs
 # cannot be validated.
 #
-# QDQ variant and not `-int8`: the latter is QOperator format (fused
-# `QLinearConv`), which we cover at 7% — it would run on ORT and not test our shaders.
+# QDQ variant *and* `-int8`: the two formats exercise different shaders on the
+# same weights — this one dequantizes to f32 and runs the tuned `Conv`, its
+# QOperator sibling `resnet50-int8-golden` below stays in int32 and requantizes
+# once. Keeping both is what makes the 3% divergence documented above
+# attributable to the format rather than to a bug.
 reference = "models/zoo/golden/resnet50-v1-12-qdq/test_data_set_0"
 fetch = { dir = "models/zoo/golden/resnet50-v1-12-qdq", member = "resnet50-v1-12-qdq", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v1-12-qdq.tar.gz" }
+
+# The two QOperator (static int8) models: `QLinearConv` / `QLinearMatMul` with
+# scales and zero-points passed to the operator itself, instead of the QDQ pairs
+# around an f32 kernel. In the default gate since 2026-07-31, when the kernels
+# landed: both run **bit-exact** against their own golden (`max|Δ| = 0.000e0`,
+# argmax 489 and 971 reproduced), which is what makes them worth running every
+# time — integer arithmetic has no tolerance band, so any rounding, saturation
+# or accumulation-order regression shows up as a different code, not as noise.
+#
+# Why these two and not a synthetic graph: they carry their own
+# `test_data_set_0`, so the oracle does not go through ORT. And the QDQ sibling
+# above documents a 3% divergence from its golden that is *structural* — the
+# golden was produced with the QDQ→`QLinearConv` fusion, i.e. integer arithmetic
+# accumulated in int32 and requantized once, while the literal graph dequantizes
+# to f32 and back. A real `QLinearConv` kernel should close that gap rather than
+# reproduce it, so these entries validate on `outputs`, not on `argmax`: the
+# divergence *is* the measurement. It did close it.
+
+[[model]]
+name = "resnet50-int8-golden"
+path = "models/zoo/golden/resnet50-v1-12-int8/resnet50-v1-12-int8.onnx"
+runner = "model-runner"
+args = []
+iters = 20
+default = true
+golden = true
+validate = "outputs"
+size_mb = 25
+reference = "models/zoo/golden/resnet50-v1-12-int8/test_data_set_0"
+fetch = { dir = "models/zoo/golden/resnet50-v1-12-int8", member = "resnet50-v1-12-int8", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v1-12-int8.tar.gz" }
+
+[[model]]
+name = "mobilenetv2-int8-golden"
+path = "models/zoo/golden/mobilenetv2-12-int8/mobilenetv2-12-int8.onnx"
+runner = "model-runner"
+args = []
+iters = 20
+default = true
+golden = true
+validate = "outputs"
+size_mb = 4
+# The smaller of the two, and depthwise: `QLinearConv` with `group == C_in` is
+# a different kernel path from the grouped-by-1 case, so it is not redundant
+# with resnet50 even though both are QOperator classifiers.
+reference = "models/zoo/golden/mobilenetv2-12-int8/test_data_set_0"
+fetch = { dir = "models/zoo/golden/mobilenetv2-12-int8", member = "mobilenetv2-12-int8", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-12-int8.tar.gz" }
 
 [[model]]
 name = "fasterrcnn-golden"

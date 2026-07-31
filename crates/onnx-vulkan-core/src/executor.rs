@@ -73,6 +73,29 @@ impl<'context> Executor<'context> {
                 by_op.len()
             )));
         }
+        // The other half of the refusal: constraints that live in the operands
+        // rather than in the node (`unsupported_quantization`). Same rule —
+        // every offender, at load time — and a distinct message, because the op
+        // *is* implemented and it is this node's parameters that are not.
+        let mut reasons: std::collections::BTreeMap<String, (usize, &str)> = Default::default();
+        for node in &ir.nodes {
+            if let Some(reason) = crate::interp::unsupported_quantization(node, &ir.initializers) {
+                let entry = reasons.entry(reason).or_insert((0, node.name.as_str()));
+                entry.0 += 1;
+            }
+        }
+        if !reasons.is_empty() {
+            let total: usize = reasons.values().map(|(count, _)| count).sum();
+            let detail = reasons
+                .iter()
+                .map(|(reason, (count, first))| format!("{reason} ×{count} (e.g. '{first}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::Error::Unsupported(format!(
+                "{total} nodes carry quantization parameters the kernels do not \
+                 implement: {detail}"
+            )));
+        }
         Ok(Self {
             cache: KernelCache::new(context),
             ir,

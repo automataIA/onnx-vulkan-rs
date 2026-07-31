@@ -504,9 +504,33 @@ fn infer_node(
             };
             vec![TensorType {
                 dtype,
-                shape: conv(node, &ctx),
+                shape: conv(node, &ctx, 1),
             }]
         }
+        // QOperator (static int8): same geometry as `Conv`, but `W` is input 3
+        // and the output type is the one the `y_zero_point` carries — the node
+        // requantizes, so it is not the accumulator type
+        "QLinearConv" => vec![TensorType {
+            dtype: ctx.input(node, 7).dtype.or(Some(UINT8)),
+            shape: conv(node, &ctx, 3),
+        }],
+        "QLinearMatMul" => vec![TensorType {
+            dtype: ctx.input(node, 7).dtype.or(Some(UINT8)),
+            shape: matmul(&ctx.shape_of(node, 0), &ctx.shape_of(node, 3)),
+        }],
+        "QLinearAdd" => vec![TensorType {
+            dtype: ctx.input(node, 7).dtype.or(Some(UINT8)),
+            shape: broadcast(&ctx.shape_of(node, 0), &ctx.shape_of(node, 3)),
+        }],
+        "QLinearGlobalAveragePool" => vec![TensorType {
+            dtype: ctx.input(node, 4).dtype.or(Some(UINT8)),
+            shape: first.shape.map(|dims| {
+                dims.iter()
+                    .enumerate()
+                    .map(|(i, d)| if i < 2 { d.clone() } else { Dim::Fixed(1) })
+                    .collect()
+            }),
+        }],
         "ConvTranspose" => vec![TensorType {
             dtype: first.dtype,
             shape: conv_transpose(node, &ctx),
@@ -881,9 +905,9 @@ fn gather(data: &Option<Vec<Dim>>, indices: &Option<Vec<Dim>>, at: i64) -> Optio
 }
 
 /// Spatial output of `Conv`, including `auto_pad`.
-fn conv(node: &NodeIr, ctx: &Ctx) -> Option<Vec<Dim>> {
+fn conv(node: &NodeIr, ctx: &Ctx, w_index: usize) -> Option<Vec<Dim>> {
     let x = ctx.shape_of(node, 0)?;
-    let w = ctx.shape_of(node, 1)?;
+    let w = ctx.shape_of(node, w_index)?;
     if x.len() < 3 || w.len() != x.len() {
         return None;
     }

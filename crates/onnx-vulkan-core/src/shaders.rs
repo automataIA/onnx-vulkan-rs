@@ -15,6 +15,7 @@ pub mod matmul_nbits;
 pub mod movement;
 pub mod normalization;
 pub mod pooling;
+pub mod qlinear;
 pub mod quantize_linear;
 pub mod reduction;
 pub mod resize;

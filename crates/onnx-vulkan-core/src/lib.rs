@@ -29,7 +29,9 @@ pub use graph::{
     fold_constant_params, storage_len,
 };
 pub use host_ops::HostTensor;
-pub use interp::{argmax_of, execute, is_implemented, is_implemented_node};
+pub use interp::{
+    argmax_of, execute, is_implemented, is_implemented_node, unsupported_quantization,
+};
 pub use interp::{execute_host_nodes, execute_traced};
 pub use plan::{StepPlan, StepTrace, host_bytes};
 pub use rewrite::{fold_constants, fuse_layernorm, prune_dead_initializers, prune_dead_nodes};

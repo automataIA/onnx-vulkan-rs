@@ -143,6 +143,43 @@ if [ "$BUILD" = 1 ]; then
     fi
 fi
 
+# ------------------------------------------------- 1b. artifact freshness
+# A run loads two artifacts built from the same tree — the runner and the
+# plugin — and nothing in the process checks that they agree. When they do not,
+# the mismatch does not crash: it reports numbers, and they are wrong. A
+# half-built pair once produced a 1.5e-5 parity divergence that looked exactly
+# like a kernel regression and cost a bisection to attribute.
+#
+# The invariant is per artifact, not between them: every artifact must be newer
+# than every source it could have been built from.
+stale_source() { # artifact -> prints the first source newer than it, or nothing
+    find "$ROOT/crates" \
+        \( -name '*.rs' -o -name '*.wgsl' -o -name '*.toml' \) \
+        -newer "$1" -print -quit 2>/dev/null
+}
+
+check_fresh() { # kind, artifacts…
+    local kind=$1 artifact newer
+    shift
+    for artifact in "$@"; do
+        [ -f "$artifact" ] || die "missing $kind artifact: $artifact (drop -n?)"
+        newer="$(stale_source "$artifact")"
+        [ -z "$newer" ] || die "stale $kind artifact: ${artifact#"$ROOT/"} is older than \
+${newer#"$ROOT/"}. Rebuild — a runner and a plugin from different trees measure nothing."
+    done
+}
+
+if [ "$DRY" != 1 ] && [ "$HAS_NATIVE" = 1 ]; then
+    check_fresh native \
+        "$ROOT/target/release/model-runner" \
+        "$ROOT/target/release/libonnxruntime_ep_vulkan.so"
+fi
+if [ "$DRY" != 1 ] && [ "$HAS_WIN" = 1 ]; then
+    check_fresh "$TARGET" \
+        "$BIN_DIR/model-runner.exe" \
+        "$BIN_DIR/onnxruntime_ep_vulkan.dll"
+fi
+
 # ---------------------------------------------------------------- 2. staging
 stage() {
     echo "== staging → $WIN_DIR"

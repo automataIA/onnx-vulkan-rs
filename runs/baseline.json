@@ -1,14 +1,14 @@
 {
-  "tag": "nbits-fork",
+  "tag": "int8-gemm-gate",
   "env": {
     "host": "DESKTOP-K4CMG90",
-    "commit": "156fb22",
+    "commit": "c6be1d9",
     "dirty": true,
     "ort": "win-x64",
     "gpu": "NVIDIA GeForce RTX 4070",
     "driver": "610.74",
     "sample_ms": 100,
-    "when": "2026-07-30T11:19:45Z",
+    "when": "2026-07-31T11:27:03Z",
     "peak_tflops_fp32": 29.15,
     "peak_gb_s": 504.2
   },
@@ -26,12 +26,12 @@
       "device": "NVIDIA GeForce RTX 4070",
       "perf_valid": true,
       "wall_ms": {
-        "median": 15.1,
-        "min": 13.2,
-        "max": 16.0,
+        "median": 15.3,
+        "min": 14.3,
+        "max": 44.8,
         "iters_used": null
       },
-      "cpu_ep_ms": 25.2,
+      "cpu_ep_ms": 26.0,
       "accuracy": {
         "kind": "outputs",
         "worst_relative": 2.19e-05,
@@ -469,107 +469,107 @@
         "pareto": [
           {
             "op": "MatMulNBits",
-            "ms": 1.673,
-            "pct": 26.7,
+            "ms": 1.67,
+            "pct": 26.1,
             "dispatches": 130,
             "gflop": 0.5674,
             "gb": 0.1833,
-            "gflops": 339.15,
-            "gb_s": 109.56,
+            "gflops": 339.76,
+            "gb_s": 109.76,
             "intensity": 3.0955,
-            "pct_peak_compute": 1.16,
-            "pct_peak_bw": 21.73,
-            "efficiency": 0.2173,
+            "pct_peak_compute": 1.17,
+            "pct_peak_bw": 21.77,
+            "efficiency": 0.2177,
             "class": "memory"
           },
           {
             "op": "MatMulNBits_gemv",
-            "ms": 1.342,
-            "pct": 21.4,
+            "ms": 1.335,
+            "pct": 20.9,
             "dispatches": 52,
             "gflop": 0.8281,
             "gb": 0.2669,
-            "gflops": 617.06,
-            "gb_s": 198.88,
+            "gflops": 620.3,
+            "gb_s": 199.93,
             "intensity": 3.1027,
-            "pct_peak_compute": 2.12,
-            "pct_peak_bw": 39.44,
-            "efficiency": 0.3944,
+            "pct_peak_compute": 2.13,
+            "pct_peak_bw": 39.65,
+            "efficiency": 0.3965,
             "class": "memory"
           },
           {
             "op": "SimplifiedLayerNormalization",
-            "ms": 0.81,
-            "pct": 12.9,
+            "ms": 0.975,
+            "pct": 15.3,
             "dispatches": 157,
             "gflop": 0.0008,
             "gb": 0.0018,
-            "gflops": 0.99,
-            "gb_s": 2.22,
+            "gflops": 0.82,
+            "gb_s": 1.85,
             "intensity": 0.4444,
             "pct_peak_compute": 0.0,
-            "pct_peak_bw": 0.44,
-            "efficiency": 0.0044,
+            "pct_peak_bw": 0.37,
+            "efficiency": 0.0037,
             "class": "latency"
           },
           {
             "op": "GQA_scores",
-            "ms": 0.722,
-            "pct": 11.5,
+            "ms": 0.717,
+            "pct": 11.2,
             "dispatches": 26
           },
           {
             "op": "MatMulNBits_head",
-            "ms": 0.66,
-            "pct": 10.5,
+            "ms": 0.659,
+            "pct": 10.3,
             "dispatches": 1,
             "gflop": 0.604,
             "gb": 0.1945,
-            "gflops": 915.15,
-            "gb_s": 294.7,
+            "gflops": 916.54,
+            "gb_s": 295.14,
             "intensity": 3.1054,
             "pct_peak_compute": 3.14,
-            "pct_peak_bw": 58.45,
-            "efficiency": 0.5845,
+            "pct_peak_bw": 58.54,
+            "efficiency": 0.5854,
             "class": "memory"
           },
           {
             "op": "GQA_out",
-            "ms": 0.48,
-            "pct": 7.7,
+            "ms": 0.479,
+            "pct": 7.5,
             "dispatches": 26
           },
           {
             "op": "GQA_pack",
-            "ms": 0.156,
-            "pct": 2.5,
+            "ms": 0.147,
+            "pct": 2.3,
             "dispatches": 78
           },
           {
             "op": "GQA_past",
-            "ms": 0.118,
+            "ms": 0.12,
             "pct": 1.9,
             "dispatches": 52,
             "gflop": 0.0136,
             "gb": 0.8863,
-            "gflops": 115.25,
-            "gb_s": 7511.02,
+            "gflops": 113.33,
+            "gb_s": 7385.83,
             "intensity": 0.0153,
-            "pct_peak_compute": 0.4,
-            "pct_peak_bw": 1489.69,
-            "efficiency": 14.8964,
+            "pct_peak_compute": 0.39,
+            "pct_peak_bw": 1464.86,
+            "efficiency": 14.6482,
             "class": "memory"
           },
           {
             "op": "GQA_softmax",
-            "ms": 0.083,
-            "pct": 1.3,
+            "ms": 0.078,
+            "pct": 1.2,
             "dispatches": 26
           },
           {
             "op": "GeluTanh",
             "ms": 0.047,
-            "pct": 0.8,
+            "pct": 0.7,
             "dispatches": 26,
             "gflop": 0.0002,
             "gb": 0.0014,
@@ -583,20 +583,20 @@
           },
           {
             "op": "GatherBlockQuantized",
-            "ms": 0.004,
-            "pct": 0.1,
+            "ms": 0.002,
+            "pct": 0.0,
             "dispatches": 1
           }
         ],
-        "compute_ms": 6.267,
-        "sync_ms": 3.938,
+        "compute_ms": 6.394,
+        "sync_ms": 3.862,
         "flushes": 57,
         "upload_mb": 6.8,
         "download_mb": 7.9,
         "submits": 57,
-        "uploads": 57,
+        "uploads": 56,
         "downloads": 56,
-        "allocs": 176,
+        "allocs": 175,
         "pool_hits": 643
       },
       "peaks": {
@@ -608,20 +608,20 @@
         "convex_blocks": 1
       },
       "system": {
-        "samples": 24,
+        "samples": 28,
         "sm_pct": {
-          "mean": 6.0,
-          "max": 20.0,
-          "p95": 20.0
+          "mean": 2.3,
+          "max": 26.0,
+          "p95": 8.0
         },
-        "fb_peak_mb": 4408.0,
-        "vram_delta_mb": 2207.0,
-        "vram_idle_mb": 2201,
+        "fb_peak_mb": 5214.0,
+        "vram_delta_mb": 2254.0,
+        "vram_idle_mb": 2960,
         "vram_source": "global-delta",
-        "rss_mb": 2995.0,
+        "rss_mb": 2930.0,
         "cpu_pct": {
-          "mean": 164.4,
-          "max": 594.0
+          "mean": 146.2,
+          "max": 609.0
         }
       },
       "raw": {
@@ -638,6 +638,794 @@
       "reason": "model-runner already measures the CPU EP anyway"
     },
     {
+      "model": "mobilenetv2",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 50,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 14.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 1.6,
+        "min": 1.5,
+        "max": 1.9,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 1.9,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 9.21e-07,
+        "outputs": [
+          {
+            "name": "output",
+            "n": 1000,
+            "max_abs_delta": 1.24e-05,
+            "ref_scale": 13.47,
+            "relative": 9.21e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 632,
+                "argmax_got": 632
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 1.24e-05,
+                "mismatches": 0,
+                "argmax_expected": 632,
+                "argmax_got": 632
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv",
+            "ms": 0.315,
+            "pct": 29.6,
+            "dispatches": 17,
+            "gflop": 0.285,
+            "gb": 0.0244,
+            "gflops": 904.76,
+            "gb_s": 77.46,
+            "intensity": 11.6803,
+            "pct_peak_compute": 3.1,
+            "pct_peak_bw": 15.36,
+            "efficiency": 0.1536,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split",
+            "ms": 0.193,
+            "pct": 18.1,
+            "dispatches": 11,
+            "gflop": 0.1961,
+            "gb": 0.009,
+            "gflops": 1016.06,
+            "gb_s": 46.63,
+            "intensity": 21.7889,
+            "pct_peak_compute": 3.49,
+            "pct_peak_bw": 9.25,
+            "efficiency": 0.0925,
+            "class": "latency"
+          },
+          {
+            "op": "Conv16",
+            "ms": 0.137,
+            "pct": 12.9,
+            "dispatches": 7,
+            "gflop": 0.0765,
+            "gb": 0.0048,
+            "gflops": 558.39,
+            "gb_s": 35.04,
+            "intensity": 15.9375,
+            "pct_peak_compute": 1.92,
+            "pct_peak_bw": 6.95,
+            "efficiency": 0.0695,
+            "class": "latency"
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.136,
+            "pct": 12.8,
+            "dispatches": 1,
+            "gflop": 0.0026,
+            "gb": 0.0051,
+            "gflops": 19.12,
+            "gb_s": 37.5,
+            "intensity": 0.5098,
+            "pct_peak_compute": 0.07,
+            "pct_peak_bw": 7.44,
+            "efficiency": 0.0744,
+            "class": "latency"
+          },
+          {
+            "op": "Conv_grouped",
+            "ms": 0.129,
+            "pct": 12.1,
+            "dispatches": 17,
+            "gflop": 0.0414,
+            "gb": 0.0245,
+            "gflops": 320.93,
+            "gb_s": 189.92,
+            "intensity": 1.6898,
+            "pct_peak_compute": 1.1,
+            "pct_peak_bw": 37.67,
+            "efficiency": 0.3767,
+            "class": "memory"
+          },
+          {
+            "op": "Clip",
+            "ms": 0.084,
+            "pct": 7.9,
+            "dispatches": 35,
+            "gflop": 0.0061,
+            "gb": 0.0488,
+            "gflops": 72.62,
+            "gb_s": 580.95,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.25,
+            "pct_peak_bw": 115.22,
+            "efficiency": 1.1522,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.036,
+            "pct": 3.4,
+            "dispatches": 11
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.008,
+            "pct": 0.8,
+            "dispatches": 1,
+            "gflop": 0.0001,
+            "gb": 0.0003,
+            "gflops": 12.5,
+            "gb_s": 37.5,
+            "intensity": 0.3333,
+            "pct_peak_compute": 0.04,
+            "pct_peak_bw": 7.44,
+            "efficiency": 0.0744,
+            "class": "latency"
+          }
+        ],
+        "compute_ms": 1.062,
+        "sync_ms": 0.146,
+        "flushes": 2,
+        "upload_mb": 0.6,
+        "download_mb": 0.0,
+        "submits": 2,
+        "uploads": 1,
+        "downloads": 1,
+        "allocs": 52,
+        "pool_hits": 61
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 104,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 2,
+        "sm_pct": {
+          "mean": 22.0,
+          "max": 43.0,
+          "p95": 43.0
+        },
+        "fb_peak_mb": 3290.0,
+        "vram_delta_mb": 326.0,
+        "vram_idle_mb": 2964,
+        "vram_source": "global-delta",
+        "rss_mb": 201.0,
+        "cpu_pct": {
+          "mean": 215.5,
+          "max": 431.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "mobilenetv2",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "mobilenetv2-int8-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 4.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 2.1,
+        "min": 1.9,
+        "max": 2.5,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 0.9,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 0.0,
+        "outputs": [
+          {
+            "name": "output",
+            "n": 1000,
+            "max_abs_delta": 0.0,
+            "ref_scale": 9.769,
+            "relative": 0.0,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 971,
+                "argmax_got": 971
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "output",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 971,
+                "argmax_got": 971
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Requantize",
+            "ms": 0.276,
+            "pct": 30.3,
+            "dispatches": 53
+          },
+          {
+            "op": "ConvInteger_grouped",
+            "ms": 0.169,
+            "pct": 18.5,
+            "dispatches": 17
+          },
+          {
+            "op": "MMI_matmul_dot4",
+            "ms": 0.166,
+            "pct": 18.2,
+            "dispatches": 6
+          },
+          {
+            "op": "MMI_matmul_coop_k32",
+            "ms": 0.156,
+            "pct": 17.0,
+            "dispatches": 29
+          },
+          {
+            "op": "MMI_pack",
+            "ms": 0.069,
+            "pct": 7.5,
+            "dispatches": 34
+          },
+          {
+            "op": "QLinearAdd",
+            "ms": 0.037,
+            "pct": 4.0,
+            "dispatches": 11
+          },
+          {
+            "op": "ConvInteger",
+            "ms": 0.017,
+            "pct": 1.9,
+            "dispatches": 1
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.009,
+            "pct": 1.0,
+            "dispatches": 1
+          },
+          {
+            "op": "QuantizeLinear",
+            "ms": 0.008,
+            "pct": 0.9,
+            "dispatches": 2,
+            "gflop": 0.0002,
+            "gb": 0.0008,
+            "gflops": 25.0,
+            "gb_s": 100.0,
+            "intensity": 0.25,
+            "pct_peak_compute": 0.09,
+            "pct_peak_bw": 19.83,
+            "efficiency": 0.1983,
+            "class": "memory"
+          },
+          {
+            "op": "DequantizeLinear",
+            "ms": 0.006,
+            "pct": 0.7,
+            "dispatches": 3,
+            "gflop": 0.0001,
+            "gb": 0.0003,
+            "gflops": 16.67,
+            "gb_s": 50.0,
+            "intensity": 0.3333,
+            "pct_peak_compute": 0.06,
+            "pct_peak_bw": 9.92,
+            "efficiency": 0.0992,
+            "class": "latency"
+          }
+        ],
+        "compute_ms": 0.914,
+        "sync_ms": 0.185,
+        "flushes": 2,
+        "upload_mb": 0.7,
+        "download_mb": 0.0,
+        "submits": 2,
+        "uploads": 42,
+        "downloads": 1,
+        "allocs": 120,
+        "pool_hits": 81
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 73,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 1,
+        "sm_pct": {
+          "mean": 0.0,
+          "max": 0.0,
+          "p95": 0.0
+        },
+        "fb_peak_mb": 3279.0,
+        "vram_delta_mb": 328.0,
+        "vram_idle_mb": 2951,
+        "vram_source": "global-delta",
+        "rss_mb": 110.0,
+        "cpu_pct": {
+          "mean": 0.0,
+          "max": 0.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "mobilenetv2-int8-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "parakeet",
+      "mode": "compile",
+      "runner": "stt-app",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 700.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 43.1,
+        "min": 42.1,
+        "max": 46.8,
+        "iters_used": 19
+      },
+      "cpu_ep_ms": null,
+      "accuracy": {
+        "kind": "transcript",
+        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
+        "expect": "Well, I don't wish to see it any more",
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MMI_matmul_coop_k32",
+            "ms": 18.302,
+            "pct": 58.9,
+            "dispatches": 267,
+            "gflop": 103.7084,
+            "gb": 0.7162,
+            "gflops": 5666.51,
+            "gb_s": 39.13,
+            "intensity": 144.8037,
+            "pct_peak_compute": 19.44,
+            "pct_peak_bw": 7.76,
+            "efficiency": 0.1944,
+            "class": "compute"
+          },
+          {
+            "op": "MatMul",
+            "ms": 1.394,
+            "pct": 4.5,
+            "dispatches": 72,
+            "gflop": 1.6959,
+            "gb": 0.0904,
+            "gflops": 1216.57,
+            "gb_s": 64.85,
+            "intensity": 18.76,
+            "pct_peak_compute": 4.17,
+            "pct_peak_bw": 12.86,
+            "efficiency": 0.1286,
+            "class": "memory"
+          },
+          {
+            "op": "DQL_partial",
+            "ms": 1.261,
+            "pct": 4.1,
+            "dispatches": 223,
+            "gflop": 0.0447,
+            "gb": 0.2233,
+            "gflops": 35.45,
+            "gb_s": 177.08,
+            "intensity": 0.2002,
+            "pct_peak_compute": 0.12,
+            "pct_peak_bw": 35.12,
+            "efficiency": 0.3512,
+            "class": "memory"
+          },
+          {
+            "op": "Transpose",
+            "ms": 1.247,
+            "pct": 4.0,
+            "dispatches": 195,
+            "gflop": 0.0,
+            "gb": 0.1689,
+            "gflops": 0.0,
+            "gb_s": 135.45,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 26.86,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Cast_dev",
+            "ms": 0.774,
+            "pct": 2.5,
+            "dispatches": 294,
+            "gflop": 0.0,
+            "gb": 0.4455,
+            "gflops": 0.0,
+            "gb_s": 575.58,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 114.16,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "DQL_finalize",
+            "ms": 0.616,
+            "pct": 2.0,
+            "dispatches": 223
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.557,
+            "pct": 1.8,
+            "dispatches": 120,
+            "gflop": 0.0571,
+            "gb": 0.0924,
+            "gflops": 102.51,
+            "gb_s": 165.89,
+            "intensity": 0.618,
+            "pct_peak_compute": 0.35,
+            "pct_peak_bw": 32.9,
+            "efficiency": 0.329,
+            "class": "memory"
+          },
+          {
+            "op": "DQL_quantize",
+            "ms": 0.524,
+            "pct": 1.7,
+            "dispatches": 223
+          },
+          {
+            "op": "Slice",
+            "ms": 0.498,
+            "pct": 1.6,
+            "dispatches": 97,
+            "gflop": 0.0,
+            "gb": 0.1246,
+            "gflops": 0.0,
+            "gb_s": 250.2,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 49.62,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Where",
+            "ms": 0.479,
+            "pct": 1.5,
+            "dispatches": 72,
+            "gflop": 0.0056,
+            "gb": 0.0453,
+            "gflops": 11.69,
+            "gb_s": 94.57,
+            "intensity": 0.1236,
+            "pct_peak_compute": 0.04,
+            "pct_peak_bw": 18.76,
+            "efficiency": 0.1876,
+            "class": "memory"
+          },
+          {
+            "op": "ConvInteger_grouped",
+            "ms": 0.325,
+            "pct": 1.0,
+            "dispatches": 26,
+            "gflop": 0.0754,
+            "gb": 0.0271,
+            "gflops": 232.0,
+            "gb_s": 83.38,
+            "intensity": 2.7823,
+            "pct_peak_compute": 0.8,
+            "pct_peak_bw": 16.54,
+            "efficiency": 0.1654,
+            "class": "memory"
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.269,
+            "pct": 0.9,
+            "dispatches": 96,
+            "gflop": 0.0229,
+            "gb": 0.1828,
+            "gflops": 85.13,
+            "gb_s": 679.55,
+            "intensity": 0.1253,
+            "pct_peak_compute": 0.29,
+            "pct_peak_bw": 134.78,
+            "efficiency": 1.3478,
+            "class": "memory"
+          },
+          {
+            "op": "Pad",
+            "ms": 0.252,
+            "pct": 0.8,
+            "dispatches": 48,
+            "gflop": 0.0,
+            "gb": 0.0456,
+            "gflops": 0.0,
+            "gb_s": 180.95,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 35.89,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.234,
+            "pct": 0.8,
+            "dispatches": 24,
+            "gflop": 0.005,
+            "gb": 0.0133,
+            "gflops": 21.37,
+            "gb_s": 56.84,
+            "intensity": 0.3759,
+            "pct_peak_compute": 0.07,
+            "pct_peak_bw": 11.27,
+            "efficiency": 0.1127,
+            "class": "memory"
+          },
+          {
+            "op": "MMI_pack",
+            "ms": 0.11,
+            "pct": 0.4,
+            "dispatches": 50,
+            "gflop": 15.0177,
+            "gb": 0.1172,
+            "gflops": 136524.55,
+            "gb_s": 1065.45,
+            "intensity": 128.1374,
+            "pct_peak_compute": 468.35,
+            "pct_peak_bw": 211.31,
+            "efficiency": 4.6835,
+            "class": "compute"
+          },
+          {
+            "op": "relu",
+            "ms": 0.099,
+            "pct": 0.3,
+            "dispatches": 3,
+            "gflop": 0.008,
+            "gb": 0.064,
+            "gflops": 80.81,
+            "gb_s": 646.46,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.28,
+            "pct_peak_bw": 128.21,
+            "efficiency": 1.2822,
+            "class": "memory"
+          },
+          {
+            "op": "ConvInteger",
+            "ms": 0.091,
+            "pct": 0.3,
+            "dispatches": 1,
+            "gflop": 0.1097,
+            "gb": 0.0245,
+            "gflops": 1205.49,
+            "gb_s": 269.23,
+            "intensity": 4.4776,
+            "pct_peak_compute": 4.14,
+            "pct_peak_bw": 53.4,
+            "efficiency": 0.534,
+            "class": "memory"
+          }
+        ],
+        "compute_ms": 31.057,
+        "sync_ms": 0.695,
+        "flushes": 7,
+        "upload_mb": 0.4,
+        "download_mb": 0.4,
+        "submits": 7,
+        "uploads": 8,
+        "downloads": 6,
+        "allocs": 312,
+        "pool_hits": 3087
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 3249,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 16,
+        "sm_pct": {
+          "mean": 24.6,
+          "max": 69.0,
+          "p95": 69.0
+        },
+        "fb_peak_mb": 5532.0,
+        "vram_delta_mb": 2568.0,
+        "vram_idle_mb": 2964,
+        "vram_source": "global-delta",
+        "rss_mb": 1439.0,
+        "cpu_pct": {
+          "mean": 89.1,
+          "max": 336.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "parakeet",
+      "mode": "cpu",
+      "runner": "stt-app",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 700.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": null,
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 283.0,
+        "min": 266.2,
+        "max": 311.9,
+        "iters_used": 19
+      },
+      "cpu_ep_ms": null,
+      "accuracy": {
+        "kind": "transcript",
+        "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.",
+        "expect": "Well, I don't wish to see it any more",
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": null,
+      "gpu": null,
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {},
+      "system": {
+        "samples": 44,
+        "sm_pct": {
+          "mean": 1.6,
+          "max": 4.0,
+          "p95": 4.0
+        },
+        "fb_peak_mb": 2964.0,
+        "vram_delta_mb": 0.0,
+        "vram_idle_mb": 2964,
+        "vram_source": "global-delta",
+        "rss_mb": 806.0,
+        "cpu_pct": {
+          "mean": 491.0,
+          "max": 685.0
+        }
+      },
+      "raw": {
+        "stdout": "cpu.stdout.log",
+        "stats": null,
+        "metrics": "cpu.metrics.csv"
+      }
+    },
+    {
       "model": "qwen25vl-decoder",
       "mode": "compile",
       "runner": "model-runner",
@@ -650,12 +1438,12 @@
       "device": "NVIDIA GeForce RTX 4070",
       "perf_valid": true,
       "wall_ms": {
-        "median": 26.8,
-        "min": 24.7,
-        "max": 33.2,
+        "median": 27.1,
+        "min": 25.4,
+        "max": 28.5,
         "iters_used": null
       },
-      "cpu_ep_ms": 74.7,
+      "cpu_ep_ms": 75.0,
       "accuracy": {
         "kind": "outputs",
         "worst_relative": 2.6e-05,
@@ -1253,85 +2041,85 @@
         "pareto": [
           {
             "op": "MatMulNBits_gemv",
-            "ms": 4.969,
-            "pct": 37.2,
+            "ms": 4.472,
+            "pct": 34.4,
             "dispatches": 72,
             "gflop": 3.2464,
             "gb": 1.0436,
-            "gflops": 653.33,
-            "gb_s": 210.02,
+            "gflops": 725.94,
+            "gb_s": 233.36,
             "intensity": 3.1108,
-            "pct_peak_compute": 2.24,
-            "pct_peak_bw": 41.65,
-            "efficiency": 0.4165,
+            "pct_peak_compute": 2.49,
+            "pct_peak_bw": 46.28,
+            "efficiency": 0.4628,
             "class": "memory"
           },
           {
             "op": "MatMulNBits",
-            "ms": 4.072,
-            "pct": 30.4,
+            "ms": 4.241,
+            "pct": 32.6,
             "dispatches": 180,
             "gflop": 2.3027,
             "gb": 0.7413,
-            "gflops": 565.5,
-            "gb_s": 182.05,
+            "gflops": 542.96,
+            "gb_s": 174.79,
             "intensity": 3.1063,
-            "pct_peak_compute": 1.94,
-            "pct_peak_bw": 36.11,
-            "efficiency": 0.3611,
+            "pct_peak_compute": 1.86,
+            "pct_peak_bw": 34.67,
+            "efficiency": 0.3467,
             "class": "memory"
           },
           {
             "op": "MatMulNBits_head",
-            "ms": 0.672,
-            "pct": 5.0,
+            "ms": 0.677,
+            "pct": 5.2,
             "dispatches": 1,
             "gflop": 0.6223,
             "gb": 0.2,
-            "gflops": 926.04,
-            "gb_s": 297.62,
+            "gflops": 919.2,
+            "gb_s": 295.42,
             "intensity": 3.1115,
-            "pct_peak_compute": 3.18,
-            "pct_peak_bw": 59.03,
-            "efficiency": 0.5903,
+            "pct_peak_compute": 3.15,
+            "pct_peak_bw": 58.59,
+            "efficiency": 0.5859,
             "class": "memory"
           },
           {
             "op": "GQA_out",
-            "ms": 0.665,
-            "pct": 5.0,
+            "ms": 0.669,
+            "pct": 5.1,
+            "dispatches": 36
+          },
+          {
+            "op": "GQA_scores",
+            "ms": 0.547,
+            "pct": 4.2,
             "dispatches": 36
           },
           {
             "op": "Transpose",
-            "ms": 0.549,
+            "ms": 0.537,
             "pct": 4.1,
             "dispatches": 145,
             "gflop": 0.0,
             "gb": 0.0013,
             "gflops": 0.0,
-            "gb_s": 2.37,
+            "gb_s": 2.42,
             "intensity": 0.0,
             "pct_peak_compute": 0.0,
-            "pct_peak_bw": 0.47,
+            "pct_peak_bw": 0.48,
             "efficiency": 0.0,
             "class": "latency"
           },
           {
-            "op": "GQA_scores",
-            "ms": 0.545,
-            "pct": 4.1,
-            "dispatches": 36
-          },
-          {
             "op": "SkipSimplifiedLayerNormalization",
-            "ms": 0.497,
-            "pct": 3.7,
+            "ms": 0.495,
+            "pct": 3.8,
             "dispatches": 72,
             "gflop": 0.0009,
             "gb": 0.0029,
-            "gflops": 1.81,
-            "gb_s": 5.84,
+            "gflops": 1.82,
+            "gb_s": 5.86,
             "intensity": 0.3103,
             "pct_peak_compute": 0.01,
             "pct_peak_bw": 1.16,
@@ -1340,76 +2128,76 @@
           },
           {
             "op": "RotaryEmbedding",
-            "ms": 0.369,
-            "pct": 2.8,
+            "ms": 0.357,
+            "pct": 2.7,
             "dispatches": 72,
             "gflop": 0.0002,
             "gb": 0.0007,
-            "gflops": 0.54,
-            "gb_s": 1.9,
+            "gflops": 0.56,
+            "gb_s": 1.96,
             "intensity": 0.2857,
             "pct_peak_compute": 0.0,
-            "pct_peak_bw": 0.38,
-            "efficiency": 0.0037,
+            "pct_peak_bw": 0.39,
+            "efficiency": 0.0039,
             "class": "latency"
           },
           {
             "op": "GQA_pack",
-            "ms": 0.198,
+            "ms": 0.199,
             "pct": 1.5,
             "dispatches": 108
           },
           {
             "op": "GQA_past",
-            "ms": 0.162,
+            "ms": 0.158,
             "pct": 1.2,
             "dispatches": 72,
             "gflop": 0.0377,
             "gb": 0.0195,
-            "gflops": 232.72,
-            "gb_s": 120.37,
+            "gflops": 238.61,
+            "gb_s": 123.42,
             "intensity": 1.9333,
-            "pct_peak_compute": 0.8,
-            "pct_peak_bw": 23.87,
-            "efficiency": 0.2387,
+            "pct_peak_compute": 0.82,
+            "pct_peak_bw": 24.48,
+            "efficiency": 0.2448,
             "class": "memory"
           },
           {
             "op": "GQA_softmax",
-            "ms": 0.11,
-            "pct": 0.8,
+            "ms": 0.111,
+            "pct": 0.9,
             "dispatches": 36
           },
           {
             "op": "sigmoid",
-            "ms": 0.059,
-            "pct": 0.4,
+            "ms": 0.063,
+            "pct": 0.5,
             "dispatches": 36,
             "gflop": 0.0004,
             "gb": 0.0032,
-            "gflops": 6.78,
-            "gb_s": 54.24,
+            "gflops": 6.35,
+            "gb_s": 50.79,
             "intensity": 0.125,
             "pct_peak_compute": 0.02,
-            "pct_peak_bw": 10.76,
-            "efficiency": 0.1076,
+            "pct_peak_bw": 10.07,
+            "efficiency": 0.1008,
             "class": "memory"
           },
           {
-            "op": "Slice",
-            "ms": 0.04,
-            "pct": 0.3,
-            "dispatches": 8,
+            "op": "Gather",
+            "ms": 0.023,
+            "pct": 0.2,
+            "dispatches": 6,
             "gflop": 0.0,
             "gb": 0.0,
             "gflops": 0.0,
             "gb_s": 0.0
           },
           {
-            "op": "Gather",
-            "ms": 0.028,
-            "pct": 0.2,
-            "dispatches": 6,
+            "op": "Slice",
+            "ms": 0.019,
+            "pct": 0.1,
+            "dispatches": 8,
             "gflop": 0.0,
             "gb": 0.0,
             "gflops": 0.0,
@@ -1458,15 +2246,15 @@
             "dispatches": 1
           }
         ],
-        "compute_ms": 13.375,
-        "sync_ms": 5.718,
+        "compute_ms": 13.0,
+        "sync_ms": 5.554,
         "flushes": 77,
         "upload_mb": 9.4,
         "download_mb": 10.0,
         "submits": 77,
-        "uploads": 165,
+        "uploads": 151,
         "downloads": 76,
-        "allocs": 338,
+        "allocs": 324,
         "pool_hits": 1122
       },
       "peaks": {
@@ -1478,20 +2266,20 @@
         "convex_blocks": 1
       },
       "system": {
-        "samples": 57,
+        "samples": 66,
         "sm_pct": {
-          "mean": 8.8,
-          "max": 84.0,
-          "p95": 84.0
+          "mean": 4.6,
+          "max": 46.0,
+          "p95": 20.0
         },
-        "fb_peak_mb": 7120.0,
-        "vram_delta_mb": 4953.0,
-        "vram_idle_mb": 2167,
+        "fb_peak_mb": 7958.0,
+        "vram_delta_mb": 4998.0,
+        "vram_idle_mb": 2960,
         "vram_source": "global-delta",
-        "rss_mb": 7044.0,
+        "rss_mb": 7136.0,
         "cpu_pct": {
-          "mean": 174.8,
-          "max": 645.0
+          "mean": 157.0,
+          "max": 631.0
         }
       },
       "raw": {
@@ -1502,6 +2290,1952 @@
     },
     {
       "model": "qwen25vl-decoder",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "resnet50-int8-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 25.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 4.1,
+        "min": 3.8,
+        "max": 4.4,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 4.5,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 0.0,
+        "outputs": [
+          {
+            "name": "resnetv17_dense0_fwd",
+            "n": 1000,
+            "max_abs_delta": 0.0,
+            "ref_scale": 9.729,
+            "relative": 0.0,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "ConvInteger_split",
+            "ms": 1.4,
+            "pct": 51.0,
+            "dispatches": 22
+          },
+          {
+            "op": "MMI_matmul_coop_k32",
+            "ms": 0.534,
+            "pct": 19.4,
+            "dispatches": 30
+          },
+          {
+            "op": "Requantize",
+            "ms": 0.305,
+            "pct": 11.1,
+            "dispatches": 54
+          },
+          {
+            "op": "QLinearAdd",
+            "ms": 0.209,
+            "pct": 7.6,
+            "dispatches": 17
+          },
+          {
+            "op": "ConvInteger_split_reduce",
+            "ms": 0.074,
+            "pct": 2.7,
+            "dispatches": 22
+          },
+          {
+            "op": "MMI_pack",
+            "ms": 0.073,
+            "pct": 2.7,
+            "dispatches": 30
+          },
+          {
+            "op": "ConvInteger",
+            "ms": 0.066,
+            "pct": 2.4,
+            "dispatches": 1
+          },
+          {
+            "op": "MMI_matmul_dot4",
+            "ms": 0.043,
+            "pct": 1.6,
+            "dispatches": 1
+          },
+          {
+            "op": "QuantizeLinear",
+            "ms": 0.013,
+            "pct": 0.5,
+            "dispatches": 3,
+            "gflop": 0.0002,
+            "gb": 0.0008,
+            "gflops": 15.38,
+            "gb_s": 61.54,
+            "intensity": 0.25,
+            "pct_peak_compute": 0.05,
+            "pct_peak_bw": 12.21,
+            "efficiency": 0.122,
+            "class": "memory"
+          },
+          {
+            "op": "MaxPool_q",
+            "ms": 0.012,
+            "pct": 0.4,
+            "dispatches": 1,
+            "gflop": 0.0008,
+            "gb": 0.001,
+            "gflops": 66.67,
+            "gb_s": 83.33,
+            "intensity": 0.8,
+            "pct_peak_compute": 0.23,
+            "pct_peak_bw": 16.53,
+            "efficiency": 0.1653,
+            "class": "memory"
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.009,
+            "pct": 0.3,
+            "dispatches": 1
+          },
+          {
+            "op": "DequantizeLinear",
+            "ms": 0.006,
+            "pct": 0.2,
+            "dispatches": 3,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          }
+        ],
+        "compute_ms": 2.744,
+        "sync_ms": 0.157,
+        "flushes": 2,
+        "upload_mb": 0.7,
+        "download_mb": 0.0,
+        "submits": 2,
+        "uploads": 47,
+        "downloads": 1,
+        "allocs": 121,
+        "pool_hits": 113
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 78,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 2,
+        "sm_pct": {
+          "mean": 21.0,
+          "max": 37.0,
+          "p95": 37.0
+        },
+        "fb_peak_mb": 3279.0,
+        "vram_delta_mb": 328.0,
+        "vram_idle_mb": 2951,
+        "vram_source": "global-delta",
+        "rss_mb": 229.0,
+        "cpu_pct": {
+          "mean": 185.0,
+          "max": 370.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "resnet50-int8-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "resnet50-qdq-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 25.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 4.7,
+        "min": 4.6,
+        "max": 5.3,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 5.7,
+      "accuracy": {
+        "kind": "argmax",
+        "outputs": [
+          {
+            "output": "resnetv17_dense0_fwd",
+            "worst_abs": 0.0,
+            "mismatches": 0,
+            "argmax_expected": 489,
+            "argmax_got": 489
+          }
+        ],
+        "tolerated": true,
+        "criterion": "argmax equal to the official reference"
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "resnetv17_dense0_fwd",
+                "worst_abs": 0.0,
+                "mismatches": 0,
+                "argmax_expected": 489,
+                "argmax_got": 489
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 2.189,
+            "pct": 61.9,
+            "dispatches": 43,
+            "gflop": 6.628,
+            "gb": 0.1459,
+            "gflops": 3027.87,
+            "gb_s": 66.65,
+            "intensity": 45.4284,
+            "pct_peak_compute": 10.39,
+            "pct_peak_bw": 13.22,
+            "efficiency": 0.1322,
+            "class": "memory"
+          },
+          {
+            "op": "Conv",
+            "ms": 0.376,
+            "pct": 10.6,
+            "dispatches": 10,
+            "gflop": 1.0838,
+            "gb": 0.0309,
+            "gflops": 2882.45,
+            "gb_s": 82.18,
+            "intensity": 35.0744,
+            "pct_peak_compute": 9.89,
+            "pct_peak_bw": 16.3,
+            "efficiency": 0.163,
+            "class": "memory"
+          },
+          {
+            "op": "DequantizeLinear",
+            "ms": 0.269,
+            "pct": 7.6,
+            "dispatches": 78,
+            "gflop": 0.0181,
+            "gb": 0.0903,
+            "gflops": 67.29,
+            "gb_s": 335.69,
+            "intensity": 0.2004,
+            "pct_peak_compute": 0.23,
+            "pct_peak_bw": 66.58,
+            "efficiency": 0.6658,
+            "class": "memory"
+          },
+          {
+            "op": "QuantizeLinear",
+            "ms": 0.265,
+            "pct": 7.5,
+            "dispatches": 74,
+            "gflop": 0.0165,
+            "gb": 0.0823,
+            "gflops": 62.26,
+            "gb_s": 310.57,
+            "intensity": 0.2005,
+            "pct_peak_compute": 0.21,
+            "pct_peak_bw": 61.6,
+            "efficiency": 0.6159,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.169,
+            "pct": 4.8,
+            "dispatches": 43
+          },
+          {
+            "op": "relu",
+            "ms": 0.058,
+            "pct": 1.7,
+            "dispatches": 16,
+            "gflop": 0.0055,
+            "gb": 0.0442,
+            "gflops": 94.83,
+            "gb_s": 762.07,
+            "intensity": 0.1244,
+            "pct_peak_compute": 0.33,
+            "pct_peak_bw": 151.14,
+            "efficiency": 1.5115,
+            "class": "memory"
+          },
+          {
+            "op": "GEMV",
+            "ms": 0.027,
+            "pct": 0.8,
+            "dispatches": 1,
+            "gflop": 0.0041,
+            "gb": 0.0082,
+            "gflops": 151.85,
+            "gb_s": 303.7,
+            "intensity": 0.5,
+            "pct_peak_compute": 0.52,
+            "pct_peak_bw": 60.23,
+            "efficiency": 0.6023,
+            "class": "memory"
+          },
+          {
+            "op": "AveragePool",
+            "ms": 0.009,
+            "pct": 0.3,
+            "dispatches": 1,
+            "gflop": 0.0001,
+            "gb": 0.0004,
+            "gflops": 11.11,
+            "gb_s": 44.44,
+            "intensity": 0.25,
+            "pct_peak_compute": 0.04,
+            "pct_peak_bw": 8.81,
+            "efficiency": 0.0881,
+            "class": "latency"
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.008,
+            "pct": 0.2,
+            "dispatches": 1,
+            "gflop": 0.0008,
+            "gb": 0.004,
+            "gflops": 100.0,
+            "gb_s": 500.0,
+            "intensity": 0.2,
+            "pct_peak_compute": 0.34,
+            "pct_peak_bw": 99.17,
+            "efficiency": 0.9917,
+            "class": "memory"
+          },
+          {
+            "op": "GEMV_reduce",
+            "ms": 0.002,
+            "pct": 0.1,
+            "dispatches": 1
+          }
+        ],
+        "compute_ms": 3.534,
+        "sync_ms": 0.268,
+        "flushes": 2,
+        "upload_mb": 0.6,
+        "download_mb": 0.0,
+        "submits": 2,
+        "uploads": 1,
+        "downloads": 1,
+        "allocs": 67,
+        "pool_hits": 221
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 349,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 3,
+        "sm_pct": {
+          "mean": 0.0,
+          "max": 0.0,
+          "p95": 0.0
+        },
+        "fb_peak_mb": 3467.0,
+        "vram_delta_mb": 511.0,
+        "vram_idle_mb": 2956,
+        "vram_source": "global-delta",
+        "rss_mb": 249.0,
+        "cpu_pct": {
+          "mean": 216.3,
+          "max": 544.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "resnet50-qdq-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "rfdetr",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 5,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 129.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 39.2,
+        "min": 36.7,
+        "max": 40.2,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 349.2,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 0.000184,
+        "outputs": [
+          {
+            "name": "pred_boxes",
+            "n": 1200,
+            "max_abs_delta": 0.0001841,
+            "ref_scale": 1.001,
+            "relative": 0.000184,
+            "mismatches": 0
+          },
+          {
+            "name": "logits",
+            "n": 27300,
+            "max_abs_delta": 0.0001559,
+            "ref_scale": 10.09,
+            "relative": 1.54e-05,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MatMul",
+            "ms": 20.124,
+            "pct": 62.4,
+            "dispatches": 133,
+            "gflop": 81.2889,
+            "gb": 1.2112,
+            "gflops": 4039.4,
+            "gb_s": 60.19,
+            "intensity": 67.1143,
+            "pct_peak_compute": 13.86,
+            "pct_peak_bw": 11.94,
+            "efficiency": 0.1386,
+            "class": "compute"
+          },
+          {
+            "op": "Softmax",
+            "ms": 1.925,
+            "pct": 6.0,
+            "dispatches": 17,
+            "gflop": 0.1711,
+            "gb": 0.4562,
+            "gflops": 88.88,
+            "gb_s": 236.99,
+            "intensity": 0.3751,
+            "pct_peak_compute": 0.3,
+            "pct_peak_bw": 47.0,
+            "efficiency": 0.47,
+            "class": "memory"
+          },
+          {
+            "op": "Transpose",
+            "ms": 1.787,
+            "pct": 5.5,
+            "dispatches": 83,
+            "gflop": 0.0,
+            "gb": 0.2992,
+            "gflops": 0.0,
+            "gb_s": 167.43,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 33.21,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Conv_split",
+            "ms": 1.109,
+            "pct": 3.4,
+            "dispatches": 8,
+            "gflop": 4.6137,
+            "gb": 0.0328,
+            "gflops": 4160.23,
+            "gb_s": 29.58,
+            "intensity": 140.6616,
+            "pct_peak_compute": 14.27,
+            "pct_peak_bw": 5.87,
+            "efficiency": 0.1427,
+            "class": "compute"
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.518,
+            "pct": 1.6,
+            "dispatches": 37,
+            "gflop": 0.0866,
+            "gb": 0.1386,
+            "gflops": 167.18,
+            "gb_s": 267.57,
+            "intensity": 0.6248,
+            "pct_peak_compute": 0.57,
+            "pct_peak_bw": 53.07,
+            "efficiency": 0.5307,
+            "class": "memory"
+          },
+          {
+            "op": "ReduceMean",
+            "ms": 0.427,
+            "pct": 1.3,
+            "dispatches": 18,
+            "gflop": 0.0049,
+            "gb": 0.0198,
+            "gflops": 11.48,
+            "gb_s": 46.37,
+            "intensity": 0.2475,
+            "pct_peak_compute": 0.04,
+            "pct_peak_bw": 9.2,
+            "efficiency": 0.092,
+            "class": "latency"
+          },
+          {
+            "op": "Slice",
+            "ms": 0.239,
+            "pct": 0.7,
+            "dispatches": 34,
+            "gflop": 0.0,
+            "gb": 0.0423,
+            "gflops": 0.0,
+            "gb_s": 176.99,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 35.1,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Conv",
+            "ms": 0.187,
+            "pct": 0.6,
+            "dispatches": 1,
+            "gflop": 0.7225,
+            "gb": 0.0071,
+            "gflops": 3863.64,
+            "gb_s": 37.97,
+            "intensity": 101.7606,
+            "pct_peak_compute": 13.25,
+            "pct_peak_bw": 7.53,
+            "efficiency": 0.1325,
+            "class": "compute"
+          },
+          {
+            "op": "Erf",
+            "ms": 0.168,
+            "pct": 0.5,
+            "dispatches": 11,
+            "gflop": 0.0273,
+            "gb": 0.2184,
+            "gflops": 162.5,
+            "gb_s": 1300.0,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.56,
+            "pct_peak_bw": 257.83,
+            "efficiency": 2.5783,
+            "class": "memory"
+          },
+          {
+            "op": "Concat",
+            "ms": 0.14,
+            "pct": 0.4,
+            "dispatches": 37,
+            "gflop": 0.0,
+            "gb": 0.0453,
+            "gflops": 0.0,
+            "gb_s": 323.57,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 64.17,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Resize",
+            "ms": 0.042,
+            "pct": 0.1,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0046,
+            "gflops": 0.0,
+            "gb_s": 109.52,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 21.72,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "MatMul16",
+            "ms": 0.033,
+            "pct": 0.1,
+            "dispatches": 2,
+            "gflop": 0.0039,
+            "gb": 0.002,
+            "gflops": 118.18,
+            "gb_s": 60.61,
+            "intensity": 1.95,
+            "pct_peak_compute": 0.41,
+            "pct_peak_bw": 12.02,
+            "efficiency": 0.1202,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.033,
+            "pct": 0.1,
+            "dispatches": 8
+          },
+          {
+            "op": "GridSample",
+            "ms": 0.03,
+            "pct": 0.1,
+            "dispatches": 3
+          },
+          {
+            "op": "relu",
+            "ms": 0.026,
+            "pct": 0.1,
+            "dispatches": 8,
+            "gflop": 0.0029,
+            "gb": 0.0231,
+            "gflops": 111.54,
+            "gb_s": 888.46,
+            "intensity": 0.1255,
+            "pct_peak_compute": 0.38,
+            "pct_peak_bw": 176.21,
+            "efficiency": 1.7621,
+            "class": "memory"
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.024,
+            "pct": 0.1,
+            "dispatches": 8,
+            "gflop": 0.002,
+            "gb": 0.0164,
+            "gflops": 83.33,
+            "gb_s": 683.33,
+            "intensity": 0.122,
+            "pct_peak_compute": 0.29,
+            "pct_peak_bw": 135.53,
+            "efficiency": 1.3552,
+            "class": "memory"
+          },
+          {
+            "op": "Gather",
+            "ms": 0.017,
+            "pct": 0.1,
+            "dispatches": 7,
+            "gflop": 0.0,
+            "gb": 0.0005,
+            "gflops": 0.0,
+            "gb_s": 29.41,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 5.83,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Sqrt",
+            "ms": 0.016,
+            "pct": 0.1,
+            "dispatches": 9,
+            "gflop": 0.0,
+            "gb": 0.0001,
+            "gflops": 0.0,
+            "gb_s": 6.25,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 1.24,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Where",
+            "ms": 0.016,
+            "pct": 0.1,
+            "dispatches": 2,
+            "gflop": 0.0004,
+            "gb": 0.0033,
+            "gflops": 25.0,
+            "gb_s": 206.25,
+            "intensity": 0.1212,
+            "pct_peak_compute": 0.09,
+            "pct_peak_bw": 40.91,
+            "efficiency": 0.4091,
+            "class": "memory"
+          },
+          {
+            "op": "ReduceMax",
+            "ms": 0.013,
+            "pct": 0.0,
+            "dispatches": 1,
+            "gflop": 0.0001,
+            "gb": 0.0006,
+            "gflops": 7.69,
+            "gb_s": 46.15,
+            "intensity": 0.1667,
+            "pct_peak_compute": 0.03,
+            "pct_peak_bw": 9.15,
+            "efficiency": 0.0915,
+            "class": "latency"
+          },
+          {
+            "op": "Cos",
+            "ms": 0.007,
+            "pct": 0.0,
+            "dispatches": 4
+          },
+          {
+            "op": "ReduceSum",
+            "ms": 0.006,
+            "pct": 0.0,
+            "dispatches": 3,
+            "gflop": 0.0005,
+            "gb": 0.0028,
+            "gflops": 83.33,
+            "gb_s": 466.67,
+            "intensity": 0.1786,
+            "pct_peak_compute": 0.29,
+            "pct_peak_bw": 92.56,
+            "efficiency": 0.9255,
+            "class": "memory"
+          },
+          {
+            "op": "Sin",
+            "ms": 0.005,
+            "pct": 0.0,
+            "dispatches": 4
+          },
+          {
+            "op": "Exp",
+            "ms": 0.005,
+            "pct": 0.0,
+            "dispatches": 3,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          }
+        ],
+        "compute_ms": 32.241,
+        "sync_ms": 0.77,
+        "flushes": 9,
+        "upload_mb": 4.1,
+        "download_mb": 0.2,
+        "submits": 9,
+        "uploads": 11,
+        "downloads": 8,
+        "allocs": 87,
+        "pool_hits": 815
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 1069,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 15,
+        "sm_pct": {
+          "mean": 3.0,
+          "max": 15.0,
+          "p95": 15.0
+        },
+        "fb_peak_mb": 3742.0,
+        "vram_delta_mb": 778.0,
+        "vram_idle_mb": 2964,
+        "vram_source": "global-delta",
+        "rss_mb": 656.0,
+        "cpu_pct": {
+          "mean": 344.9,
+          "max": 678.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "rfdetr",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "roberta-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 499.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 3.6,
+        "min": 3.3,
+        "max": 4.1,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 6.9,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 9.05e-07,
+        "outputs": [
+          {
+            "name": "output_1",
+            "n": 768,
+            "max_abs_delta": 3.815e-06,
+            "ref_scale": 11.29,
+            "relative": 3.38e-07,
+            "mismatches": 0
+          },
+          {
+            "name": "output_2",
+            "n": 768,
+            "max_abs_delta": 5.662e-07,
+            "ref_scale": 0.6258,
+            "relative": 9.05e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "output_1",
+                "worst_abs": 9.835e-07,
+                "mismatches": 0,
+                "argmax_expected": 588,
+                "argmax_got": 588
+              },
+              {
+                "output": "output_2",
+                "worst_abs": 3.651e-07,
+                "mismatches": 0,
+                "argmax_expected": 507,
+                "argmax_got": 507
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "output_1",
+                "worst_abs": 3.815e-06,
+                "mismatches": 0,
+                "argmax_expected": 588,
+                "argmax_got": 588
+              },
+              {
+                "output": "output_2",
+                "worst_abs": 7.153e-07,
+                "mismatches": 0,
+                "argmax_expected": 507,
+                "argmax_got": 507
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "GEMV",
+            "ms": 1.004,
+            "pct": 45.8,
+            "dispatches": 72,
+            "gflop": 0.1699,
+            "gb": 0.3404,
+            "gflops": 169.22,
+            "gb_s": 339.04,
+            "intensity": 0.4991,
+            "pct_peak_compute": 0.58,
+            "pct_peak_bw": 67.24,
+            "efficiency": 0.6724,
+            "class": "memory"
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.223,
+            "pct": 10.2,
+            "dispatches": 48,
+            "gflop": 0.0,
+            "gb": 0.0003,
+            "gflops": 0.0,
+            "gb_s": 1.35,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.27,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "GEMV_reduce",
+            "ms": 0.201,
+            "pct": 9.2,
+            "dispatches": 72
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.103,
+            "pct": 4.7,
+            "dispatches": 25,
+            "gflop": 0.0001,
+            "gb": 0.0003,
+            "gflops": 0.97,
+            "gb_s": 2.91,
+            "intensity": 0.3333,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.58,
+            "efficiency": 0.0058,
+            "class": "latency"
+          },
+          {
+            "op": "MatMul16",
+            "ms": 0.098,
+            "pct": 4.5,
+            "dispatches": 24,
+            "gflop": 0.0,
+            "gb": 0.0001,
+            "gflops": 0.0,
+            "gb_s": 1.02,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 0.2,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.088,
+            "pct": 4.0,
+            "dispatches": 1,
+            "gflop": 0.0012,
+            "gb": 0.0024,
+            "gflops": 13.64,
+            "gb_s": 27.27,
+            "intensity": 0.5,
+            "pct_peak_compute": 0.05,
+            "pct_peak_bw": 5.41,
+            "efficiency": 0.0541,
+            "class": "latency"
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.042,
+            "pct": 1.9,
+            "dispatches": 12,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          },
+          {
+            "op": "Erf",
+            "ms": 0.02,
+            "pct": 0.9,
+            "dispatches": 12,
+            "gflop": 0.0,
+            "gb": 0.0003,
+            "gflops": 0.0,
+            "gb_s": 15.0,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 2.98,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Gather",
+            "ms": 0.009,
+            "pct": 0.4,
+            "dispatches": 4,
+            "gflop": 0.0,
+            "gb": 0.156,
+            "gflops": 0.0,
+            "gb_s": 17333.33,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 3437.79,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.002,
+            "pct": 0.1,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          }
+        ],
+        "compute_ms": 2.194,
+        "sync_ms": 0.38,
+        "flushes": 4,
+        "upload_mb": 0.0,
+        "download_mb": 0.0,
+        "submits": 4,
+        "uploads": 2,
+        "downloads": 3,
+        "allocs": 84,
+        "pool_hits": 411
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 636,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 9,
+        "sm_pct": {
+          "mean": 2.7,
+          "max": 24.0,
+          "p95": 24.0
+        },
+        "fb_peak_mb": 4374.0,
+        "vram_delta_mb": 1418.0,
+        "vram_idle_mb": 2956,
+        "vram_source": "global-delta",
+        "rss_mb": 1564.0,
+        "cpu_pct": {
+          "mean": 135.8,
+          "max": 386.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "roberta-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "roberta-seq128",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 499.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 19.2,
+        "min": 17.9,
+        "max": 19.7,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 49.1,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 2.22e-06,
+        "outputs": [
+          {
+            "name": "output_1",
+            "n": 98304,
+            "max_abs_delta": 2.67e-05,
+            "ref_scale": 12.0,
+            "relative": 2.22e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "output_2",
+            "n": 768,
+            "max_abs_delta": 8.345e-07,
+            "ref_scale": 0.5699,
+            "relative": 1.46e-06,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "MatMul",
+            "ms": 14.637,
+            "pct": 89.0,
+            "dispatches": 96,
+            "gflop": 22.3473,
+            "gb": 0.4624,
+            "gflops": 1526.77,
+            "gb_s": 31.59,
+            "intensity": 48.3289,
+            "pct_peak_compute": 5.24,
+            "pct_peak_bw": 6.27,
+            "efficiency": 0.0627,
+            "class": "latency"
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.33,
+            "pct": 2.0,
+            "dispatches": 48,
+            "gflop": 0.0,
+            "gb": 0.0377,
+            "gflops": 0.0,
+            "gb_s": 114.24,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 22.66,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.215,
+            "pct": 1.3,
+            "dispatches": 12,
+            "gflop": 0.0071,
+            "gb": 0.0189,
+            "gflops": 33.02,
+            "gb_s": 87.91,
+            "intensity": 0.3757,
+            "pct_peak_compute": 0.11,
+            "pct_peak_bw": 17.44,
+            "efficiency": 0.1743,
+            "class": "memory"
+          },
+          {
+            "op": "LayerNormalization",
+            "ms": 0.109,
+            "pct": 0.7,
+            "dispatches": 25,
+            "gflop": 0.0123,
+            "gb": 0.0198,
+            "gflops": 112.84,
+            "gb_s": 181.65,
+            "intensity": 0.6212,
+            "pct_peak_compute": 0.39,
+            "pct_peak_bw": 36.03,
+            "efficiency": 0.3603,
+            "class": "memory"
+          },
+          {
+            "op": "Gemm",
+            "ms": 0.08,
+            "pct": 0.5,
+            "dispatches": 1,
+            "gflop": 0.0012,
+            "gb": 0.0024,
+            "gflops": 15.0,
+            "gb_s": 30.0,
+            "intensity": 0.5,
+            "pct_peak_compute": 0.05,
+            "pct_peak_bw": 5.95,
+            "efficiency": 0.0595,
+            "class": "latency"
+          },
+          {
+            "op": "Erf",
+            "ms": 0.049,
+            "pct": 0.3,
+            "dispatches": 12,
+            "gflop": 0.0047,
+            "gb": 0.0377,
+            "gflops": 95.92,
+            "gb_s": 769.39,
+            "intensity": 0.1247,
+            "pct_peak_compute": 0.33,
+            "pct_peak_bw": 152.6,
+            "efficiency": 1.526,
+            "class": "memory"
+          },
+          {
+            "op": "Gather",
+            "ms": 0.018,
+            "pct": 0.1,
+            "dispatches": 4,
+            "gflop": 0.0,
+            "gb": 0.1576,
+            "gflops": 0.0,
+            "gb_s": 8755.56,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 1736.53,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.002,
+            "pct": 0.0,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0,
+            "gflops": 0.0,
+            "gb_s": 0.0
+          }
+        ],
+        "compute_ms": 16.442,
+        "sync_ms": 0.436,
+        "flushes": 4,
+        "upload_mb": 0.0,
+        "download_mb": 0.4,
+        "submits": 4,
+        "uploads": 5,
+        "downloads": 3,
+        "allocs": 17,
+        "pool_hits": 409
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 636,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 16,
+        "sm_pct": {
+          "mean": 13.2,
+          "max": 91.0,
+          "p95": 91.0
+        },
+        "fb_peak_mb": 4374.0,
+        "vram_delta_mb": 1418.0,
+        "vram_idle_mb": 2956,
+        "vram_source": "global-delta",
+        "rss_mb": 1749.0,
+        "cpu_pct": {
+          "mean": 267.4,
+          "max": 671.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "roberta-seq128",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "yolov4-golden",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 20,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 245.0,
+      "perf_tol": 10.0,
+      "golden": true,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 31.2,
+        "min": 30.6,
+        "max": 33.4,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 162.8,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 4.09e-06,
+        "outputs": [
+          {
+            "name": "Identity:0",
+            "n": 689520,
+            "max_abs_delta": 8.523e-06,
+            "ref_scale": 2.085,
+            "relative": 4.09e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "Identity_1:0",
+            "n": 172380,
+            "max_abs_delta": 4.262e-06,
+            "ref_scale": 2.898,
+            "relative": 1.47e-06,
+            "mismatches": 0
+          },
+          {
+            "name": "Identity_2:0",
+            "n": 43095,
+            "max_abs_delta": 4.008e-06,
+            "ref_scale": 3.109,
+            "relative": 1.29e-06,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": {
+        "backends": {
+          "cpu": {
+            "outputs": [
+              {
+                "output": "Identity:0",
+                "worst_abs": 4.172e-06,
+                "mismatches": 0,
+                "argmax_expected": 676430,
+                "argmax_got": 676430
+              },
+              {
+                "output": "Identity_1:0",
+                "worst_abs": 2.25e-06,
+                "mismatches": 0,
+                "argmax_expected": 1956,
+                "argmax_got": 1956
+              },
+              {
+                "output": "Identity_2:0",
+                "worst_abs": 1.237e-06,
+                "mismatches": 0,
+                "argmax_expected": 36550,
+                "argmax_got": 36550
+              }
+            ],
+            "ok": true
+          },
+          "vulkan": {
+            "outputs": [
+              {
+                "output": "Identity:0",
+                "worst_abs": 7.629e-06,
+                "mismatches": 0,
+                "argmax_expected": 676430,
+                "argmax_got": 676430
+              },
+              {
+                "output": "Identity_1:0",
+                "worst_abs": 4.768e-06,
+                "mismatches": 0,
+                "argmax_expected": 1956,
+                "argmax_got": 1956
+              },
+              {
+                "output": "Identity_2:0",
+                "worst_abs": 3.532e-06,
+                "mismatches": 0,
+                "argmax_expected": 36550,
+                "argmax_got": 36550
+              }
+            ],
+            "ok": true
+          }
+        },
+        "ok": true,
+        "cpu_agrees": true
+      },
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 10.87,
+            "pct": 55.2,
+            "dispatches": 78,
+            "gflop": 42.6178,
+            "gb": 0.3896,
+            "gflops": 3920.68,
+            "gb_s": 35.84,
+            "intensity": 109.3886,
+            "pct_peak_compute": 13.45,
+            "pct_peak_bw": 7.11,
+            "efficiency": 0.1345,
+            "class": "compute"
+          },
+          {
+            "op": "Conv",
+            "ms": 4.106,
+            "pct": 20.9,
+            "dispatches": 32,
+            "gflop": 17.487,
+            "gb": 0.326,
+            "gflops": 4258.89,
+            "gb_s": 79.4,
+            "intensity": 53.6411,
+            "pct_peak_compute": 14.61,
+            "pct_peak_bw": 15.75,
+            "efficiency": 0.1575,
+            "class": "memory"
+          },
+          {
+            "op": "Tanh",
+            "ms": 0.451,
+            "pct": 2.3,
+            "dispatches": 72,
+            "gflop": 0.0444,
+            "gb": 0.3551,
+            "gflops": 98.45,
+            "gb_s": 787.36,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.34,
+            "pct_peak_bw": 156.16,
+            "efficiency": 1.5616,
+            "class": "memory"
+          },
+          {
+            "op": "Log",
+            "ms": 0.415,
+            "pct": 2.1,
+            "dispatches": 72,
+            "gflop": 0.0444,
+            "gb": 0.3551,
+            "gflops": 106.99,
+            "gb_s": 855.66,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.37,
+            "pct_peak_bw": 169.71,
+            "efficiency": 1.6971,
+            "class": "memory"
+          },
+          {
+            "op": "Exp",
+            "ms": 0.388,
+            "pct": 2.0,
+            "dispatches": 72,
+            "gflop": 0.0444,
+            "gb": 0.3551,
+            "gflops": 114.43,
+            "gb_s": 915.21,
+            "intensity": 0.125,
+            "pct_peak_compute": 0.39,
+            "pct_peak_bw": 181.52,
+            "efficiency": 1.8151,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.369,
+            "pct": 1.9,
+            "dispatches": 78
+          },
+          {
+            "op": "Concat",
+            "ms": 0.152,
+            "pct": 0.8,
+            "dispatches": 31,
+            "gflop": 0.0,
+            "gb": 0.0875,
+            "gflops": 0.0,
+            "gb_s": 575.66,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 114.17,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "LeakyRelu",
+            "ms": 0.105,
+            "pct": 0.5,
+            "dispatches": 35,
+            "gflop": 0.0083,
+            "gb": 0.0661,
+            "gflops": 79.05,
+            "gb_s": 629.52,
+            "intensity": 0.1256,
+            "pct_peak_compute": 0.27,
+            "pct_peak_bw": 124.86,
+            "efficiency": 1.2486,
+            "class": "memory"
+          },
+          {
+            "op": "Slice",
+            "ms": 0.068,
+            "pct": 0.3,
+            "dispatches": 9,
+            "gflop": 0.0,
+            "gb": 0.0072,
+            "gflops": 0.0,
+            "gb_s": 105.88,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 21.0,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.061,
+            "pct": 0.3,
+            "dispatches": 3,
+            "gflop": 0.0003,
+            "gb": 0.0021,
+            "gflops": 4.92,
+            "gb_s": 34.43,
+            "intensity": 0.1429,
+            "pct_peak_compute": 0.02,
+            "pct_peak_bw": 6.83,
+            "efficiency": 0.0683,
+            "class": "latency"
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.06,
+            "pct": 0.3,
+            "dispatches": 4,
+            "gflop": 0.0,
+            "gb": 0.0114,
+            "gflops": 0.0,
+            "gb_s": 190.0,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 37.68,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.015,
+            "pct": 0.1,
+            "dispatches": 6,
+            "gflop": 0.0009,
+            "gb": 0.0069,
+            "gflops": 60.0,
+            "gb_s": 460.0,
+            "intensity": 0.1304,
+            "pct_peak_compute": 0.21,
+            "pct_peak_bw": 91.23,
+            "efficiency": 0.9123,
+            "class": "memory"
+          },
+          {
+            "op": "Resize",
+            "ms": 0.008,
+            "pct": 0.0,
+            "dispatches": 2,
+            "gflop": 0.0,
+            "gb": 0.0026,
+            "gflops": 0.0,
+            "gb_s": 325.0,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 64.46,
+            "efficiency": 0.0,
+            "class": "latency"
+          }
+        ],
+        "compute_ms": 19.689,
+        "sync_ms": 5.425,
+        "flushes": 4,
+        "upload_mb": 2.1,
+        "download_mb": 3.6,
+        "submits": 4,
+        "uploads": 1,
+        "downloads": 3,
+        "allocs": 124,
+        "pool_hits": 526
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 589,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 30,
+        "sm_pct": {
+          "mean": 15.6,
+          "max": 77.0,
+          "p95": 77.0
+        },
+        "fb_peak_mb": 4246.0,
+        "vram_delta_mb": 1295.0,
+        "vram_idle_mb": 2951,
+        "vram_source": "global-delta",
+        "rss_mb": 911.0,
+        "cpu_pct": {
+          "mean": 409.1,
+          "max": 661.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "yolov4-golden",
+      "mode": "cpu",
+      "status": "skip",
+      "ok": true,
+      "reason": "model-runner already measures the CPU EP anyway"
+    },
+    {
+      "model": "yolov8n",
+      "mode": "compile",
+      "runner": "model-runner",
+      "iters": 50,
+      "ok": true,
+      "exit_code": 0,
+      "model_size_mb": 13.0,
+      "perf_tol": 10.0,
+      "golden": false,
+      "device": "NVIDIA GeForce RTX 4070",
+      "perf_valid": true,
+      "wall_ms": {
+        "median": 7.2,
+        "min": 6.7,
+        "max": 9.6,
+        "iters_used": null
+      },
+      "cpu_ep_ms": 24.6,
+      "accuracy": {
+        "kind": "outputs",
+        "worst_relative": 7.65e-07,
+        "outputs": [
+          {
+            "name": "output0",
+            "n": 705600,
+            "max_abs_delta": 0.0004883,
+            "ref_scale": 637.9,
+            "relative": 7.65e-07,
+            "mismatches": 0
+          }
+        ],
+        "tolerated": true
+      },
+      "parity": null,
+      "reference": null,
+      "gpu": {
+        "pareto": [
+          {
+            "op": "Conv_split",
+            "ms": 1.967,
+            "pct": 40.7,
+            "dispatches": 41,
+            "gflop": 5.8665,
+            "gb": 0.0652,
+            "gflops": 2982.46,
+            "gb_s": 33.15,
+            "intensity": 89.977,
+            "pct_peak_compute": 10.23,
+            "pct_peak_bw": 6.57,
+            "efficiency": 0.1023,
+            "class": "compute"
+          },
+          {
+            "op": "Conv",
+            "ms": 1.292,
+            "pct": 26.7,
+            "dispatches": 21,
+            "gflop": 2.8691,
+            "gb": 0.0895,
+            "gflops": 2220.67,
+            "gb_s": 69.27,
+            "intensity": 32.057,
+            "pct_peak_compute": 7.62,
+            "pct_peak_bw": 13.74,
+            "efficiency": 0.1374,
+            "class": "memory"
+          },
+          {
+            "op": "Softmax",
+            "ms": 0.365,
+            "pct": 7.5,
+            "dispatches": 1,
+            "gflop": 0.0016,
+            "gb": 0.0043,
+            "gflops": 4.38,
+            "gb_s": 11.78,
+            "intensity": 0.3721,
+            "pct_peak_compute": 0.02,
+            "pct_peak_bw": 2.34,
+            "efficiency": 0.0233,
+            "class": "latency"
+          },
+          {
+            "op": "sigmoid",
+            "ms": 0.18,
+            "pct": 3.7,
+            "dispatches": 58,
+            "gflop": 0.0146,
+            "gb": 0.1165,
+            "gflops": 81.11,
+            "gb_s": 647.22,
+            "intensity": 0.1253,
+            "pct_peak_compute": 0.28,
+            "pct_peak_bw": 128.37,
+            "efficiency": 1.2836,
+            "class": "memory"
+          },
+          {
+            "op": "Conv_split_reduce",
+            "ms": 0.171,
+            "pct": 3.5,
+            "dispatches": 41
+          },
+          {
+            "op": "Concat",
+            "ms": 0.166,
+            "pct": 3.4,
+            "dispatches": 51,
+            "gflop": 0.0,
+            "gb": 0.0773,
+            "gflops": 0.0,
+            "gb_s": 465.66,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 92.36,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Slice",
+            "ms": 0.136,
+            "pct": 2.8,
+            "dispatches": 20,
+            "gflop": 0.0,
+            "gb": 0.0297,
+            "gflops": 0.0,
+            "gb_s": 218.38,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 43.31,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "Transpose",
+            "ms": 0.025,
+            "pct": 0.5,
+            "dispatches": 1,
+            "gflop": 0.0,
+            "gb": 0.0043,
+            "gflops": 0.0,
+            "gb_s": 172.0,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 34.11,
+            "efficiency": 0.0,
+            "class": "latency"
+          },
+          {
+            "op": "MaxPool",
+            "ms": 0.018,
+            "pct": 0.4,
+            "dispatches": 3,
+            "gflop": 0.0002,
+            "gb": 0.0012,
+            "gflops": 11.11,
+            "gb_s": 66.67,
+            "intensity": 0.1667,
+            "pct_peak_compute": 0.04,
+            "pct_peak_bw": 13.22,
+            "efficiency": 0.1322,
+            "class": "memory"
+          },
+          {
+            "op": "Conv16",
+            "ms": 0.015,
+            "pct": 0.3,
+            "dispatches": 2,
+            "gflop": 0.0084,
+            "gb": 0.0005,
+            "gflops": 560.0,
+            "gb_s": 33.33,
+            "intensity": 16.8,
+            "pct_peak_compute": 1.92,
+            "pct_peak_bw": 6.61,
+            "efficiency": 0.0661,
+            "class": "latency"
+          },
+          {
+            "op": "Resize",
+            "ms": 0.013,
+            "pct": 0.3,
+            "dispatches": 2,
+            "gflop": 0.0,
+            "gb": 0.0061,
+            "gflops": 0.0,
+            "gb_s": 469.23,
+            "intensity": 0.0,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bw": 93.06,
+            "efficiency": 0.0,
+            "class": "latency"
+          }
+        ],
+        "compute_ms": 4.831,
+        "sync_ms": 0.306,
+        "flushes": 2,
+        "upload_mb": 4.9,
+        "download_mb": 2.8,
+        "submits": 2,
+        "uploads": 1,
+        "downloads": 1,
+        "allocs": 99,
+        "pool_hits": 186
+      },
+      "peaks": {
+        "peak_tflops_fp32": 29.15,
+        "peak_gb_s": 504.2
+      },
+      "blocks": {
+        "nodes_claimed": 233,
+        "convex_blocks": 1
+      },
+      "system": {
+        "samples": 12,
+        "sm_pct": {
+          "mean": 9.2,
+          "max": 37.0,
+          "p95": 37.0
+        },
+        "fb_peak_mb": 3342.0,
+        "vram_delta_mb": 327.0,
+        "vram_idle_mb": 3015,
+        "vram_source": "global-delta",
+        "rss_mb": 291.0,
+        "cpu_pct": {
+          "mean": 393.4,
+          "max": 655.0
+        }
+      },
+      "raw": {
+        "stdout": "compile.stdout.log",
+        "stats": "compile.stats.log",
+        "metrics": "compile.metrics.csv"
+      }
+    },
+    {
+      "model": "yolov8n",
       "mode": "cpu",
       "status": "skip",
       "ok": true,

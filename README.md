@@ -10,9 +10,14 @@
 
 A Vulkan Execution Provider **plugin** for ONNX Runtime, entirely in Rust, plus
 a **standalone pure-Rust engine** (own ONNX parser, no ORT in the process) that
-shares the same kernels. Reference app: STT with **Parakeet TDT 0.6B v3 (int8
-ONNX)**. Linux and Windows, NVIDIA/AMD GPUs (lavapipe as a CPU fallback —
-correctness only, never performance).
+shares the same kernels. Linux and Windows, NVIDIA/AMD GPUs (lavapipe as a CPU
+fallback — correctness only, never performance).
+
+Runs int4 LLMs at **~160 tok/s** (gemma3-1b) and **~71 tok/s** (qwen2.5-VL),
+puts static int8 convolutions on the **tensor cores**, and reaches 9.07× the
+ORT CPU EP on rfdetr — while refusing at load time, loudly and completely, any
+graph it cannot run end to end on the GPU. Reference app: STT with **Parakeet
+TDT 0.6B v3 (int8 ONNX)**.
 
 ONNX Runtime has no official Vulkan EP: this project implements one out-of-tree
 using the [Plugin EP API](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries/usage.html)
@@ -111,49 +116,101 @@ WSLENV=RUST_LOG:ORT_DYLIB_PATH ./target/x86_64-pc-windows-msvc/release/stt-app.e
 - [x] Core extracted from ORT (`onnx-vulkan-core`), synthetic-graph tests
 - [x] **Standalone frontend**: own `.onnx` parser + static shape inference,
       runs the Parakeet encoder with no ONNX Runtime in the process
-- [x] Op coverage 100% on the whole vision/speech matrix (parakeet int8, rfdetr
-      fp32/int8, sam3 vision int8, SAM3 ViT-H fp32, yolov4/v8n, mobilenetv2,
-      resnet50-qdq, roberta)
+- [x] Op coverage 100% on the whole matrix: vision, speech and LLM (parakeet
+      int8, rfdetr fp32/int8, sam3 vision int8, SAM3 ViT-H fp32, yolov4/v8n,
+      mobilenetv2 fp32/int8, resnet50 qdq/int8, roberta, gemma3-1b int4,
+      qwen2.5-VL int4)
 - [x] `VK_KHR_cooperative_matrix` on `MatMulInteger` (GLSL, compiled offline)
 - [x] Register-blocked `MatMul` / `Gemm` / `Conv` behind occupancy predicates
 - [x] Liveness-based intermediate release + buffer pool (sam3: OOM → 5.6 GB peak)
-- [ ] Public `onnx-vulkan` facade crate (`load` → `run`)
-- [ ] Pre-recorded command buffer, full load-time memory planning
-- [ ] fp16, static-quant Q/DQ ops, AMD validation
-- [ ] `MatMulNBits` + attention ops + generation runtime (int4 LLM)
+- [x] Public `onnx-vulkan` facade crate (`Session::load` → `run` → `get`)
+- [x] **int4 LLM**: `MatMulNBits`, `GroupQueryAttention`, `RotaryEmbedding`,
+      `GatherBlockQuantized`, resident KV cache, replayed decode loop
+- [x] **Static int8 (QOperator)**: `QLinearConv`/`MatMul`/`Add`/`GlobalAveragePool`,
+      `ConvInteger` on the tensor cores via im2col + `cooperative_matrix`
+- [x] **Load-time validation**: opset bounds and operand dtypes, so an
+      unsupported node is refused before it can answer wrongly
+- [ ] fp16, AMD validation (parked for want of hardware)
+- [ ] Full arena allocation (archived: no model is near OOM — `plan.md` §5)
 
 See `plan.md` for the ordered roadmap and `cronologia.md` for the work log.
 
+## Fail loud, by construction
+
+The engine runs a graph **entirely** on the GPU or refuses it at load time,
+naming every offender. There is no silent per-node fallback, and that is an
+architectural choice, not a missing feature: a backend that quietly drops nodes
+to the CPU turns a coverage gap into a performance mystery, and a backend that
+claims a node it cannot honour turns it into a wrong number.
+
+Three independent checks must agree before a node is claimed, all of them
+before any memory is allocated:
+
+| check | reads | example refusal |
+|---|---|---|
+| `is_implemented_node` | op, **opset**, attributes, arity | `Pad` below opset 11, where `pads` is an attribute and the input the kernel reads does not exist |
+| `unsupported_quantization` | the operand **values** | a per-channel weight zero point that is not identically zero |
+| `unsupported_dtype` | the operand **types** | a non-float tensor reaching a kernel that reads `f32` and has no integer path |
+
+Two of the three exist because the first was not enough: an int64-mask
+`ReduceSum` claimed by a float kernel crashed a run, and a `uint8` `MaxPool`
+read packed bytes as floats — `max|Δ| = 8.086`, argmax 489 → 611. A **silently
+wrong answer**, caught only because that model ships golden reference data. The
+failure mode this design refuses is not "unsupported"; it is "plausible".
+
+Above `MAX_OPSET` a model is refused whole, and the message says why: the
+kernels have not been read against that revision of the spec. Re-exporting at a
+supported opset is one line in every export tool, and it beats a number nobody
+can trust.
+
 ## Performance
 
-RTX 4070, driver 610.74, batch 1, native Windows ORT, `runs/conv-blocked-1`.
+RTX 4070, driver 610.74, batch 1, native Windows ORT, `runs/validation-gate2`
+(the promoted baseline — every number here is one the regression gate enforces).
 Ratio is against the ORT **CPU EP (MLAS)** on the same graph.
 
 | model | wall | CPU EP | ratio | blocks | flush | GPU Pareto head |
 |---|---|---|---|---|---|---|
-| rfdetr | 41.1 ms | 367.1 ms | **8.93×** | 1 | 9 | `MatMul` 55% |
-| parakeet (encoder) | 46.6 ms | 294.8 ms | **6.32×** | 1 | 7 | `MMI_matmul_coop_k32` 58% |
-| yolov4 | 42.0 ms | 168.6 ms | **4.01×** | 1 | 4 | `Conv` 85% |
-| yolov8n | 9.2 ms | 25.6 ms | **2.78×** | 1 | 2 | `Conv` 62% |
-| mobilenetv2 | 1.8 ms | 2.0 ms | 1.11× | 1 | 2 | `Conv16` 47% |
-| roberta (seq 1) | 10.2 ms | 7.8 ms | **0.76×** | 1 | 4 | `MatMul16` 64% |
-| resnet50-qdq | 9.3 ms | 6.9 ms | **0.74×** | 1 | 2 | `Conv16` 49% |
+| rfdetr | 41.4 ms | 375.4 ms | **9.07×** | 1 | 9 | `MatMul` 61% |
+| parakeet (encoder) | 46.4 ms | 342.9 ms | **7.39×** | 1 | 7 | `MMI_matmul_coop_k32` 60% |
+| yolov4 | 32.5 ms | 189.3 ms | **5.82×** | 1 | 4 | `Conv_split` 54% |
+| yolov8n | 7.1 ms | 27.1 ms | **3.82×** | 1 | 2 | `Conv_split` 41% |
+| qwen2.5-VL decoder (int4) | 28.2 ms | 95.9 ms | **3.40×** | 1 | 77 | `MatMulNBits_gemv` 35% |
+| roberta seq 128 | 18.7 ms | 54.7 ms | **2.93×** | 1 | 4 | `MatMul` 90% |
+| gemma3-1b (int4) | 15.5 ms | 34.0 ms | **2.19×** | 1 | 57 | `MatMulNBits` 26% |
+| roberta seq 1 | 3.6 ms | 7.7 ms | **2.14×** | 1 | 4 | `GEMV` 49% |
+| resnet50-int8 | 3.4 ms | 4.9 ms | **1.44×** | 1 | 2 | `ConvInteger_coop` 31% |
+| mobilenetv2 | 1.6 ms | 2.2 ms | **1.38×** | 1 | 2 | `Conv` 30% |
+| resnet50-qdq | 5.0 ms | 6.2 ms | **1.24×** | 1 | 2 | `Conv_split` 62% |
+| mobilenetv2-int8 | 2.1 ms | 1.1 ms | 0.52× | 1 | 2 | `Requantize` 30% |
+
+Generation, measured on the replayed decode loop rather than on a single
+forward: **gemma3-1b 6.24 ms/token (~160 tok/s)** and **qwen2.5-VL 14.09
+ms/token (~71 tok/s)**, zero device allocations per step, one flush.
 
 Read honestly:
 
-- **Structure is solved.** Every model is at 1 convex block with sync under
-  1 ms (yolov4: 4.5 ms). Boundary count is no longer a lever — the suite is
-  kernel-bound end to end.
-- **The two models below 1× lose for the same reason**, and it is not a missing
-  kernel: **their output tensors are smaller than the GPU**. A 4070 holds 70,656
-  resident threads; no `Conv` geometry in resnet50-qdq fills it, and roberta at
-  `seq_len = 1` is a GEMV — 768 useful threads out of 70,656. Every tile
-  enlargement buys arithmetic intensity by giving back grid width, measured at
-  par on both. Full attribution in `docs/resnet50-gap.md`. The same roberta graph
-  at `seq_len = 128` runs at **1.96×** (43.2 ms CPU EP against 22.0).
-- **mobilenetv2 at 1.11× is overhead-dominated** (1.8 ms total) — not a target.
+- **Structure is solved.** Every model is at 1 convex block. Boundary count is
+  no longer a lever — the suite is kernel-bound end to end.
+- **One model is below the CPU EP, and no kernel will move it.**
+  `mobilenetv2-int8` spends 0.9 of its 2.1 ms on the GPU; the rest is ORT and
+  plugin overhead across 73 nodes. Its `ConvInteger` work is 17 depthwise
+  convolutions with `K = 9` — not a GEMM, nothing to tile, nothing to split.
+  It is an overhead item, and it is labelled as one instead of being tuned.
+- **The two models that used to be below 1× no longer are**, and neither was
+  fixed by a bigger tile. roberta at `seq_len = 1` (0.76×) is a GEMV: 768 useful
+  threads on a card that holds 70,656, so the fix was splitting `K` to
+  manufacture workgroups — now 2.14×, at 500–515 GB/s against the card's ~504,
+  which means that lever is spent rather than merely pulled. resnet50-qdq
+  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.24×. Full
+  attribution in `docs/resnet50-gap.md`.
+- **Ratios move because the reference moves.** The MLAS baseline drifted 4.5 →
+  6.2 ms on the same binary across consecutive runs. Compare milliseconds, and
+  treat `blocks` / `flushes` / `MB transferred` — which are deterministic — as
+  the primary metric.
 - **lavapipe numbers mean nothing for performance**; the suite marks those runs
-  `perf_valid: false`.
+  `perf_valid: false`. They are still a valid *correctness* gate, because
+  integer arithmetic is exact on any device.
 
 The regression gate (`scripts/testsuite.sh --baseline runs/baseline.json`) fails
 on accuracy outside tolerance, median wall past `perf_tol`, more flushes or MB

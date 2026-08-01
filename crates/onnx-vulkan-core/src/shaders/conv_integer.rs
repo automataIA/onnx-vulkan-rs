@@ -343,6 +343,73 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+pub const IM2COL_BINDINGS: u32 = 3;
+/// 14 u32 fields, all geometry plus the sign flip.
+pub const IM2COL_PUSH_BYTES: u32 = 56;
+
+/// The materialization every other kernel in this module exists to avoid.
+///
+/// The implicit GEMM rebuilds each column of the im2col matrix from its index
+/// and never writes one. Cooperative matrices cannot: `coopMatLoad` takes a
+/// base offset and a row stride, so the operand has to exist in memory. This
+/// pass writes it — `[P, K]`, one row per output pixel, which is exactly the
+/// `[N, K]` layout [`crate::shaders::matmul_integer::PACK_B`] produces, so the
+/// multiply that follows is the shared `MatMulInteger` dispatch with
+/// `M = C_out`, `N = P`, and `out` landing in NCHW without a transpose.
+///
+/// Worth it only on the cooperative path: measured on resnet50-int8's own
+/// geometries (`examples/conv_integer_coop`), im2col plus the tensor cores is
+/// **1.47×** the implicit ladder, while im2col plus the portable WGSL matmul is
+/// **0.79×** — materializing loses on its own and wins only for what it unlocks.
+///
+/// Out-of-bounds taps get the activation zero point, which is what
+/// `ConvInteger` pads with, so the padded product `(zp − zp)(w − w_zp)` vanishes
+/// without the multiply knowing any geometry. `flip` is `0x80808080` when X is
+/// `int8`: the cooperative combination is `u8 × u8` and this pass is already
+/// touching every byte, so the sign flip the matmul cannot do costs nothing
+/// here.
+pub const IM2COL: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<u32>;    // u8 packed [C_in, H, W]
+@group(0) @binding(1) var<storage, read> azp: array<u32>;
+@group(0) @binding(2) var<storage, read_write> col: array<u32>;  // u8 packed [P, K]
+
+struct Push {
+    words: u32, kdepth: u32, khkw: u32,
+    h_in: u32, w_in: u32, w_out: u32, kw: u32,
+    sh: u32, sw: u32, phb: u32, pwb: u32, dh: u32, dw: u32,
+    flip: u32,
+}
+var<immediate> pc: Push;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= pc.words) { return; }
+    let k4 = pc.kdepth / 4u;
+    let p = i / k4;
+    let k0 = (i % k4) * 4u;
+    let oh = p / pc.w_out;
+    let ow = p % pc.w_out;
+    let a_zp = azp[0] & 0xffu;
+    var word = 0u;
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        let k = k0 + j;
+        let c = k / pc.khkw;
+        let r = (k % pc.khkw) / pc.kw;
+        let s = k % pc.kw;
+        let ih = i32(oh * pc.sh + r * pc.dh) - i32(pc.phb);
+        let iw = i32(ow * pc.sw + s * pc.dw) - i32(pc.pwb);
+        var b = a_zp;
+        if (ih >= 0 && iw >= 0 && ih < i32(pc.h_in) && iw < i32(pc.w_in)) {
+            let idx = (c * pc.h_in + u32(ih)) * pc.w_in + u32(iw);
+            b = (x[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xffu;
+        }
+        word = word | (b << (j * 8u));
+    }
+    col[i] = word ^ pc.flip;
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -356,5 +423,6 @@ mod tests {
             vk_compute::compile_wgsl(&source).expect("shader ConvInteger valido");
         }
         vk_compute::compile_wgsl(super::SPLIT_REDUCE).expect("shader ConvInteger reduce valido");
+        vk_compute::compile_wgsl(super::IM2COL).expect("shader ConvInteger im2col valido");
     }
 }

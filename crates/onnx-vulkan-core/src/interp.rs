@@ -33,10 +33,12 @@ use crate::shaders::conv::{
 };
 use crate::shaders::conv_integer::{
     BINDINGS as CONV_INTEGER_BINDINGS, BLOCKED_TILE_SIZE as CONV_I_BLOCKED_TILE_SIZE,
-    PUSH_BYTES as CONV_INTEGER_PUSH_BYTES, SPLIT_REDUCE as CONV_I_SPLIT_REDUCE,
-    SPLIT_REDUCE_BINDINGS as CONV_I_SPLIT_REDUCE_BINDINGS, TILE_SIZE as CONV_I_TILE_SIZE,
-    blocked as conv_i_blocked_source, blocked_splitk as conv_i_blocked_splitk_source,
-    direct as conv_i_direct_source, implicit_gemm as conv_i_gemm_source,
+    IM2COL as CONV_I_IM2COL, IM2COL_BINDINGS as CONV_I_IM2COL_BINDINGS,
+    IM2COL_PUSH_BYTES as CONV_I_IM2COL_PUSH_BYTES, PUSH_BYTES as CONV_INTEGER_PUSH_BYTES,
+    SPLIT_REDUCE as CONV_I_SPLIT_REDUCE, SPLIT_REDUCE_BINDINGS as CONV_I_SPLIT_REDUCE_BINDINGS,
+    TILE_SIZE as CONV_I_TILE_SIZE, blocked as conv_i_blocked_source,
+    blocked_splitk as conv_i_blocked_splitk_source, direct as conv_i_direct_source,
+    implicit_gemm as conv_i_gemm_source,
 };
 use crate::shaders::conv_transpose::{
     BINDINGS as CONV_T_BINDINGS, FILL as CONV_T_FILL, FILL_BINDINGS as CONV_T_FILL_BINDINGS,
@@ -70,6 +72,7 @@ use crate::shaders::matmul_fp32::{
 };
 use crate::shaders::matmul_integer::{
     COOP_BINDINGS as MMI_COOP_BINDINGS, COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES,
+    COOP_TILE as MMI_COOP_TILE, CoopVariant,
     FLIP_BINDINGS as MMI_FLIP_BINDINGS, FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY,
     FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES, MATMUL_BINDINGS as MMI_BINDINGS,
     MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B, PACK_BINDINGS as MMI_PACK_BINDINGS,
@@ -2972,6 +2975,29 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
         );
     }
 
+    // Second fast path: state the convolution as an explicit GEMM and put it on
+    // the tensor cores. It costs a materialized im2col matrix — the write the
+    // implicit kernels below exist to avoid — and pays for it only because the
+    // cooperative kernel is that much faster: measured over resnet50-int8's own
+    // geometries (`examples/conv_integer_coop`) im2col + cooperative matrix is
+    // **1.47×** the implicit ladder, while im2col + the WGSL matmul is 0.79×.
+    // So the path is taken only when the cooperative variant actually applies,
+    // never as a fallback.
+    let pixels = (h_out * w_out) as usize;
+    let kdepth = (g.gsi * kh * kw) as usize;
+    let coop = if group == 1 && n == 1 && total > 0 {
+        mmi_coop_variant(&ctx.coop_u8, ctx.subgroup_size)
+            .filter(|v| mmi_coop_applies(v, c_out as usize, kdepth, pixels, false))
+    } else {
+        None
+    };
+    if let Some(variant) = coop {
+        return conv_im2col_coop(
+            env, node, &x_name, &w_name, &g, out_shape, pixels, kdepth, x_signed, w_signed,
+            variant,
+        );
+    }
+
     let x = env.device(&x_name)?;
     let w = env.device(&w_name)?;
     let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
@@ -3670,6 +3696,151 @@ fn conv_pointwise_matmul(
         },
     )?;
     ctx.defer_destroy(packed);
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: INT32,
+            shape: out_shape,
+            elem_count: total,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `ConvInteger` as an explicit GEMM on the cooperative matrix unit.
+///
+/// The kernels in `shaders::conv_integer` rebuild every im2col column from its
+/// index and never materialize the matrix. `coopMatLoad` takes a base offset
+/// and a row stride, so a cooperative matrix cannot be fed that way: the
+/// operand has to exist. This path writes it and multiplies it, and it is
+/// entered **only** when the cooperative variant applies, because the
+/// materialization loses against the implicit ladder on any other kernel —
+/// 1.47× with the tensor cores, 0.79× with the WGSL matmul, measured over this
+/// model's own geometries in `examples/conv_integer_coop`.
+///
+/// The mapping needs no transpose and no pack. `M = C_out`, `N = P`, and:
+///
+/// - A is the ONNX weight `[C_out, C_in·KH·KW]`, already the `[M, K]` the
+///   kernel wants — flipped once per session if it is `int8`, since the
+///   hardware combination is `u8 × u8` and a cooperative matrix has no bitwise
+///   operations.
+/// - B is the im2col matrix `[P, K]`, which is the `[N, K]` layout `PACK_B`
+///   produces for the pointwise path.
+/// - out is `[C_out, P]`, which is NCHW at `n == 1`. That restriction is why
+///   `n == 1` gates this path, exactly as it gates the pointwise one.
+///
+/// A signed activation costs nothing extra here: the im2col pass already
+/// touches every byte, so it flips them on the way out.
+#[allow(clippy::too_many_arguments)]
+fn conv_im2col_coop(
+    env: &mut Env,
+    node: &NodeIr,
+    x_name: &str,
+    w_name: &str,
+    g: &ConvGeom,
+    out_shape: Vec<i64>,
+    pixels: usize,
+    kdepth: usize,
+    x_signed: u32,
+    w_signed: u32,
+    variant: &'static CoopVariant,
+) -> Result<()> {
+    let c_out = g.c_out as usize;
+    let total = c_out * pixels;
+    let words = pixels * kdepth / 4;
+
+    let ctx = env.context();
+    let col = ctx.create_storage_buffer((words * 4) as u64)?;
+    {
+        let x = env.device(x_name)?;
+        let azp = zp_ref(env, node.inputs.get(2))?;
+        let mut push = Vec::with_capacity(CONV_I_IM2COL_PUSH_BYTES as usize);
+        for value in [
+            words as u32,
+            kdepth as u32,
+            (g.kh * g.kw) as u32,
+            g.h_in as u32,
+            g.w_in as u32,
+            g.w_out as u32,
+            g.kw as u32,
+            g.sh as u32,
+            g.sw as u32,
+            g.phb as u32,
+            g.pwb as u32,
+            g.dh as u32,
+            g.dw as u32,
+            if x_signed != 0 { MMI_SIGN_FLIP_WORD } else { 0 },
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "ConvInteger_im2col",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(CONV_I_IM2COL)?,
+                    CONV_I_IM2COL_BINDINGS,
+                    CONV_I_IM2COL_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[x.buffer(), azp, &col],
+                    &push,
+                    [(words as u32).div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+
+    let w_ptr = if w_signed != 0 {
+        flipped_const(env, w_name, c_out * kdepth)?
+    } else {
+        env.device(w_name)?.buffer() as *const GpuBuffer
+    };
+    let ctx = env.context();
+    // SAFETY: the flipped weight lives in the cache, which never removes
+    // entries and keeps them boxed; an unflipped one is the tensor's own
+    // buffer, alive for the whole execution.
+    let w: &GpuBuffer = unsafe { &*w_ptr };
+    let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
+    let azp = zp_ref(env, node.inputs.get(3))?; // A = W → weight zero point
+    let bzp = zp_ref(env, node.inputs.get(2))?; // B = im2col → activation zero point
+
+    // Dispatched here rather than through `mmi_dispatch` for one reason: the
+    // Pareto attributes by pipeline key, and folding these into
+    // `MMI_matmul_coop_k32` would merge the convolutions with the pointwise
+    // matmuls in the one profile that decides what to optimize next.
+    let mut push = Vec::with_capacity(MMI_COOP_PUSH_BYTES as usize);
+    for value in [
+        c_out as u32,
+        kdepth as u32,
+        pixels as u32,
+        if w_signed != 0 { MMI_SIGN_FLIP_BYTE } else { 0 },
+        if x_signed != 0 { MMI_SIGN_FLIP_BYTE } else { 0 },
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    with_pipeline(
+        env.cache(),
+        "ConvInteger_coop",
+        || ctx.create_pipeline(&variant.spirv(), MMI_COOP_BINDINGS, MMI_COOP_PUSH_BYTES),
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[w, &col, azp, bzp, &out],
+                &push,
+                [
+                    (pixels as u32).div_ceil(MMI_COOP_TILE),
+                    (c_out as u32).div_ceil(MMI_COOP_TILE),
+                    1,
+                ],
+            )
+        },
+    )?;
+    ctx.defer_destroy(col);
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {

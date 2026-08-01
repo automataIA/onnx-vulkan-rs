@@ -31,25 +31,35 @@ use std::ptr;
 pub unsafe fn canonical_nodes(
     graph: *const sys::OrtGraph,
     nodes: &[*const sys::OrtNode],
-) -> Result<Vec<graph_ir::NodeIr>> {
+) -> Result<(
+    Vec<graph_ir::NodeIr>,
+    std::collections::HashMap<String, i32>,
+)> {
     let api = crate::ort_util::apis().ort;
+    let opsets = unsafe { graph_ir::operator_sets(graph)? };
     let mut irs = Vec::with_capacity(nodes.len());
+    let mut types = std::collections::HashMap::new();
     for &node in nodes {
-        irs.push(unsafe { graph_ir::extract_node(api, node)? });
+        irs.push(unsafe { graph_ir::extract_node(api, node, &opsets)? });
+        unsafe { graph_ir::node_value_types(api, node, &mut types)? };
     }
     let mut constants = onnx_vulkan_core::constant_outputs(&irs);
     constants.extend(unsafe { graph_ir::extract_initializers(graph)? });
     for ir in &mut irs {
         graph_ir::fold_constant_params(ir, &constants);
     }
-    Ok(irs)
+    Ok((irs, types))
 }
 
 /// Nodes that the compiling EP can fuse and execute (delegates to the interpreter,
 /// the single source of truth on coverage). The check is on the **node**, not
 /// on the op name: attributes decide whether the kernel can handle it.
-pub fn is_fusible_node(node: &graph_ir::NodeIr) -> bool {
+pub fn is_fusible_node(
+    node: &graph_ir::NodeIr,
+    types: &std::collections::HashMap<String, i32>,
+) -> bool {
     onnx_vulkan_core::is_implemented_node(node)
+        && onnx_vulkan_core::unsupported_dtype(node, types).is_none()
 }
 
 /// Enables the compiling EP path (`VULKAN_EP_COMPILE=1`).

@@ -30,7 +30,8 @@ pub use graph::{
 };
 pub use host_ops::HostTensor;
 pub use interp::{
-    argmax_of, execute, is_implemented, is_implemented_node, unsupported_quantization,
+    MAX_OPSET, argmax_of, execute, is_implemented, is_implemented_node, unsupported_dtype,
+    unsupported_quantization,
 };
 pub use interp::{execute_host_nodes, execute_traced};
 pub use plan::{StepPlan, StepTrace, host_bytes};

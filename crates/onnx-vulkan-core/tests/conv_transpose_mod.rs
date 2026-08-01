@@ -28,7 +28,7 @@ fn node(op: &str, inputs: &[&str], attrs: &[(&str, AttrValue)]) -> NodeIr {
     NodeIr {
         domain: String::new(),
         op: op.to_string(),
-        since_version: 11,
+        opset: 11,
         name: format!("{op}_0"),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: vec!["out".to_string()],
@@ -45,6 +45,7 @@ fn graph(op: &str, inputs: &[&str], attrs: &[(&str, AttrValue)]) -> GraphIr {
         initializers: HashMap::<String, InitializerIr>::new(),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: vec!["out".to_string()],
+        ..Default::default()
     }
 }
 

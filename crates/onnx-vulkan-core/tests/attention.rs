@@ -171,7 +171,7 @@ fn run_case(case: Case) {
     let node = NodeIr {
         domain: "com.microsoft".into(),
         op: "GroupQueryAttention".into(),
-        since_version: 1,
+        opset: 1,
         name: "gqa".into(),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: ["out", "present_key", "present_value"]
@@ -190,6 +190,7 @@ fn run_case(case: Case) {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into(), "present_key".into(), "present_value".into()],
+        ..Default::default()
     };
 
     let host = [

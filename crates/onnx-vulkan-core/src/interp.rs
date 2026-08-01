@@ -72,14 +72,13 @@ use crate::shaders::matmul_fp32::{
 };
 use crate::shaders::matmul_integer::{
     COOP_BINDINGS as MMI_COOP_BINDINGS, COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES,
-    COOP_TILE as MMI_COOP_TILE, CoopVariant,
-    FLIP_BINDINGS as MMI_FLIP_BINDINGS, FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY,
-    FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES, MATMUL_BINDINGS as MMI_BINDINGS,
-    MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B, PACK_BINDINGS as MMI_PACK_BINDINGS,
-    PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES, PACKED_KEY as MMI_PACKED_KEY,
-    SIGN_FLIP_BYTE as MMI_SIGN_FLIP_BYTE, SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD,
-    TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
-    coop_variant as mmi_coop_variant, matmul as mmi_matmul,
+    COOP_TILE as MMI_COOP_TILE, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
+    FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY, FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES,
+    MATMUL_BINDINGS as MMI_BINDINGS, MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B,
+    PACK_BINDINGS as MMI_PACK_BINDINGS, PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES,
+    PACKED_KEY as MMI_PACKED_KEY, SIGN_FLIP_BYTE as MMI_SIGN_FLIP_BYTE,
+    SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD, TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY,
+    coop_applies as mmi_coop_applies, coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, DECODE_LANES as MMNB_DECODE_LANES,
@@ -229,8 +228,62 @@ pub fn is_implemented(op: &str) -> bool {
 /// cover (`cubic`), pooling has `ceil_mode`, and claiming a node that cannot
 /// then be run is a runtime error instead of a CPU fallback
 /// (`op-plan.md` §4b). Whoever decides coverage must use this.
+/// Highest `ai.onnx` opset any model in the suite is validated against.
+///
+/// A model above it is refused whole, and that is the honest answer rather than
+/// a conservative one: the kernels have not been read against a newer spec, and
+/// nothing here would notice a semantic change. Exporting at a supported opset
+/// is a one-line change in every export tool, which is a better outcome for a
+/// user than a plausible wrong number.
+pub const MAX_OPSET: i32 = 21;
+
+/// Lowest `ai.onnx` opset whose *form* each kernel reads.
+///
+/// Only ops whose contract migrated under them are listed; anything absent has
+/// no lower bound. Every entry is a form the code actually reads, not a guess
+/// about the spec:
+///
+/// - `Pad` takes `pads` from `inputs[1]`; before opset 11 it is an attribute
+///   and that input does not exist.
+/// - `Slice` takes `starts`/`ends` from inputs; attributes before opset 10.
+/// - `TopK` takes `K` from `inputs[1]`; an attribute before opset 10.
+/// - `Resize`'s `coordinate_transformation_mode`, which
+///   [`is_implemented_node`] reads with a `half_pixel` default, does not exist
+///   before opset 11 — where the operator is `asymmetric` by definition, so the
+///   default would silently pick the wrong transform.
+///
+/// `Squeeze`, `Unsqueeze`, `Clip` and `Split` also migrated, and are absent on
+/// purpose: their implementations read the input when present and fall back to
+/// the attribute, so both forms run.
+const MIN_OPSET: &[(&str, i32)] = &[("Pad", 11), ("Resize", 11), ("Slice", 10), ("TopK", 10)];
+
+/// Whether the opset the node's domain was imported at is one the kernels were
+/// written against.
+///
+/// Contrib domains (`com.microsoft`) are versioned on their own axis at
+/// version 1 and are exempt: the `ai.onnx` bounds would be meaningless there,
+/// and the ops themselves are constrained by arity and attributes in
+/// [`is_implemented_node`].
+///
+/// An opset of 0 means the producer could not resolve one. That is treated as
+/// unknown and allowed: refusing a node over a number we failed to read would
+/// reject working models to guard against a hypothetical one.
+fn opset_supported(node: &NodeIr) -> bool {
+    if !node.domain.is_empty() && node.domain != "ai.onnx" {
+        return true;
+    }
+    if node.opset == 0 {
+        return true;
+    }
+    let min = MIN_OPSET
+        .iter()
+        .find(|(op, _)| *op == node.op)
+        .map_or(1, |(_, v)| *v);
+    node.opset >= min && node.opset <= MAX_OPSET
+}
+
 pub fn is_implemented_node(node: &NodeIr) -> bool {
-    if !is_implemented(&node.op) {
+    if !is_implemented(&node.op) || !opset_supported(node) {
         return false;
     }
     let string_attr = |name: &str, default: &'static str| {
@@ -438,6 +491,65 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         }
         _ => true,
     }
+}
+
+/// Ops whose kernel reads input 0 as `f32` while the ONNX schema admits more.
+///
+/// **This list is derived from the kernels, not from the schema, and not from
+/// a bug report.** The first draft was written from the incident below and
+/// contained `MaxPool`, `AveragePool`, `GlobalAveragePool` and `CumSum` — all
+/// four wrong, because that incident was fixed *in the kernel*: `pool()`
+/// branches on `UINT8`/`INT8` and dispatches `MaxPool_q`, and `CumSum` is a
+/// host op over any dtype. Adding them here cost resnet50-int8 and both roberta
+/// entries a convex block each, which the suite caught. Before adding an op,
+/// read its dispatch and confirm there is no integer branch.
+///
+/// The list is short on purpose. It is not a transcription of the schema — it
+/// is the set of ops whose kernel reads the buffer as `f32` while the spec
+/// admits more, which is the shape of the one bug this exists to stop: a
+/// `MaxPool` on a `uint8` tensor was claimed by the float kernel and answered
+/// with reinterpreted bytes — `max|Δ| = 8.086`, argmax 489 → 611, wrong and
+/// silent, caught only because that model ships golden data.
+///
+/// An op absent from this table is unconstrained, and a value whose type the
+/// producer could not resolve is allowed: this refuses what is known to be
+/// wrong, never what is merely unknown.
+const FLOAT_ONLY_INPUT0: &[&str] = &[
+    "Softmax",
+    "LayerNormalization",
+    "SimplifiedLayerNormalization",
+    "SkipSimplifiedLayerNormalization",
+    "GroupQueryAttention",
+    "RotaryEmbedding",
+    "Conv",
+    "ConvTranspose",
+    "Gemm",
+    "GridSample",
+];
+
+/// Why this node's operand types are outside what the kernels read, or `None`.
+///
+/// The third of the load-time refusals, and the one that closes the silent
+/// class. [`is_implemented_node`] reads the node — op, opset, attributes,
+/// arity. [`unsupported_quantization`] reads the operand *values*. This reads
+/// the operand *types*, which live in neither: a `NodeIr` does not carry them,
+/// and an intermediate value is in no initializer. `GraphIr::value_types`
+/// carries them instead, filled by whichever frontend built the graph.
+pub fn unsupported_dtype(
+    node: &NodeIr,
+    types: &std::collections::HashMap<String, i32>,
+) -> Option<String> {
+    if !FLOAT_ONLY_INPUT0.contains(&node.op.as_str()) {
+        return None;
+    }
+    let name = node.inputs.first().filter(|n| !n.is_empty())?;
+    let dtype = *types.get(name.as_str())?;
+    (dtype != FLOAT).then(|| {
+        format!(
+            "{} on a non-float input (ONNX element type {dtype}); the kernel reads f32",
+            node.op
+        )
+    })
 }
 
 /// Why a QOperator node cannot be run, when the reason is in its **values**.
@@ -2993,8 +3105,7 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
     };
     if let Some(variant) = coop {
         return conv_im2col_coop(
-            env, node, &x_name, &w_name, &g, out_shape, pixels, kdepth, x_signed, w_signed,
-            variant,
+            env, node, &x_name, &w_name, &g, out_shape, pixels, kdepth, x_signed, w_signed, variant,
         );
     }
 
@@ -3121,7 +3232,7 @@ fn lowered(node: &NodeIr, op: &str, inputs: &[&str], outputs: &[&str]) -> NodeIr
     NodeIr {
         domain: String::new(),
         op: op.to_string(),
-        since_version: node.since_version,
+        opset: node.opset,
         name: format!("{}__{op}", node.name),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: outputs.iter().map(|s| (*s).to_string()).collect(),

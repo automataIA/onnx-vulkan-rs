@@ -390,6 +390,52 @@ def int_constants(graph) -> dict[str, list[int]]:
     return out
 
 
+def opset_bounds() -> tuple[int, dict[str, int]]:
+    """`MAX_OPSET` and `MIN_OPSET`, read from the Rust.
+
+    Unlike `NODE_RULES` these are *data*, not logic, so they are parsed rather
+    than transcribed: there is nothing to keep in sync by hand and therefore
+    nothing to drift.
+    """
+    src = INTERP.read_text()
+    ceiling = re.search(r"pub const MAX_OPSET: i32 = (\d+);", src)
+    if not ceiling:
+        sys.exit(f"cannot read MAX_OPSET from {INTERP}")
+    table = re.search(r"const MIN_OPSET: &\[\(&str, i32\)\] = &\[(.*?)\];", src, re.S)
+    if not table:
+        sys.exit(f"cannot read MIN_OPSET from {INTERP}")
+    mins = {op: int(v) for op, v in re.findall(r'\("([A-Za-z0-9_]+)",\s*(\d+)\)', table.group(1))}
+    return int(ceiling.group(1)), mins
+
+
+def float_only_ops() -> set[str]:
+    """`FLOAT_ONLY_INPUT0`, read from the Rust for the same reason."""
+    src = INTERP.read_text()
+    body = re.search(r"const FLOAT_ONLY_INPUT0: &\[&str\] = &\[(.*?)\];", src, re.S)
+    if not body:
+        sys.exit(f"cannot read FLOAT_ONLY_INPUT0 from {INTERP}")
+    return set(re.findall(r'"([A-Za-z0-9_]+)"', body.group(1)))
+
+
+FLOAT = TensorProto.FLOAT
+
+
+def value_dtypes(graph) -> dict[str, int]:
+    """Element type of every value the graph declares or produces.
+
+    The engine gets these from its frontend's inference; here the declared
+    types are enough, because what the check refuses is a value whose type the
+    file *states* and the kernel cannot read.
+    """
+    out: dict[str, int] = {}
+    for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+        if vi.type.HasField("tensor_type"):
+            out[vi.name] = vi.type.tensor_type.elem_type
+    for init in graph.initializer:
+        out[init.name] = init.data_type
+    return out
+
+
 def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
     """Histogram of the graph's ops and of only the **non-claimed** nodes.
 
@@ -398,12 +444,16 @@ def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
     not loaded.
     """
     model = onnx.load(str(path), load_external_data=False)
+    max_opset, min_opset = opset_bounds()
+    float_only = float_only_ops()
+    opsets = {o.domain: o.version for o in model.opset_import}
     counts: Counter[str] = Counter()
     missing: Counter[str] = Counter()
     stack = [model.graph]
     while stack:
         graph = stack.pop()
         consts = Constants(int_constants(graph), quant_params(graph))
+        dtypes = value_dtypes(graph)
         for node in graph.node:
             name = node.op_type if not node.domain else f"{node.domain}::{node.op_type}"
             counts[name] += 1
@@ -412,8 +462,21 @@ def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
             # at the domain, so a contrib op we implement (`GroupQueryAttention`)
             # must count as covered here too
             rule = NODE_RULES.get(node.op_type)
+            # `ai.onnx` only: contrib domains are versioned on their own axis
+            version = opsets.get(node.domain, 0) if node.domain in ("", None) else 0
+            in0 = node.input[0] if node.input and node.input[0] else None
             if node.op_type not in known:
                 missing[name] += 1
+            elif version and not (
+                min_opset.get(node.op_type, 1) <= version <= max_opset
+            ):
+                missing[f"{name} (opset {version})"] += 1
+            elif (
+                node.op_type in float_only
+                and in0 in dtypes
+                and dtypes[in0] != FLOAT
+            ):
+                missing[f"{name} (element type {dtypes[in0]})"] += 1
             elif rule is not None and not rule(node, consts):
                 # known name but non-claimable node: counts as a gap, and is
                 # the distinction that the by-name count was missing

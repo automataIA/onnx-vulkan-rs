@@ -68,7 +68,7 @@ fn matmul_tiles_edges_and_broadcast_match_the_cpu_reference() {
             nodes: vec![NodeIr {
                 domain: String::new(),
                 op: "MatMul".to_string(),
-                since_version: 13,
+                opset: 13,
                 name: "mm".to_string(),
                 inputs: vec!["A".to_string(), "B".to_string()],
                 outputs: vec!["Y".to_string()],
@@ -77,6 +77,7 @@ fn matmul_tiles_edges_and_broadcast_match_the_cpu_reference() {
             initializers: HashMap::new(),
             inputs: vec!["A".to_string(), "B".to_string()],
             outputs: vec!["Y".to_string()],
+            ..Default::default()
         };
         let context = VkContext::new().expect("contesto Vulkan");
         let cache = KernelCache::new(&context);

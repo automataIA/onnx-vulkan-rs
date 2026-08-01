@@ -17,7 +17,7 @@ fn node(attrs: &[(&str, AttrValue)]) -> NodeIr {
     NodeIr {
         domain: String::new(),
         op: "GridSample".to_string(),
-        since_version: 16,
+        opset: 16,
         name: "GridSample_0".to_string(),
         inputs: vec!["x".to_string(), "grid".to_string()],
         outputs: vec!["out".to_string()],
@@ -46,6 +46,7 @@ fn graph(attrs: &[(&str, AttrValue)]) -> GraphIr {
         initializers: HashMap::<String, InitializerIr>::new(),
         inputs: vec!["x".to_string(), "grid".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     }
 }
 

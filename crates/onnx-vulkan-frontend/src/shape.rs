@@ -125,6 +125,19 @@ impl Types {
         self.0.get(name)
     }
 
+    /// Element type of every value whose dtype inference resolved, in the form
+    /// [`onnx_vulkan_core::GraphIr::value_types`] wants.
+    ///
+    /// Shapes are dropped: coverage is decided on the element type, and a
+    /// symbolic dimension says nothing about whether a kernel can read the
+    /// bytes.
+    pub fn dtypes(&self) -> HashMap<String, i32> {
+        self.0
+            .iter()
+            .filter_map(|(name, t)| t.dtype.map(|d| (name.clone(), d)))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }

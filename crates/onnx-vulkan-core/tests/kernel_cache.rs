@@ -34,7 +34,7 @@ fn matmul_integer_graph() -> GraphIr {
         nodes: vec![NodeIr {
             domain: String::new(),
             op: "MatMulInteger".to_string(),
-            since_version: 10,
+            opset: 10,
             name: "mmi".to_string(),
             inputs: vec![
                 "a".to_string(),
@@ -48,6 +48,7 @@ fn matmul_integer_graph() -> GraphIr {
         initializers,
         inputs: vec!["a".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     }
 }
 

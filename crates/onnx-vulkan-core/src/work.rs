@@ -207,7 +207,7 @@ mod tests {
         NodeIr {
             domain: String::new(),
             op: op.into(),
-            since_version: 13,
+            opset: 13,
             name: String::new(),
             inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
             outputs: outputs.iter().map(|s| (*s).to_string()).collect(),

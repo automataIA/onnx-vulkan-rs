@@ -87,7 +87,7 @@ fn run_case(case: Case) {
     let node = NodeIr {
         domain: "com.microsoft".into(),
         op: "RotaryEmbedding".into(),
-        since_version: 1,
+        opset: 1,
         name: "rotary".into(),
         inputs: ["x", "position_ids", "cos_cache", "sin_cache"]
             .iter()
@@ -103,6 +103,7 @@ fn run_case(case: Case) {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into()],
+        ..Default::default()
     };
     let x_shape = if case.bnsh {
         vec![1, case.heads as i64, case.seq as i64, H as i64]

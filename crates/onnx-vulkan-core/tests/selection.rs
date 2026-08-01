@@ -15,7 +15,7 @@ fn node(op: &str, attrs: &[(&str, AttrValue)]) -> NodeIr {
     NodeIr {
         domain: String::new(),
         op: op.to_string(),
-        since_version: 17,
+        opset: 17,
         name: format!("{op}_0"),
         inputs: vec!["a".to_string(), "b".to_string()],
         outputs: vec!["out".to_string()],

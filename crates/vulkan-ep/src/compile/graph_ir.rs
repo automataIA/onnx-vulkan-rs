@@ -209,12 +209,14 @@ pub unsafe fn extract(graph: *const sys::OrtGraph) -> Result<GraphIr> {
             (api.Graph_GetNodes.expect("Graph_GetNodes"))(graph, nodes.as_mut_ptr(), num_nodes),
             "Graph_GetNodes",
         )?;
+        let opsets = operator_sets(graph)?;
         for node in nodes {
-            let mut n = extract_node(api, node)?;
+            let mut n = extract_node(api, node, &opsets)?;
             // same normalization applied in `GetCapability`: the node that
             // runs must be the one we declared we can handle
             fold_constant_params(&mut n, &ir.initializers);
             ir.nodes.push(n);
+            node_value_types(api, node, &mut ir.value_types)?;
         }
 
         Ok(ir)
@@ -306,11 +308,70 @@ unsafe fn read_io(
     }
 }
 
+/// Opset version the model imports for each domain (`""` = `ai.onnx`).
+///
+/// This, and not `Node_GetSinceVersion`, is what `NodeIr::opset` carries.
+/// The two are different numbers — ORT resolves a node to its operator's own
+/// schema version (a `Pad` in a model at opset 17 resolves to 13) while the
+/// standalone frontend reads the model's `opset_import`. Coverage is decided
+/// on that field, so if the two hosts filled it differently they would claim
+/// different nodes for the same graph, which is precisely what the shared IR
+/// exists to prevent.
+///
+/// # Safety
+/// `graph` valid for the call duration.
+pub unsafe fn operator_sets(graph: *const sys::OrtGraph) -> Result<HashMap<String, i32>> {
+    let api = apis().ort;
+    unsafe {
+        let mut n = 0usize;
+        check(
+            (api.Graph_GetNumOperatorSets
+                .expect("Graph_GetNumOperatorSets"))(graph, &mut n),
+            "Graph_GetNumOperatorSets",
+        )?;
+        if n == 0 {
+            return Ok(HashMap::new());
+        }
+        let mut domains: Vec<*const c_char> = vec![ptr::null(); n];
+        let mut versions: Vec<i64> = vec![0; n];
+        check(
+            (api.Graph_GetOperatorSets.expect("Graph_GetOperatorSets"))(
+                graph,
+                domains.as_mut_ptr(),
+                versions.as_mut_ptr(),
+                n,
+            ),
+            "Graph_GetOperatorSets",
+        )?;
+        Ok(domains
+            .into_iter()
+            .zip(versions)
+            .map(|(d, v)| {
+                let domain = if d.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(d).to_string_lossy().into_owned()
+                };
+                (domain, v as i32)
+            })
+            .collect())
+    }
+}
+
 /// Extracts a single node into [`NodeIr`].
+///
+/// `opsets` comes from [`operator_sets`]; a domain the model does not import
+/// leaves `opset` at 0, which [`onnx_vulkan_core::is_implemented_node`] reads
+/// as "unknown" and lets through rather than refusing a node over a number it
+/// could not obtain.
 ///
 /// # Safety
 /// `node` valid for the call duration.
-pub unsafe fn extract_node(api: &sys::OrtApi, node: *const sys::OrtNode) -> Result<NodeIr> {
+pub unsafe fn extract_node(
+    api: &sys::OrtApi,
+    node: *const sys::OrtNode,
+    opsets: &HashMap<String, i32>,
+) -> Result<NodeIr> {
     unsafe {
         let mut op: *const c_char = ptr::null();
         check(
@@ -330,11 +391,7 @@ pub unsafe fn extract_node(api: &sys::OrtApi, node: *const sys::OrtNode) -> Resu
             CStr::from_ptr(domain).to_string_lossy().into_owned()
         };
 
-        let mut since_version = 0;
-        check(
-            (api.Node_GetSinceVersion.expect("Node_GetSinceVersion"))(node, &mut since_version),
-            "Node_GetSinceVersion",
-        )?;
+        let opset = opsets.get(&domain).copied().unwrap_or(0);
 
         let mut nm: *const c_char = ptr::null();
         check(
@@ -376,7 +433,7 @@ pub unsafe fn extract_node(api: &sys::OrtApi, node: *const sys::OrtNode) -> Resu
         Ok(NodeIr {
             domain,
             op,
-            since_version,
+            opset,
             name,
             inputs,
             outputs,
@@ -397,6 +454,86 @@ pub unsafe fn fused_node_io(node: *const sys::OrtNode) -> Result<(Vec<String>, V
 }
 
 /// Names of a node's input or output values.
+/// Records the element type of every value this node reads or writes.
+///
+/// The types are what `GraphIr::value_types` carries and what
+/// `unsupported_dtype` refuses on. Walking nodes rather than the graph's
+/// declared inputs and outputs is deliberate: an intermediate value appears in
+/// neither, and it is exactly the intermediate `uint8` that a float kernel used
+/// to reinterpret.
+///
+/// A value whose type ORT does not report is left out of the map, and an
+/// absent entry means "unknown", never "wrong": the check lets it through.
+///
+/// # Safety
+/// `node` valid for the call duration.
+pub unsafe fn node_value_types(
+    api: &sys::OrtApi,
+    node: *const sys::OrtNode,
+    into: &mut HashMap<String, i32>,
+) -> Result<()> {
+    unsafe {
+        for inputs in [true, false] {
+            let mut n = 0usize;
+            let count = if inputs {
+                api.Node_GetNumInputs.expect("Node_GetNumInputs")
+            } else {
+                api.Node_GetNumOutputs.expect("Node_GetNumOutputs")
+            };
+            check(count(node, &mut n), "Node_GetNum{In,Out}puts")?;
+            if n == 0 {
+                continue;
+            }
+            let mut vis: Vec<*const sys::OrtValueInfo> = vec![ptr::null(); n];
+            let get = if inputs {
+                api.Node_GetInputs.expect("Node_GetInputs")
+            } else {
+                api.Node_GetOutputs.expect("Node_GetOutputs")
+            };
+            check(get(node, vis.as_mut_ptr(), n), "Node_Get{In,Out}puts")?;
+            for vi in vis {
+                if vi.is_null() {
+                    continue;
+                }
+                let name = value_info_name(vi)?;
+                if name.is_empty() {
+                    continue;
+                }
+                let mut ti: *const sys::OrtTypeInfo = ptr::null();
+                check(
+                    (api.GetValueInfoTypeInfo.expect("GetValueInfoTypeInfo"))(vi, &mut ti),
+                    "GetValueInfoTypeInfo",
+                )?;
+                if ti.is_null() {
+                    continue;
+                }
+                // borrowed from the value info, not owned: no release here
+                let mut tensor: *const sys::OrtTensorTypeAndShapeInfo = ptr::null();
+                check(
+                    (api.CastTypeInfoToTensorInfo
+                        .expect("CastTypeInfoToTensorInfo"))(ti, &mut tensor),
+                    "CastTypeInfoToTensorInfo",
+                )?;
+                if tensor.is_null() {
+                    continue; // not a tensor (sequence, map): nothing to constrain
+                }
+                let mut ty =
+                    sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+                check(
+                    (api.GetTensorElementType.expect("GetTensorElementType"))(tensor, &mut ty),
+                    "GetTensorElementType",
+                )?;
+                // ORT's element codes are the ONNX `TensorProto.DataType` ones
+                let code = ty as i32;
+                if code != 0 {
+                    into.insert(name, code);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 unsafe fn node_value_names(
     api: &sys::OrtApi,
     node: *const sys::OrtNode,

@@ -108,6 +108,7 @@ pub fn model_to_ir(model: &proto::ModelProto, base_dir: Option<&Path>) -> Result
         initializers,
         inputs,
         outputs,
+        ..Default::default()
     })
 }
 
@@ -193,7 +194,7 @@ fn node_to_ir(
     Ok(NodeIr {
         domain,
         op: node.op_type().to_string(),
-        since_version: version as i32,
+        opset: version as i32,
         name: node.name().to_string(),
         inputs: node.input.clone(),
         outputs: node.output.clone(),

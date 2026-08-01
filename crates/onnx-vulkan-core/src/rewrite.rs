@@ -212,7 +212,7 @@ fn match_layernorm(
         op: "LayerNormalization".into(),
         // the operator's own opset, independent of the graph's: the pattern
         // exists precisely because the graph predates it
-        since_version: 17,
+        opset: 17,
         name: format!("{}_fused_LayerNormalization", output),
         inputs,
         outputs: vec![output],
@@ -468,7 +468,7 @@ mod tests {
         NodeIr {
             domain: String::new(),
             op: op.into(),
-            since_version: 11,
+            opset: 11,
             name: output.into(),
             inputs: inputs.iter().map(|s| s.to_string()).collect(),
             outputs: vec![output.into()],
@@ -520,6 +520,7 @@ mod tests {
             ]),
             inputs: vec!["x".into()],
             outputs: vec!["y".into()],
+            ..Default::default()
         }
     }
 
@@ -633,6 +634,7 @@ mod tests {
             ]),
             inputs: vec!["x".into()],
             outputs: vec!["y".into()],
+            ..Default::default()
         };
         assert_eq!(fold_constants(&mut ir), 1);
         assert_eq!(ir.nodes.len(), 1);
@@ -676,6 +678,7 @@ mod tests {
             ]),
             inputs: vec!["x".into()],
             outputs: vec!["y".into()],
+            ..Default::default()
         };
         assert_eq!(fold_constants(&mut ir), 2);
         assert_eq!(ir.nodes.len(), 1);
@@ -693,6 +696,7 @@ mod tests {
             ]),
             inputs: vec![],
             outputs: vec!["w".into()],
+            ..Default::default()
         };
         assert_eq!(fold_constants(&mut ir), 0);
     }
@@ -709,6 +713,7 @@ mod tests {
             ]),
             inputs: vec![],
             outputs: vec!["w".into()],
+            ..Default::default()
         };
         assert_eq!(fold_constants(&mut ir), 0);
     }

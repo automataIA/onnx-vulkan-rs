@@ -602,6 +602,12 @@ fn main() -> Result<(), Err> {
     );
 
     sweep(&ctx, &k, "resnet50-int8  (23 nodes)", RESNET50_INT8, reps)?;
-    sweep(&ctx, &k, "mobilenetv2-int8  (18 nodes)", MOBILENETV2_INT8, reps)?;
+    sweep(
+        &ctx,
+        &k,
+        "mobilenetv2-int8  (18 nodes)",
+        MOBILENETV2_INT8,
+        reps,
+    )?;
     Ok(())
 }

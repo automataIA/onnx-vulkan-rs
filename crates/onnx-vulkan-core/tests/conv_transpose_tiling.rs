@@ -138,7 +138,7 @@ fn run(c: &Case) -> (Vec<f32>, Vec<f32>) {
         nodes: vec![NodeIr {
             domain: String::new(),
             op: "ConvTranspose".to_string(),
-            since_version: 11,
+            opset: 11,
             name: "ct".to_string(),
             inputs,
             outputs: vec!["Y".to_string()],
@@ -147,6 +147,7 @@ fn run(c: &Case) -> (Vec<f32>, Vec<f32>) {
         initializers,
         inputs: vec!["X".to_string()],
         outputs: vec!["Y".to_string()],
+        ..Default::default()
     };
 
     let context = VkContext::new().expect("Vulkan context");

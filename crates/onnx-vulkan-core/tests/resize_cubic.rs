@@ -137,7 +137,7 @@ fn node(attrs: &[(&str, AttrValue)]) -> NodeIr {
     NodeIr {
         domain: String::new(),
         op: "Resize".to_string(),
-        since_version: 13,
+        opset: 13,
         name: "Resize_0".to_string(),
         inputs: vec!["x".to_string(), String::new(), "scales".to_string()],
         outputs: vec!["out".to_string()],
@@ -171,6 +171,7 @@ fn run(coord: &str) -> (Vec<f32>, Vec<i64>) {
         )]),
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let context = VkContext::new().expect("Vulkan context");

@@ -13,7 +13,7 @@ fn node(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrValue)]
     NodeIr {
         domain: String::new(),
         op: op.to_string(),
-        since_version: 13,
+        opset: 13,
         name: format!("{op}_0"),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: outputs.iter().map(|s| (*s).to_string()).collect(),
@@ -197,6 +197,7 @@ fn conv_f32_with_stride_pad_dilation_and_bias() {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(
@@ -268,6 +269,7 @@ fn conv_f32_split_k_over_a_batch_matches_the_cpu_reference() {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(
@@ -324,6 +326,7 @@ fn conv_f32_depthwise_without_bias() {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(
@@ -383,6 +386,7 @@ fn conv_f32_1d_with_same_upper_padding() {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(
@@ -442,6 +446,7 @@ fn qdq_roundtrip(dtype: i32, per_axis: bool) {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(
@@ -598,6 +603,7 @@ fn qdq_conv_matches_float_conv_within_quantization_error() {
         initializers,
         inputs: vec!["x_q".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
 
     let out = run(

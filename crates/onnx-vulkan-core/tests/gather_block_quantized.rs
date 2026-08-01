@@ -83,7 +83,7 @@ fn run_case(case: Case) {
     let node = NodeIr {
         domain: "com.microsoft".into(),
         op: "GatherBlockQuantized".into(),
-        since_version: 1,
+        opset: 1,
         name: "gbq".into(),
         inputs: ["table", "indices", "scales", "zp"]
             .iter()
@@ -107,6 +107,7 @@ fn run_case(case: Case) {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into()],
+        ..Default::default()
     };
 
     let context = VkContext::new().expect("Vulkan context");

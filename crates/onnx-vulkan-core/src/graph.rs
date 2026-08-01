@@ -197,8 +197,17 @@ pub struct NodeIr {
     /// ONNX domain; empty string for the standard `ai.onnx` operators.
     pub domain: String,
     pub op: String,
-    /// Operator schema version resolved from the model's opset.
-    pub since_version: i32,
+    /// Version of the operator set this node's `domain` was imported at — the
+    /// model's opset, **not** the operator's own resolved schema version.
+    ///
+    /// The distinction cost a bug: the two are different numbers (a `Pad` in a
+    /// model at opset 17 resolves to schema version 13), and the field used to
+    /// be called `since_version` while the frontend put the model opset in it
+    /// and the ORT plugin put `Node_GetSinceVersion` in it. Coverage decided on
+    /// that field would have decided differently per host, which is the one
+    /// thing the shared IR exists to prevent. Both producers now write the
+    /// model opset; [`crate::is_implemented_node`] reads it as such.
+    pub opset: i32,
     pub name: String,
     /// Names of input values; empty string = missing optional input.
     pub inputs: Vec<String>,
@@ -224,6 +233,19 @@ pub struct GraphIr {
     /// External graph inputs, excluding constant initializers.
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// Element type of every value the producer could resolve, by name
+    /// (`TensorProto.DataType` codes).
+    ///
+    /// Coverage used to be decided on the op name and its attributes alone,
+    /// which is how a `uint8` `MaxPool` was claimed by an f32 kernel and
+    /// answered with reinterpreted bytes — `max|Δ| = 8.086`, argmax 489 → 611,
+    /// wrong and silent. [`crate::unsupported_dtype`] reads this map to refuse
+    /// that at load time.
+    ///
+    /// Empty is not "no types": it is "this producer resolved none", and the
+    /// check treats an unknown type as permitted, because refusing what we
+    /// simply failed to infer would reject working models.
+    pub value_types: HashMap<String, i32>,
 }
 
 /// Ops whose `axes` migrated from attribute to input, with the input index.
@@ -309,7 +331,7 @@ mod tests {
             nodes: vec![NodeIr {
                 domain: String::new(),
                 op: "Add".into(),
-                since_version: 14,
+                opset: 14,
                 name: "add".into(),
                 inputs: vec!["x".into(), "bias".into()],
                 outputs: vec!["y".into()],
@@ -318,6 +340,7 @@ mod tests {
             initializers: HashMap::from([("bias".into(), initializer)]),
             inputs: vec!["x".into()],
             outputs: vec!["y".into()],
+            ..Default::default()
         };
 
         assert_eq!(graph.nodes[0].op, "Add");

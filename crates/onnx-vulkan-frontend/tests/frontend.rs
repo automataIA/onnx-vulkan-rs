@@ -107,7 +107,7 @@ fn nodes_keep_order_names_and_optional_inputs() {
 fn schema_version_comes_from_the_model_opset() {
     let ir = mixed();
     for node in &ir.nodes {
-        assert_eq!(node.since_version, 17, "node {}", node.name);
+        assert_eq!(node.opset, 17, "node {}", node.name);
         assert_eq!(node.domain, "", "standard domain");
     }
 }

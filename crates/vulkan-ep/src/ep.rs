@@ -166,7 +166,7 @@ unsafe fn fuse_supported(
     let ep_api = apis().ep;
     // constant parameters passed as inputs (the reduction `axes`) decide
     // whether a node is supported: they must be resolved before the check
-    let irs = unsafe { crate::compile::canonical_nodes(graph, nodes)? };
+    let (irs, value_types) = unsafe { crate::compile::canonical_nodes(graph, nodes)? };
 
     // Per-node I/O and support (indices aligned with `nodes`).
     let mut node_inputs = Vec::with_capacity(nodes.len());
@@ -178,7 +178,7 @@ unsafe fn fuse_supported(
         let op = unsafe { node_op(node) }?;
         // `VULKAN_EP_OPS=Op1,Op2` restricts fusion to those ops: useful to
         // bisect which kernel introduces a divergence on a real model.
-        let claimed = crate::compile::is_fusible_node(ir)
+        let claimed = crate::compile::is_fusible_node(ir, &value_types)
             && only.as_ref().is_none_or(|list| list.contains(&op));
         supported.push(claimed);
         node_inputs.push(ins);

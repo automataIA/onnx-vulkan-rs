@@ -63,9 +63,13 @@ pub fn load(path: impl AsRef<Path>) -> Result<Model> {
 pub fn load_from_bytes(bytes: &[u8], base_dir: Option<&Path>) -> Result<Model> {
     let model = proto::ModelProto::decode(bytes)
         .map_err(|e| Error::Malformed(format!("decodifica protobuf: {e}")))?;
-    let graph = model_to_ir(&model, base_dir)?;
+    let mut graph = model_to_ir(&model, base_dir)?;
     let declared = model.graph.as_ref().map(declared_types).unwrap_or_default();
     let (types, conflicts) = shape::infer(&graph, &declared);
+    // The IR carries the element types with it, so the coverage check reads the
+    // same map whichever host built the graph. Without this the standalone path
+    // would have no types at all and would claim what the plugin refuses.
+    graph.value_types = types.dtypes();
     Ok(Model {
         graph,
         types,

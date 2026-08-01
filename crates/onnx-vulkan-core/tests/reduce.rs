@@ -17,7 +17,7 @@ fn node(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrValue)]
     NodeIr {
         domain: String::new(),
         op: op.to_string(),
-        since_version: 13,
+        opset: 13,
         name: format!("{op}_0"),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: outputs.iter().map(|s| (*s).to_string()).collect(),
@@ -34,6 +34,7 @@ fn graph(nodes: Vec<NodeIr>, output: &str) -> GraphIr {
         initializers: HashMap::<String, InitializerIr>::new(),
         inputs: vec!["x".to_string()],
         outputs: vec![output.to_string()],
+        ..Default::default()
     }
 }
 
@@ -219,6 +220,7 @@ fn constant_axes_input_is_folded_into_the_attribute() {
         initializers,
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     };
     let (got, out_shape) = run(&ir, HostTensor::from_f32(shape.clone(), &x), "out");
     assert_eq!(out_shape, vec![2, 1, 7]);

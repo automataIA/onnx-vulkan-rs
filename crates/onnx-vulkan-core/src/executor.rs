@@ -96,6 +96,30 @@ impl<'context> Executor<'context> {
                  implement: {detail}"
             )));
         }
+        // The third refusal, and the one that closes the silent class: the op
+        // is implemented, its parameters are fine, and its *operands* are of a
+        // type the kernel would misread. Before this check a `uint8` `MaxPool`
+        // was claimed by the float kernel and answered with reinterpreted
+        // bytes. Same rule again — every offender, grouped, at load time.
+        let mut wrong_types: std::collections::BTreeMap<String, (usize, &str)> = Default::default();
+        for node in &ir.nodes {
+            if let Some(reason) = crate::interp::unsupported_dtype(node, &ir.value_types) {
+                let entry = wrong_types.entry(reason).or_insert((0, node.name.as_str()));
+                entry.0 += 1;
+            }
+        }
+        if !wrong_types.is_empty() {
+            let total: usize = wrong_types.values().map(|(count, _)| count).sum();
+            let detail = wrong_types
+                .iter()
+                .map(|(reason, (count, first))| format!("{reason} ×{count} (e.g. '{first}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::Error::Unsupported(format!(
+                "{total} nodes read operands of a type their kernel does not \
+                 implement: {detail}"
+            )));
+        }
         Ok(Self {
             cache: KernelCache::new(context),
             ir,

@@ -516,7 +516,9 @@ fn main() -> Result<(), Err> {
 
         // What production dispatches for this geometry, unchanged.
         let routed = match conv::split_k(s.pixels(), s.c_out, kdepth) {
-            Some(split) => g.best(&ctx, || g.enqueue_splitk(&ctx, &k.split64, &k.reduce, split))?,
+            Some(split) => g.best(&ctx, || {
+                g.enqueue_splitk(&ctx, &k.split64, &k.reduce, split)
+            })?,
             None if conv::prefer_blocked(s.pixels(), s.c_out) => {
                 g.best(&ctx, || g.enqueue_gemm(&ctx, &k.gemm64, TILE_BLOCKED))?
             }
@@ -604,7 +606,8 @@ fn main() -> Result<(), Err> {
     );
     println!(
         "{:>38} {:>9.3} ms  (coop refuses these; counted as routed on both sides)",
-        "of which unchanged", ineligible * 1e3
+        "of which unchanged",
+        ineligible * 1e3
     );
     println!("{:>38} {col_mb:>9.1} MB", "im2col written per inference");
     println!(

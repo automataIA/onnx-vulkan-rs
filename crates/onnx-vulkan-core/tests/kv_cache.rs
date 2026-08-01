@@ -76,7 +76,7 @@ fn graph(kvh: usize, bias: Bias) -> GraphIr {
     let node = NodeIr {
         domain: "com.microsoft".into(),
         op: "GroupQueryAttention".into(),
-        since_version: 1,
+        opset: 1,
         name: "gqa".into(),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: ["out", "present_key", "present_value"]
@@ -100,6 +100,7 @@ fn graph(kvh: usize, bias: Bias) -> GraphIr {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into(), "present_key".into(), "present_value".into()],
+        ..Default::default()
     }
 }
 

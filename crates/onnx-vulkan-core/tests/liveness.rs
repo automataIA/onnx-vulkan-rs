@@ -26,7 +26,7 @@ fn relu_chain() -> GraphIr {
         .map(|i| NodeIr {
             domain: String::new(),
             op: "Relu".to_string(),
-            since_version: 14,
+            opset: 14,
             name: format!("relu_{i}"),
             inputs: vec![if i == 0 {
                 "x".to_string()
@@ -46,6 +46,7 @@ fn relu_chain() -> GraphIr {
         initializers: HashMap::<String, InitializerIr>::new(),
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     }
 }
 

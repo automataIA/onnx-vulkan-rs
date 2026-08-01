@@ -30,7 +30,7 @@ fn node(op: &str, inputs: &[&str], outputs: &[&str]) -> NodeIr {
     NodeIr {
         domain: "com.microsoft".into(),
         op: op.into(),
-        since_version: 1,
+        opset: 1,
         name: op.into(),
         inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
         outputs: outputs.iter().map(|s| (*s).to_string()).collect(),
@@ -107,6 +107,7 @@ fn skip_form_matches_the_unfused_add_and_rms_norm() {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into(), "sum".into()],
+        ..Default::default()
     };
     let got = run(&fused_ir, &host, &["out", "sum"]);
 
@@ -117,7 +118,7 @@ fn skip_form_matches_the_unfused_add_and_rms_norm() {
             NodeIr {
                 domain: String::new(),
                 op: "Add".into(),
-                since_version: 14,
+                opset: 14,
                 name: "add".into(),
                 inputs: vec!["x".into(), "skip".into()],
                 outputs: vec!["sum".into()],
@@ -128,6 +129,7 @@ fn skip_form_matches_the_unfused_add_and_rms_norm() {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into(), "sum".into()],
+        ..Default::default()
     };
     let unfused = run(&unfused_ir, &host, &["out", "sum"]);
 
@@ -174,6 +176,7 @@ fn the_residual_sum_is_optional() {
         initializers: HashMap::new(),
         inputs: Vec::new(),
         outputs: vec!["out".into()],
+        ..Default::default()
     };
     let got = run(&ir, &host, &["out"]);
     let (expected, _) = reference(&x, &skip, &gamma, c);

@@ -20,7 +20,7 @@ fn node(attrs: &[(&str, AttrValue)]) -> NodeIr {
     NodeIr {
         domain: String::new(),
         op: "ArgMax".to_string(),
-        since_version: 13,
+        opset: 13,
         name: "argmax_0".to_string(),
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
@@ -37,6 +37,7 @@ fn graph(node: NodeIr) -> GraphIr {
         initializers: HashMap::<String, InitializerIr>::new(),
         inputs: vec!["x".to_string()],
         outputs: vec!["out".to_string()],
+        ..Default::default()
     }
 }
 
@@ -210,7 +211,7 @@ fn the_runtime_helper_reduces_a_value_the_graph_produced() {
         nodes: vec![NodeIr {
             domain: String::new(),
             op: "Relu".to_string(),
-            since_version: 13,
+            opset: 13,
             name: "relu_0".to_string(),
             inputs: vec!["x".to_string()],
             outputs: vec!["logits".to_string()],
@@ -219,6 +220,7 @@ fn the_runtime_helper_reduces_a_value_the_graph_produced() {
         initializers: HashMap::new(),
         inputs: vec!["x".to_string()],
         outputs: vec!["logits".to_string()],
+        ..Default::default()
     };
 
     let context = VkContext::new().expect("Vulkan context");

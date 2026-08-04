@@ -556,11 +556,14 @@ fn run_standalone(
         let run = session
             .run(feed.iter().map(|(n, t)| (n.as_str(), t.clone())))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        times.push(start.elapsed().as_secs_f64() * 1000.0);
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let outputs = run
+            .get_many(&name_refs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         last = names
             .iter()
-            .map(|name| {
-                let tensor = run.get(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            .zip(outputs)
+            .map(|(name, tensor)| {
                 let values = tensor
                     .to_f32()
                     .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -571,6 +574,10 @@ fn run_standalone(
             })
             .collect::<Result<_>>()?;
         run.finish();
+        // `Session::run` records deferred work. The inference is complete only
+        // after its outputs have been read, so the wall clock includes the
+        // batched readback and its single fence.
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
         // The Pareto is normally printed by the plugin's `OnRunEnd`, which does
         // not exist here. Without it the profiler pass of a `standalone` job
         // would report the **EP** sub-run's GPU time next to the facade's wall

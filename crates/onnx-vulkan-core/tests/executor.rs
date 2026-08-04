@@ -66,20 +66,24 @@ fn runs_a_graph_and_reads_both_device_and_host_outputs() {
     assert!(outputs.on_device("out"), "the GPU branch stays in VRAM");
     assert_eq!(outputs.shape_of("out").expect("shape"), vec![2, 4]);
     assert_eq!(outputs.dtype_of("out").expect("dtype"), FLOAT);
-    assert_eq!(
-        outputs
-            .host("out")
-            .expect("download")
-            .to_f32()
-            .expect("f32"),
-        WANT.to_vec()
-    );
-
-    // `Shape` is resolved on the host: it must not end up in VRAM
+    // `Shape` is resolved on the host: it must not end up in VRAM. Reading it
+    // together with the device output exercises mixed-residency batching and
+    // preserves the caller's requested order.
     assert!(!outputs.on_device("x_shape"));
-    let shape = outputs.host("x_shape").expect("host shape");
+    let mut downloaded = outputs
+        .host_many(&["x_shape", "out"])
+        .expect("batched mixed-residency readback");
+    let output = downloaded.pop().expect("device output");
+    let shape = downloaded.pop().expect("host shape");
+    assert_eq!(output.to_f32().expect("f32"), WANT.to_vec());
     assert_eq!(shape.dtype, INT64);
     assert_eq!(shape.to_i64().expect("i64"), vec![2, 4]);
+
+    // The batched path populates the same small-download cache as `host`.
+    assert_eq!(
+        outputs.host("out").expect("cached output").data,
+        output.data
+    );
     outputs.finish();
 }
 

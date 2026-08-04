@@ -284,6 +284,11 @@ impl<'a> Outputs<'a> {
         self.env.host(name)
     }
 
+    /// Reads several values on the host with at most one GPU flush.
+    pub fn host_many(&self, names: &[&str]) -> Result<Vec<HostTensor>> {
+        self.env.host_many(names)
+    }
+
     /// Index of the largest element along the last axis of a value this run
     /// produced, reduced **on the device**: the dispatches join the command
     /// buffer the run is still holding, and only the indices are downloaded.

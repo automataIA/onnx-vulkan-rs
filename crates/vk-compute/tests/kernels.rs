@@ -70,6 +70,40 @@ fn add_f32() {
     ctx.destroy_pipeline(pipeline);
 }
 
+#[test]
+fn batched_download_preserves_order_and_lengths() {
+    let ctx = VkContext::new().expect("Vulkan context");
+    let first = (0..257u32).collect::<Vec<_>>();
+    let second = (0..19u32).map(|value| value * 17).collect::<Vec<_>>();
+    let first_buffer = ctx
+        .create_storage_buffer(std::mem::size_of_val(first.as_slice()) as u64)
+        .expect("first storage buffer");
+    let second_buffer = ctx
+        .create_storage_buffer(std::mem::size_of_val(second.as_slice()) as u64)
+        .expect("second storage buffer");
+
+    // Keep both uploads deferred: the one flush inside stream_download_many
+    // must execute the uploads followed by both readbacks in order.
+    ctx.stream_upload(&first_buffer, as_bytes(&first))
+        .expect("first deferred upload");
+    ctx.stream_upload(&second_buffer, as_bytes(&second))
+        .expect("second deferred upload");
+    let downloads = ctx
+        .stream_download_many(&[
+            (&first_buffer, std::mem::size_of_val(first.as_slice())),
+            (&second_buffer, std::mem::size_of_val(second.as_slice())),
+            (&second_buffer, 0),
+        ])
+        .expect("batched download");
+
+    assert_eq!(from_bytes::<u32>(&downloads[0]), first);
+    assert_eq!(from_bytes::<u32>(&downloads[1]), second);
+    assert!(downloads[2].is_empty());
+
+    ctx.destroy_buffer(first_buffer);
+    ctx.destroy_buffer(second_buffer);
+}
+
 /// ONNX-style MatMulInteger: dynamic A u8 [M,K], constant B u8 [K,N],
 /// scalar zero points, i32 [M,N] output. B packed by column:
 /// b_packed[col][i] = 4 bytes along K.

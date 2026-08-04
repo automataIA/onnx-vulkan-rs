@@ -708,6 +708,14 @@ impl Run<'_> {
         Ok(self.outputs.host(name)?)
     }
 
+    /// Reads several outputs with one GPU synchronization.
+    ///
+    /// Prefer this over repeated [`Self::get`] calls for models with several
+    /// outputs, such as decoders exposing one key/value cache per layer.
+    pub fn get_many(&self, names: &[&str]) -> Result<Vec<HostTensor>> {
+        Ok(self.outputs.host_many(names)?)
+    }
+
     /// Index of the largest element along the last axis of an output, computed
     /// on the GPU.
     ///

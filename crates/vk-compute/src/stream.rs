@@ -480,6 +480,88 @@ impl VkContext {
         self.stream_download_at(src, 0, bytes)
     }
 
+    /// Reads several device buffers with one queue submission and one fence.
+    ///
+    /// A model may expose dozens of outputs (a decoder has one key/value pair
+    /// per layer). Calling [`Self::stream_download`] for each one serializes a
+    /// submit and fence per output. This records every copy first, flushes the
+    /// shared stream once, then reads all staging buffers after that fence.
+    pub fn stream_download_many(&self, sources: &[(&GpuBuffer, usize)]) -> Result<Vec<Vec<u8>>> {
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &(src, bytes) in sources {
+            anyhow::ensure!(
+                bytes as u64 <= src.size,
+                "download out of bounds: {bytes} on {}",
+                src.size
+            );
+        }
+
+        let mut staging = Vec::with_capacity(sources.len());
+        for &(src, bytes) in sources {
+            crate::stats::record_down(bytes as u64);
+            if bytes == 0 {
+                staging.push((None, bytes));
+                continue;
+            }
+            let buffer = match self.acquire_staging_download(bytes as u64) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    // Only recycle staging after the fence proves that no
+                    // queued copy still references it. On the compound error
+                    // path, leaking a buffer is safer than reusing live memory.
+                    if self.flush().is_ok() {
+                        for (buffer, _) in staging.drain(..) {
+                            if let Some(buffer) = buffer {
+                                self.release_staging(buffer, false);
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.stream_copy_range(src, 0, &buffer, 0, bytes as u64) {
+                // A recorded copy may already reference an earlier staging
+                // buffer. Flush it before returning those buffers to the pool.
+                if self.flush().is_ok() {
+                    self.release_staging(buffer, false);
+                    for (buffer, _) in staging.drain(..) {
+                        if let Some(buffer) = buffer {
+                            self.release_staging(buffer, false);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            staging.push((Some(buffer), bytes));
+        }
+
+        self.flush()?;
+
+        let mut outputs = Vec::with_capacity(staging.len());
+        let mut first_error = None;
+        for (buffer, bytes) in staging {
+            let Some(buffer) = buffer else {
+                outputs.push(Vec::new());
+                continue;
+            };
+            let data = buffer.read_mapped(bytes);
+            self.release_staging(buffer, false);
+            match data {
+                Ok(data) => outputs.push(data),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    outputs.push(Vec::new());
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(outputs),
+        }
+    }
+
     /// Download from a **region** of the source buffer.
     pub fn stream_download_at(
         &self,

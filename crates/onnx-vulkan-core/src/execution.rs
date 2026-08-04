@@ -211,6 +211,95 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         }
     }
 
+    /// Returns several host copies with at most one device synchronization.
+    ///
+    /// Host-resident values and cached downloads are copied immediately. All
+    /// remaining device values are copied to staging buffers together and the
+    /// stream is flushed once, irrespective of the number of outputs.
+    pub fn host_many(&self, names: &[&str]) -> Result<Vec<HostTensor>> {
+        let mut outputs: Vec<Option<HostTensor>> = vec![None; names.len()];
+        let mut pending = Vec::new();
+
+        for (index, &name) in names.iter().enumerate() {
+            if let Some(initializer) = self.initializers.get(name) {
+                outputs[index] = Some(HostTensor::new(
+                    initializer.dtype,
+                    initializer.shape.clone(),
+                    initializer.data.clone(),
+                ));
+                continue;
+            }
+            if let Some(stride) = self.row_padding(name) {
+                return Err(Error::InvalidTensor(format!(
+                    "'{name}' lives in a buffer padded to {stride} time steps per row, so its leading \
+                     elements are not the tensor its shape declares: read it row by row with that \
+                     stride, or run against a cache whose length is the sequence"
+                )));
+            }
+            match self.values.get(name) {
+                Some(Tensor::Host(tensor)) => outputs[index] = Some(tensor.clone()),
+                Some(Tensor::Device(tensor)) => {
+                    if let Some(host) = self.host_cache.borrow().get(name) {
+                        outputs[index] = Some(host.clone());
+                        continue;
+                    }
+                    let byte_len =
+                        storage_len(tensor.dtype, tensor.elem_count).ok_or_else(|| {
+                            Error::InvalidTensor(format!(
+                                "dtype {} has no fixed-size storage",
+                                tensor.dtype
+                            ))
+                        })?;
+                    if byte_len == 0 {
+                        outputs[index] = Some(HostTensor::new(
+                            tensor.dtype,
+                            tensor.shape.clone(),
+                            Vec::new(),
+                        ));
+                    } else {
+                        pending.push((index, name, tensor, byte_len));
+                    }
+                }
+                None => {
+                    return Err(Error::InvalidTensor(format!(
+                        "host value '{name}' not present"
+                    )));
+                }
+            }
+        }
+
+        let sources: Vec<_> = pending
+            .iter()
+            .map(|(_, _, tensor, bytes)| (tensor.buffer(), *bytes))
+            .collect();
+        let downloads = self
+            .context
+            .stream_download_many(&sources)
+            .map_err(backend_error)?;
+        for ((index, name, tensor, byte_len), data) in pending.into_iter().zip(downloads) {
+            let host = HostTensor::new(tensor.dtype, tensor.shape.clone(), data);
+            if byte_len <= HOST_MEMO_MAX_BYTES {
+                self.host_cache
+                    .borrow_mut()
+                    .insert(name.to_owned(), host.clone());
+            }
+            outputs[index] = Some(host);
+        }
+
+        outputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, tensor)| {
+                tensor.ok_or_else(|| {
+                    Error::Backend(format!(
+                        "batched download left output {} ('{}') unresolved",
+                        index, names[index]
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn dtype_of(&self, name: &str) -> Result<i32> {
         match self.values.get(name) {
             Some(Tensor::Device(tensor)) => Ok(tensor.dtype),

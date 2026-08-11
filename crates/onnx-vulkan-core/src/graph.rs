@@ -1,6 +1,7 @@
 //! Owned intermediate representation of an ONNX graph.
 
 use crate::host_ops::HostTensor;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Elementary `TensorProto` type according to ONNX numeric codes.
@@ -248,6 +249,113 @@ pub struct GraphIr {
     pub value_types: HashMap<String, i32>,
 }
 
+/// Stable digest of the executable graph contract.
+///
+/// Node order and graph input/output order remain significant. Unordered maps
+/// are sorted before encoding. Initializer contents participate in the digest,
+/// but callers only receive the digest: an execution-plan manifest can validate
+/// external weights without embedding another copy of them.
+pub fn graph_digest(graph: &GraphIr) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    field(&mut digest, b"onnx-vulkan-graph-digest-v1");
+    strings(&mut digest, &graph.inputs);
+    strings(&mut digest, &graph.outputs);
+
+    integer(&mut digest, graph.nodes.len() as u64);
+    for node in &graph.nodes {
+        field(&mut digest, node.domain.as_bytes());
+        field(&mut digest, node.op.as_bytes());
+        field(&mut digest, &node.opset.to_le_bytes());
+        field(&mut digest, node.name.as_bytes());
+        strings(&mut digest, &node.inputs);
+        strings(&mut digest, &node.outputs);
+        let mut attrs = node.attrs.iter().collect::<Vec<_>>();
+        attrs.sort_unstable_by_key(|(name, _)| *name);
+        integer(&mut digest, attrs.len() as u64);
+        for (name, value) in attrs {
+            field(&mut digest, name.as_bytes());
+            attribute(&mut digest, value);
+        }
+    }
+
+    let mut initializers = graph.initializers.iter().collect::<Vec<_>>();
+    initializers.sort_unstable_by_key(|(name, _)| *name);
+    integer(&mut digest, initializers.len() as u64);
+    for (name, initializer) in initializers {
+        field(&mut digest, name.as_bytes());
+        initializer_digest(&mut digest, initializer);
+    }
+
+    let mut value_types = graph.value_types.iter().collect::<Vec<_>>();
+    value_types.sort_unstable_by_key(|(name, _)| *name);
+    integer(&mut digest, value_types.len() as u64);
+    for (name, dtype) in value_types {
+        field(&mut digest, name.as_bytes());
+        field(&mut digest, &dtype.to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn integer(digest: &mut Sha256, value: u64) {
+    digest.update(value.to_le_bytes());
+}
+
+fn field(digest: &mut Sha256, bytes: &[u8]) {
+    integer(digest, bytes.len() as u64);
+    digest.update(bytes);
+}
+
+fn strings(digest: &mut Sha256, values: &[String]) {
+    integer(digest, values.len() as u64);
+    for value in values {
+        field(digest, value.as_bytes());
+    }
+}
+
+fn initializer_digest(digest: &mut Sha256, initializer: &InitializerIr) {
+    field(digest, &initializer.dtype.to_le_bytes());
+    integer(digest, initializer.shape.len() as u64);
+    for dimension in &initializer.shape {
+        field(digest, &dimension.to_le_bytes());
+    }
+    field(digest, &initializer.data);
+}
+
+fn attribute(digest: &mut Sha256, value: &AttrValue) {
+    match value {
+        AttrValue::Int(value) => {
+            digest.update([0]);
+            field(digest, &value.to_le_bytes());
+        }
+        AttrValue::Ints(values) => {
+            digest.update([1]);
+            integer(digest, values.len() as u64);
+            for value in values {
+                field(digest, &value.to_le_bytes());
+            }
+        }
+        AttrValue::Float(value) => {
+            digest.update([2]);
+            field(digest, &value.to_bits().to_le_bytes());
+        }
+        AttrValue::Floats(values) => {
+            digest.update([3]);
+            integer(digest, values.len() as u64);
+            for value in values {
+                field(digest, &value.to_bits().to_le_bytes());
+            }
+        }
+        AttrValue::String(value) => {
+            digest.update([4]);
+            field(digest, value.as_bytes());
+        }
+        AttrValue::Tensor(value) => {
+            digest.update([5]);
+            initializer_digest(digest, value);
+        }
+    }
+}
+
 /// Ops whose `axes` migrated from attribute to input, with the input index.
 ///
 /// ONNX moved `axes` to inputs at different times: `ReduceSum` from
@@ -345,5 +453,49 @@ mod tests {
 
         assert_eq!(graph.nodes[0].op, "Add");
         assert_eq!(graph.initializers["bias"].data.len(), 8);
+    }
+
+    #[test]
+    fn graph_digest_is_canonical_and_content_sensitive() {
+        let node = NodeIr {
+            domain: String::new(),
+            op: "Add".into(),
+            opset: 14,
+            name: "add".into(),
+            inputs: vec!["x".into(), "bias".into()],
+            outputs: vec!["y".into()],
+            attrs: HashMap::from([
+                ("beta".into(), AttrValue::Float(1.0)),
+                ("axes".into(), AttrValue::Ints(vec![1, 2])),
+            ]),
+        };
+        let initializer = InitializerIr {
+            dtype: ElementType::Float32 as i32,
+            shape: vec![1],
+            data: 1.0_f32.to_le_bytes().to_vec(),
+        };
+        let graph = GraphIr {
+            nodes: vec![node.clone()],
+            initializers: HashMap::from([("bias".into(), initializer.clone())]),
+            inputs: vec!["x".into()],
+            outputs: vec!["y".into()],
+            value_types: HashMap::from([("y".into(), 1), ("x".into(), 1)]),
+        };
+        let reordered = GraphIr {
+            nodes: vec![NodeIr {
+                attrs: HashMap::from([
+                    ("axes".into(), AttrValue::Ints(vec![1, 2])),
+                    ("beta".into(), AttrValue::Float(1.0)),
+                ]),
+                ..node
+            }],
+            value_types: HashMap::from([("x".into(), 1), ("y".into(), 1)]),
+            ..graph.clone()
+        };
+        assert_eq!(graph_digest(&graph), graph_digest(&reordered));
+
+        let mut changed = graph;
+        changed.initializers.get_mut("bias").unwrap().data[0] ^= 1;
+        assert_ne!(graph_digest(&changed), graph_digest(&reordered));
     }
 }

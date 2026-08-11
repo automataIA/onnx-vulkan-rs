@@ -12,14 +12,67 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vk_compute::{ComputePipeline, GpuBuffer, VkContext};
+
+/// Stable identity of one compiled pipeline within a session.
+///
+/// `operation` remains the human-readable profiler label. `tactic` is present
+/// for generated or artifact-selected implementations whose shader can differ
+/// while serving the same operation. The map owns the typed key and its tactic
+/// ID; only the closed-set profiler label remains static, so persistent tactic
+/// IDs never have to be leaked into `'static` storage.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PipelineKey {
+    operation: &'static str,
+    tactic: Option<String>,
+}
+
+impl PipelineKey {
+    pub fn committed(operation: &'static str) -> Self {
+        Self {
+            operation,
+            tactic: None,
+        }
+    }
+
+    pub fn tactic(operation: &'static str, tactic: impl Into<String>) -> Self {
+        Self {
+            operation,
+            tactic: Some(tactic.into()),
+        }
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub fn tactic_id(&self) -> Option<&str> {
+        self.tactic.as_deref()
+    }
+}
+
+impl From<&'static str> for PipelineKey {
+    fn from(operation: &'static str) -> Self {
+        Self::committed(operation)
+    }
+}
 
 /// Identity of a packed weight: value name plus dimensions of the
 /// produced layout. Name alone is insufficient to distinguish two weights with
 /// the same label, and shape alters buffer contents.
 type PackedKey = (String, usize, usize);
+
+/// Read-only inventory of one session-owned transformed weight.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackedWeightInfo {
+    pub name: String,
+    pub rows: usize,
+    pub columns: usize,
+    pub bytes: u64,
+}
 
 /// Identity of an initializer loaded into VRAM: name, dtype, and byte count.
 /// The dtype and length are part of the key because two graphs can reuse the
@@ -28,7 +81,8 @@ type UploadKey = (String, i32, usize);
 
 pub struct KernelCache<'context> {
     context: &'context VkContext,
-    pipelines: Mutex<HashMap<&'static str, Box<ComputePipeline>>>,
+    tuning: Arc<crate::tuning::TacticResolver>,
+    pipelines: Mutex<HashMap<PipelineKey, Box<ComputePipeline>>>,
     packed: Mutex<HashMap<PackedKey, Box<GpuBuffer>>>,
     uploads: Mutex<HashMap<UploadKey, Box<GpuBuffer>>>,
     zero_scalar: Mutex<Option<Box<GpuBuffer>>>,
@@ -41,8 +95,16 @@ pub struct KernelCache<'context> {
 
 impl<'context> KernelCache<'context> {
     pub fn new(context: &'context VkContext) -> Self {
+        Self::with_tuning(context, Arc::new(crate::tuning::TacticResolver::off()))
+    }
+
+    pub fn with_tuning(
+        context: &'context VkContext,
+        tuning: Arc<crate::tuning::TacticResolver>,
+    ) -> Self {
         Self {
             context,
+            tuning,
             pipelines: Mutex::new(HashMap::new()),
             packed: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
@@ -58,6 +120,10 @@ impl<'context> KernelCache<'context> {
         self.context
     }
 
+    pub fn tuning(&self) -> &crate::tuning::TacticResolver {
+        &self.tuning
+    }
+
     /// How many pipelines have been compiled and how many weights packed since
     /// the cache was created: on a warm session these numbers stop growing.
     pub fn builds(&self) -> (usize, usize) {
@@ -67,18 +133,48 @@ impl<'context> KernelCache<'context> {
         )
     }
 
+    /// Compiled identities for diagnostics and structural tests.
+    pub fn pipeline_keys(&self) -> Vec<PipelineKey> {
+        self.pipelines
+            .lock()
+            .expect("poisoned pipeline cache")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Canonical metadata for transformed weights already materialized by a
+    /// real run. The underlying bytes and device handles never leave the
+    /// session cache.
+    pub fn packed_weights(&self) -> Vec<PackedWeightInfo> {
+        let mut weights = self
+            .packed
+            .lock()
+            .expect("poisoned packed-weights cache")
+            .iter()
+            .map(|((name, rows, columns), buffer)| PackedWeightInfo {
+                name: name.clone(),
+                rows: *rows,
+                columns: *columns,
+                bytes: buffer.size,
+            })
+            .collect::<Vec<_>>();
+        weights.sort_unstable();
+        weights
+    }
+
     /// Pipeline for `key` (one per shader variant), compiled on first request.
     /// The lock is not held during dispatch.
     ///
     /// The pointer stays valid as long as the cache lives.
     pub(crate) fn pipeline(
         &self,
-        key: &'static str,
+        key: PipelineKey,
         build: impl FnOnce() -> Result<ComputePipeline>,
     ) -> Result<*const ComputePipeline> {
         {
             let map = self.pipelines.lock().expect("poisoned pipeline cache");
-            if let Some(existing) = map.get(key) {
+            if let Some(existing) = map.get(&key) {
                 return Ok(&**existing as *const ComputePipeline);
             }
         }
@@ -234,5 +330,20 @@ impl Drop for KernelCache<'_> {
         if let Some(buffer) = self.zero_scalar.get_mut().expect("zero cache").take() {
             self.context.destroy_buffer(*buffer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PipelineKey;
+
+    #[test]
+    fn pipeline_key_separates_tactics_for_one_operation() {
+        let tile32 = PipelineKey::tactic("Conv", "blocked:tile32");
+        let tile128 = PipelineKey::tactic("Conv", "blocked:tile128");
+        assert_ne!(tile32, tile128);
+        assert_eq!(tile32.operation(), "Conv");
+        assert_eq!(tile32.tactic_id(), Some("blocked:tile32"));
+        assert_eq!(PipelineKey::committed("Conv").tactic_id(), None);
     }
 }

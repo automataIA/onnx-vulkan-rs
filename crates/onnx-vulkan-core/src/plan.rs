@@ -82,6 +82,14 @@ pub struct StepPlan {
     held: Vec<vk_compute::GpuBuffer>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepPlanStats {
+    pub dispatches: usize,
+    pub host_nodes: usize,
+    pub temporary_buffer_sizes: Vec<u64>,
+    pub temporary_bytes: u64,
+}
+
 impl StepPlan {
     /// Builds a plan from consecutive captured steps, `steps[i]` being the trace
     /// of step `origin + i`.
@@ -131,6 +139,23 @@ impl StepPlan {
 
     pub fn host_node_count(&self) -> usize {
         self.host_nodes.len()
+    }
+
+    /// Metadata safe to persist in an execution-plan manifest. It describes
+    /// the verified live plan without exposing commands, handles, or buffers.
+    pub fn stats(&self) -> StepPlanStats {
+        let mut temporary_buffer_sizes = self
+            .held
+            .iter()
+            .map(|buffer| buffer.size)
+            .collect::<Vec<_>>();
+        temporary_buffer_sizes.sort_unstable();
+        StepPlanStats {
+            dispatches: self.dispatches(),
+            host_nodes: self.host_node_count(),
+            temporary_bytes: temporary_buffer_sizes.iter().copied().sum(),
+            temporary_buffer_sizes,
+        }
     }
 
     /// Takes the free buffers out of the pool and keeps them.

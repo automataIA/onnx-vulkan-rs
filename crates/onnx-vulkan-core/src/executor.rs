@@ -14,7 +14,27 @@
 use crate::{
     ExecutionEnv, GraphIr, HostTensor, KernelCache, Result, Tensor, execute, is_implemented_node,
 };
+use std::sync::Arc;
 use vk_compute::{GpuBuffer, VkContext};
+
+/// Applies the exact load-time graph rewrites shared by execution and offline
+/// execution-plan identity. It is pure graph normalization: support checks and
+/// every Vulkan allocation remain in [`Executor::with_tuning`].
+pub fn prepare_graph(ir: &mut GraphIr) {
+    let fused = crate::rewrite::fuse_layernorm(ir);
+    let folded = crate::rewrite::fold_constants(ir);
+    if fused > 0 || folded > 0 {
+        let pruned = crate::rewrite::prune_dead_nodes(ir);
+        let released = crate::rewrite::prune_dead_initializers(ir);
+        log::info!(
+            "rewrite: {fused} decomposed LayerNormalization fused, \
+             {folded} constant nodes folded, {pruned} orphaned nodes pruned, \
+             {:.1} MB of initializers released, {} nodes left",
+            released as f64 / 1e6,
+            ir.nodes.len()
+        );
+    }
+}
 
 /// A graph plus the GPU resources reused across its runs.
 ///
@@ -32,22 +52,20 @@ impl<'context> Executor<'context> {
     /// The check happens here rather than at the first dispatch on purpose: a
     /// model either runs entirely on the GPU or it fails loud, and the useful
     /// moment to fail is at load, not halfway through an inference.
-    pub fn new(context: &'context VkContext, mut ir: GraphIr) -> Result<Self> {
+    pub fn new(context: &'context VkContext, ir: GraphIr) -> Result<Self> {
+        Self::with_tuning(context, ir, Arc::new(crate::tuning::TacticResolver::off()))
+    }
+
+    /// Builds an executor with a session-owned persistent tactic resolver.
+    /// Hosts use this one shared boundary after loading an artifact once.
+    pub fn with_tuning(
+        context: &'context VkContext,
+        mut ir: GraphIr,
+        tuning: Arc<crate::tuning::TacticResolver>,
+    ) -> Result<Self> {
         // Load-time rewrites live here and not in each host, so the standalone
         // path and the ORT plugin cannot end up running different graphs.
-        let fused = crate::rewrite::fuse_layernorm(&mut ir);
-        let folded = crate::rewrite::fold_constants(&mut ir);
-        if fused > 0 || folded > 0 {
-            let pruned = crate::rewrite::prune_dead_nodes(&mut ir);
-            let released = crate::rewrite::prune_dead_initializers(&mut ir);
-            log::info!(
-                "rewrite: {fused} decomposed LayerNormalization fused, \
-                 {folded} constant nodes folded, {pruned} orphaned nodes pruned, \
-                 {:.1} MB of initializers released, {} nodes left",
-                released as f64 / 1e6,
-                ir.nodes.len()
-            );
-        }
+        prepare_graph(&mut ir);
         // Every unsupported node, not the first: a caller deciding whether this
         // engine can run their model needs the whole list, and discovering it
         // one recompile at a time is not a report.
@@ -121,7 +139,7 @@ impl<'context> Executor<'context> {
             )));
         }
         Ok(Self {
-            cache: KernelCache::new(context),
+            cache: KernelCache::with_tuning(context, tuning),
             ir,
         })
     }

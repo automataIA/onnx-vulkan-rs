@@ -16,6 +16,7 @@ all-features = true
 [dependencies]
 onnx-vulkan-core = { workspace = true }
 onnx-vulkan-frontend = { workspace = true }
+onnx-vulkan-tune = { path = "../onnx-vulkan-tune" }
 vk-compute = { workspace = true }
 log.workspace = true
 

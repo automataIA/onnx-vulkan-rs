@@ -103,6 +103,11 @@ fn a_warm_cache_is_reused_across_runs() {
         after_first.0 >= 2,
         "pack + matmul compiled: {after_first:?}"
     );
+    let packed = cache.packed_weights();
+    assert_eq!(packed.len(), 1);
+    assert_eq!(packed[0].name, "b");
+    assert_eq!((packed[0].rows, packed[0].columns), (K, N));
+    assert_eq!(packed[0].bytes, (K * N) as u64);
 
     // second execution: same results, no recompilation or packing
     assert_eq!(run_once(&cache, &ir, &a), want);

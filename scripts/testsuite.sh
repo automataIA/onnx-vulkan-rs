@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Automated test suite: builds, stages to Windows, runs the model × EP path
-# matrix, samples metrics, writes structured logs in `runs/` and prints a
+# Automated test suite: builds, runs the model × EP path matrix natively on
+# Linux, samples metrics, writes structured logs in `runs/` and prints a
 # summary pasteable into `cronologia.md`.
 #
 #   scripts/testsuite.sh                              # default matrix
 #   scripts/testsuite.sh -m yolov8n -M compile -i 50  # one model, one path
-#   scripts/testsuite.sh -n -m rfdetr                 # reuse existing staging
+#   scripts/testsuite.sh -n -m rfdetr                 # reuse the existing build
 #   scripts/testsuite.sh --baseline runs/baseline.json
 #   scripts/testsuite.sh --metric rfdetr.compile gpu.compute_ms   # read a number
 #
@@ -17,12 +17,10 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HELPERS="$ROOT/scripts/testsuite"
 MANIFEST="$ROOT/tests/models.toml"
-TARGET=x86_64-pc-windows-msvc
-BIN_DIR="$ROOT/target/$TARGET/release"
-# Windows staging directory (WSL side); overridable from the environment
-WIN_DIR="${TESTSUITE_WIN_DIR:-}"
+BIN_DIR="$ROOT/target/release"
+ORT_LIB="$ROOT/third_party/onnxruntime/linux-x64/lib/libonnxruntime.so"
 
-MODELS=() MODES=() ITERS="" BUILD=1 STAGE_ONLY=0 SAMPLE_MS=100
+MODELS=() MODES=() ITERS="" BUILD=1 SAMPLE_MS=100
 BASELINE="" TAG="" KEEP=20 DRY=0 DESC="" METRIC_SEL="" METRIC_PATH=""
 
 die() {
@@ -37,8 +35,7 @@ usage() {
   -m, --model NAME    only this model (repeatable; default: the manifest's `default` entries)
   -M, --mode MODE     cpu | registry | compile (repeatable; default: cpu,compile)
   -i, --iters N       iterations per run (default: from the manifest)
-  -n, --no-build      skip build and staging
-      --stage-only    build and stage, does not run
+  -n, --no-build      skip the build and reuse target/release as it is
       --sample MS     metric sampling period (0 = disable; default 100)
       --baseline FILE compare with a previous run and apply the gates
       --tag NAME      label of the output folder (default: timestamp)
@@ -61,7 +58,6 @@ while [ $# -gt 0 ]; do
     -M | --mode) MODES+=("$2"); shift 2 ;;
     -i | --iters) ITERS="$2"; shift 2 ;;
     -n | --no-build) BUILD=0; shift ;;
-    --stage-only) STAGE_ONLY=1; shift ;;
     --sample) SAMPLE_MS="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
@@ -78,7 +74,7 @@ done
 
 # ------------------------------------------------------- 0. --metric (query)
 # Reads an existing run and exits. Deliberately before every check below: a
-# query touches no Windows host, no staging dir and no toolchain, so it must
+# query touches no GPU and no toolchain, so it must
 # work anywhere the repo is checked out. Extraction stays separate from
 # execution — a loop chains them (`testsuite.sh -m X --tag e42 &&
 # testsuite.sh --metric X.compile gpu.compute_ms --tag e42`).
@@ -101,24 +97,7 @@ fi
 
 [ -f "$MANIFEST" ] || die "manifest missing: $MANIFEST"
 
-# A run made only of `standalone` jobs never touches Windows: no cross-build, no
-# staging, no interop. That is the whole point of the mode — it turns a 3–5 min
-# cycle into seconds — so its requirements must not be the Windows ones.
-HAS_NATIVE=0 HAS_WIN=1 NATIVE_ONLY=0
-if [ ${#MODES[@]} -gt 0 ]; then
-    HAS_WIN=0
-    for m in "${MODES[@]}"; do
-        if [ "$m" = standalone ]; then HAS_NATIVE=1; else HAS_WIN=1; fi
-    done
-    [ "$HAS_NATIVE" = 1 ] && [ "$HAS_WIN" = 0 ] && NATIVE_ONLY=1
-fi
-
-WIN_PATH=""
-if [ "$NATIVE_ONLY" = 0 ]; then
-    command -v wslpath >/dev/null || die "WSL required: the suite drives the Windows binaries via interop"
-    [[ -n "$WIN_DIR" ]] || die "set TESTSUITE_WIN_DIR to the Windows staging dir (WSL side)"
-    WIN_PATH="$(wslpath -w "$WIN_DIR" 2>/dev/null)" || die "WIN_DIR not convertible: $WIN_DIR"
-fi
+[ -f "$ORT_LIB" ] || die "ONNX Runtime missing: $ORT_LIB (run ./scripts/fetch-deps.sh)"
 
 run_cmd() { # executes, or just prints with --dry-run
     if [ "$DRY" = 1 ]; then
@@ -132,15 +111,9 @@ manifest() { "$HELPERS/manifest.py" "$@" --manifest "$MANIFEST"; }
 
 # ---------------------------------------------------------------- 1. build
 if [ "$BUILD" = 1 ]; then
-    if [ "$HAS_NATIVE" = 1 ]; then
-        echo "== build (native, for the standalone mode)"
-        run_cmd cargo build --release -p model-runner -p vulkan-ep || die "native build failed"
-    fi
-    if [ "$HAS_WIN" = 1 ]; then
-        echo "== build ($TARGET)"
-        run_cmd cargo xwin build --release --target "$TARGET" \
-            -p model-runner -p stt-app -p vulkan-ep || die "build failed"
-    fi
+    echo "== build"
+    run_cmd cargo build --release -p model-runner -p stt-app -p vulkan-ep ||
+        die "build failed"
 fi
 
 # ------------------------------------------------- 1b. artifact freshness
@@ -169,43 +142,12 @@ ${newer#"$ROOT/"}. Rebuild — a runner and a plugin from different trees measur
     done
 }
 
-if [ "$DRY" != 1 ] && [ "$HAS_NATIVE" = 1 ]; then
-    check_fresh native \
-        "$ROOT/target/release/model-runner" \
-        "$ROOT/target/release/libonnxruntime_ep_vulkan.so"
+if [ "$DRY" != 1 ]; then
+    check_fresh release \
+        "$BIN_DIR/model-runner" \
+        "$BIN_DIR/stt-app" \
+        "$BIN_DIR/libonnxruntime_ep_vulkan.so"
 fi
-if [ "$DRY" != 1 ] && [ "$HAS_WIN" = 1 ]; then
-    check_fresh "$TARGET" \
-        "$BIN_DIR/model-runner.exe" \
-        "$BIN_DIR/onnxruntime_ep_vulkan.dll"
-fi
-
-# ---------------------------------------------------------------- 2. staging
-stage() {
-    echo "== staging → $WIN_DIR"
-    mkdir -p "$WIN_DIR"
-    for f in model-runner.exe stt-app.exe onnxruntime_ep_vulkan.dll; do
-        [ -f "$BIN_DIR/$f" ] || die "missing binary: $BIN_DIR/$f (drop -n?)"
-        run_cmd cp "$BIN_DIR/$f" "$WIN_DIR/"
-    done
-    run_cmd cp "$ROOT/scripts/sample-metrics.ps1" "$WIN_DIR/"
-    if [ ! -f "$WIN_DIR/onnxruntime.dll" ]; then
-        run_cmd cp "$ROOT/third_party/onnxruntime/win-x64/lib/onnxruntime.dll" "$WIN_DIR/" ||
-            die "onnxruntime.dll missing: run ./scripts/fetch-deps.sh"
-    fi
-    # the models weigh 4.2 GB in total: copy only what the matrix needs, and
-    # only if missing or older than the source (--update)
-    local paths
-    paths="$(manifest stage "${MODEL_ARGS[@]}")" || die "manifest unreadable"
-    [ -n "$paths" ] || return 0
-    # shellcheck disable=SC2086
-    echo "$paths" | while read -r p; do
-        [ -e "$ROOT/$p" ] || { echo "  ! missing source: $p" >&2; continue; }
-        # models with external weights carry a .onnx_data sidecar
-        run_cmd rsync -a --update --relative "$ROOT/./$p" "$ROOT/./$p"_data "$WIN_DIR/" 2>/dev/null ||
-            run_cmd rsync -a --update --relative "$ROOT/./$p" "$WIN_DIR/"
-    done
-}
 
 MODEL_ARGS=()
 for m in ${MODELS+"${MODELS[@]}"}; do MODEL_ARGS+=(-m "$m"); done
@@ -213,15 +155,9 @@ MODE_ARGS=()
 for m in ${MODES+"${MODES[@]}"}; do MODE_ARGS+=(-M "$m"); done
 [ -n "$ITERS" ] && MODE_ARGS+=(--iters "$ITERS")
 
-# reference data must be fetched before staging, which propagates it
+# reference data must be fetched before the matrix runs, which consumes it
 if [ "$DRY" = 0 ]; then
     manifest fetch ${MODEL_ARGS+"${MODEL_ARGS[@]}"} || true
-fi
-
-[ "$BUILD" = 1 ] && [ "$HAS_WIN" = 1 ] && stage
-if [ "$STAGE_ONLY" = 1 ]; then
-    echo "== stage-only: done"
-    exit 0
 fi
 
 # ---------------------------------------------------------------- 3. context
@@ -229,13 +165,16 @@ TAG="${TAG:-$(date +%Y-%m-%dT%H-%M-%S)}"
 RUN_DIR="$ROOT/runs/$TAG"
 mkdir -p "$RUN_DIR"
 
-gpu_name="$(/mnt/c/Windows/System32/nvidia-smi.exe --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r')"
-driver="$(/mnt/c/Windows/System32/nvidia-smi.exe --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r')"
+# NVML, not nvidia-smi: the same helper that samples the run reads the identity,
+# so the two cannot disagree about which device produced the numbers.
+gpu_json="$("$HELPERS/sample_metrics.py" gpu 2>/dev/null || echo '{}')"
+gpu_name="$(jq -r '.gpu // ""' <<<"$gpu_json")"
+driver="$(jq -r '.driver // ""' <<<"$gpu_json")"
 jq -n \
     --arg host "$(hostname)" \
     --arg commit "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)" \
     --argjson dirty "$([ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ] && echo true || echo false)" \
-    --arg ort "$(basename "$(dirname "$(dirname "$ROOT/third_party/onnxruntime/win-x64/lib/onnxruntime.dll")")" 2>/dev/null)" \
+    --arg ort "$(basename "$(dirname "$(dirname "$ORT_LIB")")" 2>/dev/null)" \
     --arg gpu "${gpu_name:-unknown}" \
     --arg driver "${driver:-unknown}" \
     --arg sample_ms "$SAMPLE_MS" \
@@ -245,8 +184,6 @@ jq -n \
     >"$RUN_DIR/env.json"
 
 # ---------------------------------------------------------------- 4. matrix
-win_rel() { printf '%s' "${1//\//\\}"; } # models/zoo/x.onnx → models\zoo\x.onnx
-
 # Instrumentation for `validate = "per-node"`: promotes intermedi to outputs.
 # Costs minutes on a large graph, so the result is cached on disk.
 instrument_model() { # $1 path, $2 name, $3 spec JSON → prints the relative path
@@ -263,7 +200,6 @@ instrument_model() { # $1 path, $2 name, $3 spec JSON → prints the relative pa
         run_cmd "$ROOT/scripts/expose-intermediates.py" "$ROOT/$src" "$ROOT/$out" \
             --from "$from" --every "$every" --limit "$limit" >&2 || return 1
     fi
-    run_cmd rsync -a --update --relative "$ROOT/./$out" "$WIN_DIR/" >&2
     printf '%s' "$out"
 }
 
@@ -271,55 +207,41 @@ instrument_model() { # $1 path, $2 name, $3 spec JSON → prints the relative pa
 # in a command substitution the process would be a child of the subshell, and
 # `wait` in the parent could not wait on it.
 SAMPLER_PID=""
-start_sampler() { # $1 process name (without .exe), $2 destination csv (WSL)
+STOP_FILE="$ROOT/target/testsuite/.testsuite-stop"
+start_sampler() { # $1 process name, $2 destination csv
     SAMPLER_PID=""
     [ "$SAMPLE_MS" = 0 ] && return 0
-    [ "$DRY" = 1 ] && { echo "+ sample-metrics.ps1 -ProcessName $1" >&2; return 0; }
-    rm -f "$WIN_DIR/.testsuite-stop" "$2"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
-        -File "$WIN_PATH\\sample-metrics.ps1" \
-        -ProcessName "$1" -Out "$WIN_PATH\\$(basename "$2")" \
-        -IntervalMs "$SAMPLE_MS" -StopFile "$WIN_PATH\\.testsuite-stop" \
+    [ "$DRY" = 1 ] && { echo "+ sample_metrics.py sample -p $1" >&2; return 0; }
+    mkdir -p "$(dirname "$STOP_FILE")"
+    rm -f "$STOP_FILE" "$2"
+    "$HELPERS/sample_metrics.py" sample -p "$1" -o "$2" \
+        --interval-ms "$SAMPLE_MS" --stop-file "$STOP_FILE" \
         >/dev/null 2>&1 </dev/null &
     SAMPLER_PID=$!
 }
 
 stop_sampler() {
     [ -z "$SAMPLER_PID" ] && return 0
-    touch "$WIN_DIR/.testsuite-stop"
+    touch "$STOP_FILE"
     wait "$SAMPLER_PID" 2>/dev/null
     SAMPLER_PID=""
-    rm -f "$WIN_DIR/.testsuite-stop"
-}
-
-# Runs a Windows command in the staging directory, with the mode's environment.
-win_exec() { # $1 `set VAR=…&&` prefix, $2 command line → stdout+stderr
-    local env_prefix="$1" cmdline="$2"
-    local common="set RUST_LOG=info&& set ORT_DYLIB_PATH=onnxruntime.dll"
-    if [ "$DRY" = 1 ]; then
-        echo "+ cmd.exe /c \"cd /d $WIN_PATH&& $common&& $env_prefix$cmdline\"" >&2
-        return 0
-    fi
-    # </dev/null: without it, cmd.exe consumes the stdin of the matrix loop
-    cmd.exe /c "cd /d $WIN_PATH&& $common&& $env_prefix$cmdline" 2>&1 </dev/null
+    rm -f "$STOP_FILE"
 }
 
 mode_env() { # $1 mode, $2 runner
     case "$1" in
-    cpu) [ "$2" = stt-app ] && printf 'set STT_NO_VULKAN=1&& ' ;;
+    cpu) [ "$2" = stt-app ] && printf 'STT_NO_VULKAN=1 ' ;;
     registry) : ;;
-    compile) printf 'set VULKAN_EP_COMPILE=1&& ' ;;
+    compile) printf 'VULKAN_EP_COMPILE=1 ' ;;
     esac
 }
 
-# Runs a native Linux command from the repo root. The `standalone` mode's whole
-# reason to exist: no cross-build, no rsync to /mnt/c, no cmd.exe, no Windows
-# host held hostage — the cycle is seconds. The Vulkan device here is whatever
-# WSL exposes (usually lavapipe), so `parse_run.py` marks these runs
-# `perf_valid: false` on its own and only their **parity** verdict is a gate.
+# Runs a command from the repo root, with the mode's environment. Every job goes
+# through here: the suite drives the release binaries of this same tree, on this
+# same machine, so a run needs no toolchain beyond the one that built them.
 native_exec() { # $1 `VAR=v` env prefix (space separated), $2 command line
     local env_prefix="$1" cmdline="$2"
-    local common="RUST_LOG=info ORT_DYLIB_PATH=$ROOT/third_party/onnxruntime/linux-x64/lib/libonnxruntime.so VULKAN_EP_PATH=$ROOT/target/release/libonnxruntime_ep_vulkan.so"
+    local common="RUST_LOG=info ORT_DYLIB_PATH=$ORT_LIB VULKAN_EP_PATH=$BIN_DIR/libonnxruntime_ep_vulkan.so"
     if [ "$DRY" = 1 ]; then
         echo "+ (cd $ROOT && env $common $env_prefix$cmdline)" >&2
         return 0
@@ -357,10 +279,10 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
     # runner command line
     mapfile -t extra < <(echo "$args" | jq -r '.[]')
     if [ "$mode" = standalone ]; then
-        # native paths, native binary, and `--standalone` adds the third backend:
-        # the same generated tensors go through ORT, the EP and the facade in one
-        # process. Two separate commands would compare two different inputs.
-        cmdline="./target/release/model-runner $model_path --iters $iters --standalone"
+        # `--standalone` adds the third backend: the same generated tensors go
+        # through ORT, the EP and the facade in one process. Two separate
+        # commands would compare two different inputs.
+        cmdline="$BIN_DIR/model-runner $model_path --iters $iters --standalone"
         for a in ${extra+"${extra[@]}"}; do cmdline+=" $a"; done
         [ -n "$reference" ] && cmdline+=" --reference $reference"
         native_exec "VULKAN_EP_COMPILE=1 " "$cmdline" >"$out_dir/$mode.stdout.log"
@@ -386,17 +308,19 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
         continue
     fi
     if [ "$runner" = stt-app ]; then
-        cmdline="set STT_BENCH=$iters&& stt-app.exe"
-        for a in ${extra+"${extra[@]}"}; do cmdline+=" $(win_rel "$a")"; done
-        cmdline+=" $(win_rel "$model_path")"
+        # stt-app takes the wav *before* the model directory and its iteration
+        # count from the environment, so the two runners differ in more than a name
+        cmdline="STT_BENCH=$iters $BIN_DIR/stt-app"
+        for a in ${extra+"${extra[@]}"}; do cmdline+=" $a"; done
+        cmdline+=" $model_path"
         proc=stt-app
     else
-        cmdline="model-runner.exe $(win_rel "$model_path") --iters $iters"
+        cmdline="$BIN_DIR/model-runner $model_path --iters $iters"
         for a in ${extra+"${extra[@]}"}; do cmdline+=" $a"; done
         # official reference data: inputs and outputs expected by the model
         # authors, not generated by us
         if [ -n "$reference" ]; then
-            cmdline+=" --reference $(win_rel "$reference")"
+            cmdline+=" --reference $reference"
         fi
         proc=model-runner
     fi
@@ -404,18 +328,15 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
 
     # "clean" pass: wall times are measured without the profiler, which inserts
     # a timestamp after every dispatch
-    metrics_tmp="$WIN_DIR/.testsuite-metrics.csv"
-    start_sampler "$proc" "$metrics_tmp"
-    win_exec "$env_prefix" "$cmdline" >"$out_dir/$mode.stdout.log"
-    code=${PIPESTATUS[0]}
+    start_sampler "$proc" "$out_dir/$mode.metrics.csv"
+    native_exec "$env_prefix" "$cmdline" >"$out_dir/$mode.stdout.log"
+    code=$?
     stop_sampler
-    # copy and don't move: on /mnt/c an still-open Windows handle makes mv fail
-    [ -f "$metrics_tmp" ] && cp "$metrics_tmp" "$out_dir/$mode.metrics.csv" && rm -f "$metrics_tmp"
 
     # pass with profiler: Pareto, flushes, MB transferred
     stats_arg=()
     if [ "$stats" = 1 ]; then
-        win_exec "${env_prefix}set VULKAN_EP_STATS=1&& " "$cmdline" \
+        native_exec "${env_prefix}VULKAN_EP_STATS=1 " "$cmdline" \
             >"$out_dir/$mode.stats.log"
         stats_arg=(--stats-log "$out_dir/$mode.stats.log")
     fi

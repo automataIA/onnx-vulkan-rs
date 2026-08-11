@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 onnx-vulkan-core = { path = "../onnx-vulkan-core" }
+onnx-vulkan-tune = { path = "../onnx-vulkan-tune" }
 ort-ep-sys = { path = "../ort-ep-sys" }
 vk-compute = { path = "../vk-compute" }
 anyhow = { workspace = true }

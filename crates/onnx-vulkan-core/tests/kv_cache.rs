@@ -510,6 +510,13 @@ fn a_planned_step_agrees_with_the_step_the_interpreter_would_have_run() {
             let mut plan = StepPlan::build(executor.graph(), &traces[1..], 1)
                 .expect("the three captured steps agree on a plan");
             plan.hold_pool(context);
+            let stats = plan.stats();
+            assert!(stats.dispatches > 0);
+            assert!(!stats.temporary_buffer_sizes.is_empty());
+            assert_eq!(
+                stats.temporary_bytes,
+                stats.temporary_buffer_sizes.iter().sum()
+            );
             held = Some((outputs, plan));
         } else {
             outputs.finish();

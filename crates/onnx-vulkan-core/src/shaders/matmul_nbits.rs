@@ -36,6 +36,271 @@ pub const PUSH_BYTES: u32 = 32;
 /// nearly half of them with nothing to do on the second pass.
 pub const WG: u32 = 64;
 
+/// Load/dequantization form explored by the `MatMulNBits` tuner.
+///
+/// The numeric codes preserve the existing example and Python protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum CandidateLoad {
+    /// One `vec4<u32>` block with a single chained accumulator.
+    Block = 0,
+    /// One `u32` word per loop iteration.
+    Word = 1,
+    /// One `vec4<u32>` block with four independent accumulators.
+    BlockFourAccumulators = 2,
+    /// One `vec4<u32>` load with per-word address calculations.
+    Quad = 4,
+}
+
+impl CandidateLoad {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Word => "vec1",
+            Self::BlockFourAccumulators => "block4",
+            Self::Quad => "vec4",
+        }
+    }
+
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Block),
+            1 => Some(Self::Word),
+            2 => Some(Self::BlockFourAccumulators),
+            4 => Some(Self::Quad),
+            _ => None,
+        }
+    }
+
+    const fn units_per_column(self, words: usize) -> usize {
+        match self {
+            Self::Word => words,
+            Self::Block | Self::BlockFourAccumulators | Self::Quad => words / 4,
+        }
+    }
+}
+
+/// Reduction implementation explored by the tuner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CandidateReduction {
+    WorkgroupTree,
+    SubgroupShuffle,
+}
+
+impl CandidateReduction {
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::WorkgroupTree => 0,
+            Self::SubgroupShuffle => 1,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WorkgroupTree => "tree",
+            Self::SubgroupShuffle => "sub",
+        }
+    }
+
+    pub const fn uses_subgroup(self) -> bool {
+        matches!(self, Self::SubgroupShuffle)
+    }
+}
+
+/// Fully specified candidate metadata shared by enumeration and orchestration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CandidateConfig {
+    pub lanes: u32,
+    pub load: CandidateLoad,
+    pub workgroup_size: u32,
+    pub reduction: CandidateReduction,
+}
+
+impl CandidateConfig {
+    pub const fn new(
+        lanes: u32,
+        load: CandidateLoad,
+        workgroup_size: u32,
+        reduction: CandidateReduction,
+    ) -> Self {
+        Self {
+            lanes,
+            load,
+            workgroup_size,
+            reduction,
+        }
+    }
+
+    /// Static geometry/capability filter used before shader compilation.
+    pub fn is_viable(self, words_per_column: usize, subgroup_size: u32) -> bool {
+        if self.lanes == 0 || self.workgroup_size == 0 {
+            return false;
+        }
+        let shape_ok = self.lanes as usize <= self.load.units_per_column(words_per_column)
+            && self.lanes <= self.workgroup_size
+            && self.workgroup_size.is_multiple_of(self.lanes);
+        let subgroup_ok = !self.reduction.uses_subgroup()
+            || (subgroup_size > 0
+                && self.lanes > 1
+                && self.lanes <= subgroup_size
+                && self.workgroup_size.is_multiple_of(subgroup_size));
+        shape_ok && subgroup_ok
+    }
+}
+
+pub const CANDIDATE_LANES: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
+pub const CANDIDATE_LOADS: &[CandidateLoad] = &[
+    CandidateLoad::Block,
+    CandidateLoad::Word,
+    CandidateLoad::BlockFourAccumulators,
+    CandidateLoad::Quad,
+];
+pub const CANDIDATE_WORKGROUP_SIZES: &[u32] = &[64, 128, 256, 512, 1024];
+pub const CANDIDATE_REDUCTIONS: &[CandidateReduction] = &[
+    CandidateReduction::WorkgroupTree,
+    CandidateReduction::SubgroupShuffle,
+];
+
+/// The original 18 configurations printed by the example in its default mode.
+pub const DEFAULT_CANDIDATES: &[CandidateConfig] = &[
+    CandidateConfig::new(
+        256,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        128,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        64,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        32,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        16,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        8,
+        CandidateLoad::Word,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        64,
+        CandidateLoad::Quad,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        32,
+        CandidateLoad::Quad,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        16,
+        CandidateLoad::Quad,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        8,
+        CandidateLoad::Quad,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        64,
+        CandidateLoad::Block,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        32,
+        CandidateLoad::Block,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        16,
+        CandidateLoad::Block,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        8,
+        CandidateLoad::Block,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        64,
+        CandidateLoad::BlockFourAccumulators,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        32,
+        CandidateLoad::BlockFourAccumulators,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        16,
+        CandidateLoad::BlockFourAccumulators,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+    CandidateConfig::new(
+        8,
+        CandidateLoad::BlockFourAccumulators,
+        256,
+        CandidateReduction::WorkgroupTree,
+    ),
+];
+
+/// Complete Cartesian search space, excluding configurations where lanes
+/// already exceed the workgroup. Geometry-specific filtering remains in
+/// [`CandidateConfig::is_viable`].
+pub fn candidate_space() -> Vec<CandidateConfig> {
+    let mut candidates = Vec::new();
+    for &workgroup_size in CANDIDATE_WORKGROUP_SIZES {
+        for &lanes in CANDIDATE_LANES {
+            for &load in CANDIDATE_LOADS {
+                for &reduction in CANDIDATE_REDUCTIONS {
+                    if lanes <= workgroup_size {
+                        candidates.push(CandidateConfig::new(
+                            lanes,
+                            load,
+                            workgroup_size,
+                            reduction,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    candidates
+}
+
 /// `out[m][n] = Σ_k a[m][k] · (nibble(n,k) − zp) · scale`.
 ///
 /// The `K` loop walks `u32` words of the weight column: thread `t` takes word
@@ -108,107 +373,69 @@ fn main(
 }
 "#;
 
-/// Columns wide enough for the decode kernel to be worth its extra pipeline.
+/// Columns wide enough for [`wide_source`] to be worth its extra pipeline.
 ///
 /// Below this the op runs at the dispatch floor — 0.010–0.014 ms for the whole
 /// node, 60 GB/s of a 0.6 MB weight — and no variant measured on the 4070 moves
 /// it by more than the noise, while the wide-column kernel measured **0.91×** at
-/// `K = 6912, N = 1152`. Wide columns are the opposite: `K = 1152, N = 6912`
-/// gains 1.37× and `K = 2048, N = 11008` 1.28×.
+/// `K = 6912, N = 1152`. The sweep over all 11 census geometries agrees and
+/// sharpens it: at `N ≤ 2048` the best configuration is 1.07×–1.17× over the
+/// shipped kernel and it is a *different* one on every geometry, which is a
+/// threshold, not a kernel. Above it the same configuration wins everywhere and
+/// wins by 1.32×–1.43×.
 ///
 /// Calibrated on an RTX 4070 with `example matmulnbits`; on another device it is
 /// an unmeasured constant.
-pub const DECODE_MIN_N: usize = 4096;
+pub const WIDE_MIN_N: usize = 4096;
 
-/// Columns above which the unembedding form wins instead (`N = 151936` and
-/// `262144` in the matrix): 1.46× weighted, 1.60× on gemma3's, at 291 GB/s of
-/// the card's 504.
-pub const HEAD_MIN_N: usize = 65536;
-
-/// Threads sharing one output column in [`decode_source`]. 16 of 256, so a
-/// workgroup covers 16 columns.
-pub const DECODE_LANES: u32 = 16;
-
-/// Threads sharing one output column in [`head_source`].
-pub const HEAD_LANES: u32 = 8;
-
-/// The decode kernel: 256 threads, `256 / lanes` columns per workgroup, `lanes`
-/// threads walking one column's words.
+/// Threads sharing one output column in [`wide_source`]. 4 of 256, so a
+/// workgroup covers 64 columns.
 ///
-/// Same arithmetic as [`MATMUL_NBITS`] and same push constants; what changes is
-/// the shape. The shipped kernel gives a whole 64-thread workgroup to one output
-/// element, so at `K = 1152` each thread loads 2.25 words and then pays a 6-deep
-/// tree reduction — the reduction, not the loading, is what it spends its time
-/// on. Sharing a workgroup between 16 columns cuts the reduction to 4 levels and
-/// quadruples the work each thread does before it.
+/// **4, not 8 and not 16, and the difference is not small.** This kernel used to
+/// be two — a word-loading form at 16 lanes for `4096 ≤ N < 65536` and this one
+/// at 8 lanes above it — and both were picked from a variant list whose lane
+/// column started at 8. Sweeping the same list down to 1 (`example matmulnbits
+/// --sweep`, all 11 census geometries) makes this form at 4 lanes the best
+/// configuration at **every** `N ≥ 4096`, which is why the word form is gone:
 ///
-/// `lane` varies fastest inside a column on purpose: `B` is
-/// `[N, n_blocks, blob]`, i.e. K-contiguous *within* a column, so the coalesced
-/// mapping is consecutive threads on consecutive words of one column. This is
-/// transposed with respect to `shaders::matmul_fp32`'s `gemv_split`, where `B`
-/// was `[K, N]` — and the transposition is measured, not assumed: the other
-/// mapping reads 576 bytes apart per lane.
-pub fn decode_source(lanes: u32) -> String {
-    let cols = 256 / lanes;
-    format!(
-        r#"
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> quant: array<u32>;
-@group(0) @binding(2) var<storage, read> scales: array<f32>;
-@group(0) @binding(3) var<storage, read> zero_points: array<u32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+/// | geometry | was | at 4 lanes | |
+/// |---|---|---|---|
+/// | gemma3 `ffn-in` `N=6912` | 184 GB/s | 243 | 1.32× |
+/// | qwen `ffn-in` `N=11008` | 270 | 378 | 1.42× |
+/// | gemma3 `lm_head` `N=262144` | 291 | 401 | 1.43× |
+/// | qwen `lm_head` `N=151936` | 275–292 | 281–289 | flat |
+///
+/// It is the mechanism this file already documents — a lane needs *enough blocks
+/// to iterate over* — read one step further down than anyone had measured. The
+/// ceiling that `cronologia.md` 2026-07-30 called exhausted at 291 GB/s (58% of
+/// the card's 504) is **413 GB/s (82%)** at 4 lanes.
+///
+/// The workgroup size stays 256 deliberately: it is worth 3–17% more on three
+/// geometries and its optimum walks 64 → 512 → 1024 with no predicate that fits
+/// (`docs/autotuning.md` §2). One calibrated constant, not two.
+pub const WIDE_LANES: u32 = 4;
 
-struct Push {{
-    k: u32, n: u32, n_blocks: u32, blob_words: u32,
-    block_size: u32, zp_row_bytes: u32, gx: u32, pad: u32,
-}}
-var<immediate> pc: Push;
-
-const LANES = {lanes}u;
-const COLS = {cols}u;
-var<workgroup> red: array<f32, 256>;
-
-@compute @workgroup_size(256)
-fn main(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_index) tid: u32,
-) {{
-    let col = (wid.y * pc.gx + wid.x) * COLS + tid / LANES;
-    let lane = tid % LANES;
-    let row = wid.z;
-    var acc = 0.0;
-    if (col < pc.n) {{
-        let words = pc.n_blocks * pc.blob_words;
-        let q_base = col * words;
-        let a_base = row * pc.k;
-        for (var w = lane; w < words; w = w + LANES) {{
-            let block = w / pc.blob_words;
-            let k0 = block * pc.block_size + (w % pc.blob_words) * 8u;
-            let word = quant[q_base + w];
-            let zoff = col * pc.zp_row_bytes + block / 2u;
-            let z = f32((zero_points[zoff / 4u] >> (8u * (zoff % 4u) + 4u * (block % 2u))) & 15u);
-            var part = 0.0;
-            for (var i = 0u; i < 8u; i = i + 1u) {{
-                let k = k0 + i;
-                if (k >= pc.k) {{ break; }}
-                part = fma(f32((word >> (4u * i)) & 15u) - z, a[a_base + k], part);
-            }}
-            acc = fma(part, scales[col * pc.n_blocks + block], acc);
-        }}
-    }}
-    red[tid] = acc;
-    workgroupBarrier();
-    for (var s = LANES / 2u; s > 0u; s = s / 2u) {{
-        if (lane < s) {{ red[tid] = red[tid] + red[tid + s]; }}
-        workgroupBarrier();
-    }}
-    if (lane == 0u && col < pc.n) {{ out[row * pc.n + col] = red[tid]; }}
-}}
-"#
-    )
+/// Production kernel selected for a concrete `MatMulNBits` invocation.
+///
+/// The wide-column tactic is calibrated for one-row decoder work only. Keeping
+/// this decision beside the shader constants lets the interpreter and the
+/// autotuning audit exercise exactly the same routing predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Row,
+    Wide { lanes: u32 },
 }
 
-/// The unembedding kernel: one **block** per lane iteration, read as a
+/// Select the currently shipped route without compiling or initializing Vulkan.
+pub const fn route(rows: usize, n: usize) -> Route {
+    if rows == 1 && n >= WIDE_MIN_N {
+        Route::Wide { lanes: WIDE_LANES }
+    } else {
+        Route::Row
+    }
+}
+
+/// The wide-column kernel: one **block** per lane iteration, read as a
 /// `vec4<u32>`, with four independent accumulators.
 ///
 /// A block is `blob_words = 4` words = 16 bytes = 32 weights, and it is the unit
@@ -225,10 +452,10 @@ fn main(
 /// that is 4–8 iterations, and at 32 lanes it is one, with nothing to hide the
 /// dependency chain behind.
 ///
-/// Only claimed above [`HEAD_MIN_N`], where the column count keeps the grid full
-/// at 8 lanes: `N / 32` is 8192 workgroups on gemma3's head and 36 on a 1152-wide
-/// projection, which is why the same kernel loses badly there.
-pub fn head_source(lanes: u32) -> String {
+/// Only claimed above [`WIDE_MIN_N`], where the column count keeps the grid
+/// full: at 4 lanes `N / 64` is 4096 workgroups on gemma3's head and 18 on a
+/// 1152-wide projection, which is why the same kernel loses badly there.
+pub fn wide_source(lanes: u32) -> String {
     let cols = 256 / lanes;
     format!(
         r#"
@@ -291,11 +518,118 @@ fn main(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn source_compiles() {
         vk_compute::compile_wgsl(MATMUL_NBITS).expect("shader MatMulNBits valid");
-        vk_compute::compile_wgsl(&decode_source(DECODE_LANES)).expect("decode variant valid");
-        vk_compute::compile_wgsl(&head_source(HEAD_LANES)).expect("head variant valid");
+        vk_compute::compile_wgsl(&wide_source(WIDE_LANES)).expect("wide variant valid");
+    }
+
+    #[test]
+    fn production_route_is_decode_only_and_inclusive_at_threshold() {
+        assert_eq!(route(1, WIDE_MIN_N - 1), Route::Row);
+        assert_eq!(route(1, WIDE_MIN_N), Route::Wide { lanes: WIDE_LANES });
+        assert_eq!(route(2, WIDE_MIN_N), Route::Row);
+        assert_eq!(route(0, WIDE_MIN_N), Route::Row);
+    }
+
+    #[test]
+    fn candidate_space_is_complete_and_unique() {
+        let candidates = candidate_space();
+        let unique = candidates.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(candidates.len(), 336);
+        assert_eq!(unique.len(), candidates.len());
+        assert_eq!(
+            candidates.first(),
+            Some(&CandidateConfig::new(
+                1,
+                CandidateLoad::Block,
+                64,
+                CandidateReduction::WorkgroupTree,
+            ))
+        );
+        assert_eq!(
+            candidates.last(),
+            Some(&CandidateConfig::new(
+                256,
+                CandidateLoad::Quad,
+                1024,
+                CandidateReduction::SubgroupShuffle,
+            ))
+        );
+    }
+
+    #[test]
+    fn default_candidates_preserve_the_legacy_order() {
+        let legacy = DEFAULT_CANDIDATES
+            .iter()
+            .map(|candidate| (candidate.lanes, candidate.load.code()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            legacy,
+            [
+                (256, 1),
+                (128, 1),
+                (64, 1),
+                (32, 1),
+                (16, 1),
+                (8, 1),
+                (64, 4),
+                (32, 4),
+                (16, 4),
+                (8, 4),
+                (64, 0),
+                (32, 0),
+                (16, 0),
+                (8, 0),
+                (64, 2),
+                (32, 2),
+                (16, 2),
+                (8, 2),
+            ]
+        );
+        assert!(DEFAULT_CANDIDATES.iter().all(|candidate| {
+            candidate.workgroup_size == 256
+                && candidate.reduction == CandidateReduction::WorkgroupTree
+        }));
+    }
+
+    #[test]
+    fn viability_covers_load_and_subgroup_constraints() {
+        let config = |lanes, load, reduction| CandidateConfig::new(lanes, load, 256, reduction);
+
+        assert!(
+            config(64, CandidateLoad::Word, CandidateReduction::WorkgroupTree).is_viable(144, 32)
+        );
+        assert!(
+            !config(64, CandidateLoad::Block, CandidateReduction::WorkgroupTree).is_viable(144, 32)
+        );
+        assert!(
+            config(
+                32,
+                CandidateLoad::Block,
+                CandidateReduction::SubgroupShuffle
+            )
+            .is_viable(144, 32)
+        );
+        assert!(
+            !config(64, CandidateLoad::Word, CandidateReduction::SubgroupShuffle)
+                .is_viable(144, 32)
+        );
+        assert!(
+            !config(1, CandidateLoad::Word, CandidateReduction::SubgroupShuffle).is_viable(144, 32)
+        );
+        assert!(
+            !CandidateConfig::new(
+                0,
+                CandidateLoad::Word,
+                256,
+                CandidateReduction::WorkgroupTree,
+            )
+            .is_viable(144, 32)
+        );
     }
 }

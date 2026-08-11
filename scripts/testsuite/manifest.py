@@ -5,10 +5,9 @@
 # ///
 """Reads `tests/models.toml` and produces the execution matrix.
 
-Three subcommands, all meant to be consumed by `scripts/testsuite.sh`:
+Two subcommands, both meant to be consumed by `scripts/testsuite.sh`:
 
     manifest.py jobs  [-m NAME]... [-M MODE]... [--iters N]   → one job per line
-    manifest.py stage [-m NAME]...                            → paths to propagate
     manifest.py fetch [-m NAME]...                            → download what is missing
 
 The fields are fixed (see `JOB_FIELDS`) and separated by US (`\\x1f`): bash reads
@@ -27,9 +26,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "tests" / "models.toml"
-# `standalone` is the odd one: it runs the **Linux-native** binary directly,
-# with no cross-build, no staging and no cmd.exe, which is what makes its cycle
-# time seconds instead of minutes (`plan.md` §9.5 P1).
+# `standalone` is the odd one: it adds a third backend to the comparison — the
+# `onnx-vulkan` facade, driven in the same process as ORT and the EP, so all
+# three see the same generated tensors (`plan.md` §9.5 P1).
 MODES = ("cpu", "registry", "compile", "standalone")
 SEP = "\x1f"  # field separator: non-whitespace, so empty fields are preserved
 
@@ -124,6 +123,7 @@ def fetch(name: str, spec: dict) -> None:
     url, member = spec["url"], spec["member"]
     print(f"== {name}: downloading {url}", file=sys.stderr)
 
+    import shutil
     import tarfile
     import tempfile
     import urllib.request
@@ -144,13 +144,16 @@ def fetch(name: str, spec: dict) -> None:
                 return
             tar.extractall(Path(tmp), members=wanted, filter="data")
         target.parent.mkdir(parents=True, exist_ok=True)
-        (Path(tmp) / member).rename(target)
+        # `shutil.move` and not `Path.rename`: the temporary directory is on
+        # whatever `$TMPDIR` points at, which is not the repo's filesystem, and
+        # `rename(2)` cannot cross a mount point
+        shutil.move(str(Path(tmp) / member), str(target))
     print(f"   → {spec['dir']}", file=sys.stderr)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=("jobs", "stage", "fields", "fetch"))
+    ap.add_argument("command", choices=("jobs", "fields", "fetch"))
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("-m", "--model", action="append", default=[])
     ap.add_argument("-M", "--mode", action="append", default=[], choices=MODES)
@@ -167,22 +170,6 @@ def main() -> int:
         for model in models:
             if "skip" not in model and "fetch" in model:
                 fetch(model["name"], model["fetch"])
-        return 0
-
-    if args.command == "stage":
-        for model in models:
-            path = model.get("path")
-            if not path or "skip" in model:
-                continue
-            print(path)
-            for extra in model.get("args", []):
-                # arguments that are files (e.g. the stt-app wav) must be staged
-                if (ROOT / extra).exists():
-                    print(extra)
-            # the reference data is needed where the model runs, not here
-            reference = model.get("reference")
-            if reference and (ROOT / reference).exists():
-                print(reference)
         return 0
 
     modes = args.mode or ["cpu", "compile"]

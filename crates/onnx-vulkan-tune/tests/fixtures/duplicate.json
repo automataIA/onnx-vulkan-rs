@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "created_by": {"onnx_vulkan_version":"0.0.1","git_commit":"abc","dirty":false,"command_line":["fixture"],"created_unix_seconds":1},
+  "device": {"name":"GPU","vendor_id":1,"device_id":2,"driver_version":3,"api_version":4,"pipeline_cache_uuid":"00000000000000000000000000000000","subgroup_size":32,"features":[]},
+  "profile": {"model_digest":"1111111111111111111111111111111111111111111111111111111111111111","symbol_values":{}},
+  "measurement_policy": {"warmup_iterations":2,"measured_iterations":20,"statistic":"median","clock":"vulkan_timestamp"},
+  "records": [
+    {"workload":{"domain":"","op":"Conv","inputs":[],"outputs":[],"attributes_digest":"2222222222222222222222222222222222222222222222222222222222222222"},"implementation_digest":"3333333333333333333333333333333333333333333333333333333333333333","tactic":{"family":"blocked","id":"tile64","parameters":{}},"measurement":{"samples":20,"median_gpu_ns":110,"min_gpu_ns":100,"max_gpu_ns":120},"correctness":{"kind":"max_abs_rel","passed":true}},
+    {"workload":{"domain":"","op":"Conv","inputs":[],"outputs":[],"attributes_digest":"2222222222222222222222222222222222222222222222222222222222222222"},"implementation_digest":"3333333333333333333333333333333333333333333333333333333333333333","tactic":{"family":"blocked","id":"tile128","parameters":{}},"measurement":{"samples":20,"median_gpu_ns":90,"min_gpu_ns":80,"max_gpu_ns":100},"correctness":{"kind":"max_abs_rel","passed":true}}
+  ]
+}

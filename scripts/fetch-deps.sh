@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Downloads ONNX Runtime 1.27.1 (linux-x64 + win-x64) and the Parakeet TDT 0.6B v3 int8 model.
+# Downloads ONNX Runtime 1.27.1 (linux-x64) and the Parakeet TDT 0.6B v3 int8 model.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,12 +27,6 @@ fetch "$ORT_GH/onnxruntime-linux-x64-$ORT_VERSION.tgz" "$ORT_DIR/onnxruntime-lin
 if [ ! -d "$ORT_DIR/linux-x64" ]; then
     tar -xzf "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION.tgz" -C "$ORT_DIR"
     mv "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION" "$ORT_DIR/linux-x64"
-fi
-
-fetch "$ORT_GH/onnxruntime-win-x64-$ORT_VERSION.zip" "$ORT_DIR/onnxruntime-win-x64-$ORT_VERSION.zip"
-if [ ! -d "$ORT_DIR/win-x64" ]; then
-    unzip -q "$ORT_DIR/onnxruntime-win-x64-$ORT_VERSION.zip" -d "$ORT_DIR"
-    mv "$ORT_DIR/onnxruntime-win-x64-$ORT_VERSION" "$ORT_DIR/win-x64"
 fi
 
 # --- Parakeet TDT 0.6B v3 model (int8 ONNX) ---

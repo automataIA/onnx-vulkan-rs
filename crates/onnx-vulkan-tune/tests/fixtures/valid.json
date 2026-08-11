@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "created_by": {
+    "onnx_vulkan_version": "0.0.1",
+    "git_commit": "0123456789abcdef",
+    "dirty": false,
+    "command_line": ["onnx-vulkan-tune", "build"],
+    "created_unix_seconds": 1785840000
+  },
+  "device": {
+    "name": "Fixture GPU",
+    "vendor_id": 4318,
+    "device_id": 10114,
+    "driver_version": 59584,
+    "api_version": 4206592,
+    "pipeline_cache_uuid": "00112233445566778899aabbccddeeff",
+    "subgroup_size": 32,
+    "features": ["integer_dot"]
+  },
+  "profile": {
+    "model_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "symbol_values": {"batch": 1}
+  },
+  "measurement_policy": {
+    "warmup_iterations": 2,
+    "measured_iterations": 20,
+    "statistic": "median",
+    "clock": "vulkan_timestamp"
+  },
+  "records": [
+    {
+      "workload": {
+        "domain": "",
+        "op": "Conv",
+        "inputs": [{"dtype": 1, "dims": [1, 3, 224, 224]}],
+        "outputs": [{"dtype": 1, "dims": [1, 64, 112, 112]}],
+        "attributes_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "implementation_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "tactic": {
+        "family": "blocked",
+        "id": "tile64",
+        "parameters": {"k_step": 16, "tile": 64}
+      },
+      "measurement": {
+        "samples": 20,
+        "median_gpu_ns": 110000,
+        "min_gpu_ns": 100000,
+        "max_gpu_ns": 120000,
+        "diagnostic_samples_gpu_ns": [100000, 110000, 120000]
+      },
+      "correctness": {"kind": "max_abs_rel", "passed": true}
+    }
+  ]
+}

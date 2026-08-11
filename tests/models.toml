@@ -71,8 +71,7 @@ size_mb = 700
 # the `standalone` mode: parity needs one process feeding the same tensors to
 # both paths, which `stt-app` cannot do — and this is the exact model whose
 # "standalone vs EP" divergence Phase 1.5 was opened for. `default = false`
-# because the `parakeet` entry above already covers the model end to end on
-# Windows, and 652 MB do not need staging twice.
+# because the `parakeet` entry above already covers the model end to end.
 #
 #   scripts/testsuite.sh -M standalone -m parakeet-encoder
 [[model]]

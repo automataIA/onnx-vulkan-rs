@@ -11,7 +11,6 @@
 //! transcription is verifiable as coverage grows. As coverage grows,
 //! fused blocks merge and boundaries drop toward ~1.
 
-use crate::KernelCache;
 use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
 use crate::shaders::attention::{
     OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
@@ -24,12 +23,14 @@ use crate::shaders::attention::{
     WG as ATTN_WG,
 };
 use crate::shaders::conv::{
-    BINDINGS as CONV_F32_BINDINGS, BLOCKED_TILE_SIZE as CONV_BLOCKED_TILE_SIZE,
-    PUSH_BYTES as CONV_F32_PUSH_BYTES, SPLIT_REDUCE as CONV_SPLIT_REDUCE,
-    SPLIT_REDUCE_BINDINGS as CONV_SPLIT_REDUCE_BINDINGS, TILE_SIZE as CONV_TILE_SIZE,
+    BINDINGS as CONV_F32_BINDINGS, PUSH_BYTES as CONV_F32_PUSH_BYTES,
+    SPLIT_REDUCE as CONV_SPLIT_REDUCE, SPLIT_REDUCE_BINDINGS as CONV_SPLIT_REDUCE_BINDINGS,
+    Tactic as ConvTactic, TacticGeometry as ConvTacticGeometry, TacticLimits as ConvTacticLimits,
     blocked as conv_blocked_source, blocked_splitk as conv_blocked_splitk_source,
-    direct as conv_direct_source, implicit_gemm as conv_gemm_source,
+    direct as conv_direct_source, generated_source as conv_generated_source,
+    implementation_fingerprint as conv_fingerprint, implicit_gemm as conv_gemm_source,
     prefer_blocked as conv_prefer_blocked, split_k as conv_split_k,
+    tuned_tactic as conv_tuned_tactic,
 };
 use crate::shaders::conv_integer::{
     BINDINGS as CONV_INTEGER_BINDINGS, BLOCKED_TILE_SIZE as CONV_I_BLOCKED_TILE_SIZE,
@@ -81,10 +82,8 @@ use crate::shaders::matmul_integer::{
     coop_applies as mmi_coop_applies, coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
 use crate::shaders::matmul_nbits::{
-    BINDINGS as MMNB_BINDINGS, DECODE_LANES as MMNB_DECODE_LANES,
-    DECODE_MIN_N as MMNB_DECODE_MIN_N, HEAD_LANES as MMNB_HEAD_LANES,
-    HEAD_MIN_N as MMNB_HEAD_MIN_N, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
-    decode_source as mmnb_decode_source, head_source as mmnb_head_source,
+    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
+    Route as MmnbRoute, route as mmnb_route, wide_source as mmnb_wide_source,
 };
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
@@ -126,6 +125,7 @@ use crate::{
     AttrValue, DeviceBuffer as BufRef, DeviceTensor as DevTensor, ExecutionEnv, GraphIr, NodeIr,
     Tensor, broadcast, device_storage_bytes, elem_size,
 };
+use crate::{KernelCache, PipelineKey};
 use anyhow::{Context as _, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use vk_compute::{ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
@@ -644,11 +644,12 @@ pub fn unsupported_quantization(
 /// Runs a closure with the pipeline (cached in the session) for an op key.
 fn with_pipeline<R>(
     cache: &KernelCache<'_>,
-    key: &'static str,
+    key: impl Into<PipelineKey>,
     build: impl FnOnce() -> Result<ComputePipeline>,
     run: impl FnOnce(&ComputePipeline) -> Result<R>,
 ) -> Result<R> {
-    vk_compute::stats::set_op(key); // Pareto attribution by dispatch type
+    let key = key.into();
+    vk_compute::stats::set_op(key.operation()); // Pareto attribution by dispatch type
     let pipeline = cache.pipeline(key, build)?;
     // SAFETY: the cache never removes entries and keeps them in `Box`: the
     // address stays valid for the lifetime of the cache, which outlives execution.
@@ -2529,46 +2530,113 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
     if g.total > 0 {
         let mut push = g.push_common();
         push.extend_from_slice(&u32::from(bias_name.is_some()).to_le_bytes());
-        // group == 1 is the only case that is really a single GEMM: grouped and
-        // depthwise stay on the direct conv (see `shaders::conv`)
-        let gemm = g.group == 1;
         let pixels = (g.h_out * g.w_out) as u32;
         let kdepth = (g.gsi * g.kh * g.kw) as usize;
-        // Splitting K buys back the grid the 64×64 tile spends, and neither
-        // transformation pays alone; see `conv::split_k`.
-        let split = if gemm {
-            conv_split_k(pixels as usize, g.c_out as usize, kdepth)
-        } else {
-            None
+        let committed =
+            conv_tuned_tactic(g.group as usize, pixels as usize, g.c_out as usize, kdepth);
+        let tensor_signature = |name: &str| -> Result<crate::tuning::TensorSignature> {
+            let dimensions = env
+                .shape_of(name)?
+                .into_iter()
+                .map(|dimension| {
+                    u64::try_from(dimension).map_err(|_| {
+                        anyhow::anyhow!(
+                            "Conv tuning signature has negative dimension {dimension} for '{name}'"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let dtype = crate::ElementType::try_from(env.dtype_of(name)?)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(crate::tuning::TensorSignature { dtype, dimensions })
         };
-        push.extend_from_slice(&split.unwrap_or(1).to_le_bytes());
+        let inputs = node
+            .inputs
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| tensor_signature(name))
+            .collect::<Result<Vec<_>>>()?;
+        let output_dimensions = g
+            .out_shape
+            .iter()
+            .copied()
+            .map(|dimension| {
+                u64::try_from(dimension).map_err(|_| {
+                    anyhow::anyhow!("Conv tuning output has negative dimension {dimension}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tuning_key = crate::tuning::TuningKey {
+            device: env.context().device_fingerprint().into(),
+            workload: crate::tuning::WorkloadSignature {
+                domain: node.domain.clone(),
+                op: node.op.clone(),
+                inputs,
+                outputs: vec![crate::tuning::TensorSignature {
+                    dtype: crate::ElementType::Float32,
+                    dimensions: output_dimensions,
+                }],
+                attributes_digest: crate::tuning::attributes_digest(node),
+            },
+            implementation: conv_fingerprint(),
+        };
+        let geometry = ConvTacticGeometry {
+            batch: g.n as u32,
+            group: g.group as u32,
+            pixels,
+            c_out: g.c_out as u32,
+            kdepth: kdepth as u32,
+            total: g.total as u64,
+        };
+        let limits = ConvTacticLimits::from_vulkan(
+            env.context().compute_limits(),
+            env.context().compute_limits().max_storage_buffer_bytes,
+        );
+        let selected = env
+            .cache()
+            .tuning()
+            .resolve(&tuning_key, |record| {
+                ConvTactic::from_persistent(record.tactic(), record.parameters())
+                    .is_some_and(|candidate| candidate.is_viable(geometry, limits))
+            })
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let tactic = selected
+            .as_ref()
+            .and_then(|record| ConvTactic::from_persistent(record.tactic(), record.parameters()))
+            .unwrap_or(committed);
+        let split = tactic.split();
+        push.extend_from_slice(&split.to_le_bytes());
         let bias: &GpuBuffer = unsafe { &*bias };
-        // Among the shapes left, only those whose grid fills the machine gain
-        // from the 64×64 tile; see `conv::prefer_blocked`.
-        let blocked = gemm && conv_prefer_blocked(pixels as usize, g.c_out as usize);
-        let (key, source, tile) = match (gemm, split.is_some(), blocked) {
-            (true, true, _) => (
-                "Conv_split",
-                conv_blocked_splitk_source(),
-                CONV_BLOCKED_TILE_SIZE,
+        let (operation, source) = match tactic {
+            ConvTactic::Direct { .. } => ("Conv_grouped", conv_direct_source()),
+            ConvTactic::ImplicitGemm { .. } => ("Conv16", conv_gemm_source()),
+            ConvTactic::Blocked {
+                output_tile: 32, ..
+            } => (
+                "Conv32",
+                conv_generated_source(tactic).ok_or_else(|| {
+                    anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}")
+                })?,
             ),
-            (true, false, true) => ("Conv", conv_blocked_source(), CONV_BLOCKED_TILE_SIZE),
-            (true, false, false) => ("Conv16", conv_gemm_source(), CONV_TILE_SIZE),
-            _ => ("Conv_grouped", conv_direct_source(), 0),
+            ConvTactic::Blocked {
+                output_tile: 128, ..
+            } => (
+                "Conv128",
+                conv_generated_source(tactic).ok_or_else(|| {
+                    anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}")
+                })?,
+            ),
+            ConvTactic::Blocked { .. } => ("Conv", conv_blocked_source()),
+            ConvTactic::SplitK { .. } => ("Conv_split", conv_blocked_splitk_source()),
         };
-        let groups = if gemm {
-            [
-                pixels.div_ceil(tile),
-                (g.c_out as u32).div_ceil(tile),
-                (g.n as u32).max(1) * split.unwrap_or(1),
-            ]
-        } else {
-            [(g.total as u32).div_ceil(256), 1, 1]
-        };
+        let key = PipelineKey::tactic(operation, format!("{tactic:?}"));
+        let groups = tactic.dispatch_grid(g.total as u32, pixels, g.c_out as u32, g.n as u32);
         // With a split the kernel writes one partial image per slice and the
         // reduction pass below folds them onto `out`, bias included.
-        let partials = split
-            .map(|s| ctx.create_storage_buffer(device_storage_bytes(FLOAT, s as usize * g.total)?))
+        let partials = (split > 1)
+            .then(|| {
+                ctx.create_storage_buffer(device_storage_bytes(FLOAT, split as usize * g.total)?)
+            })
             .transpose()?;
         with_pipeline(
             env.cache(),
@@ -4433,25 +4501,24 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
     // | N | kernel | measured |
     // |---|---|---|
     // | < 4096 | `MATMUL_NBITS` | the wide-column form is 0.91× here |
-    // | 4096 .. 65536 | `decode_source(16)` | 1.28× .. 1.37× |
-    // | ≥ 65536 (`lm_head`) | `head_source(8)` | 1.46× weighted, 1.60× on gemma3 |
+    // | ≥ 4096 | `wide_source(4)` | 1.32× .. 1.43×, and 413 GB/s of the card's 504 |
     //
     // Below 4096 columns the node runs at the dispatch floor — 0.010 ms, 60 GB/s
     // of a 0.6 MB weight — so there is nothing to win and a wider kernel loses.
+    // Above it there used to be a second fork at `N = 65536` onto a word-loading
+    // kernel at 16 lanes; the full sweep of all 11 census geometries retired it,
+    // because the block form at 4 lanes beats it at every width above the floor
+    // (`docs/autotuning.md` §2).
     // `rows > 1` (prefill) keeps the original kernel: it re-reads the weight per
     // row, which is the honest cost of not having a tiled form yet, and no
     // measurement of prefill exists to justify choosing differently.
-    let variant = match (rows, n) {
-        (1, n) if n >= MMNB_HEAD_MIN_N => Some((MMNB_HEAD_LANES, true)),
-        (1, n) if n >= MMNB_DECODE_MIN_N => Some((MMNB_DECODE_LANES, false)),
-        _ => None,
-    };
+    let variant = mmnb_route(rows, n);
     if rows > 0 && n > 0 {
         // one workgroup per column in the shipped kernel, one per `256 / lanes`
         // columns in the decode variants
         let groups = match variant {
-            Some((lanes, _)) => (n as u32).div_ceil(256 / lanes),
-            None => n as u32,
+            MmnbRoute::Wide { lanes } => (n as u32).div_ceil(256 / lanes),
+            MmnbRoute::Row => n as u32,
         };
         let gx = groups.clamp(1, 32768);
         let mut push = Vec::with_capacity(MMNB_PUSH_BYTES as usize);
@@ -4467,13 +4534,13 @@ fn matmul_nbits(env: &mut Env, node: &NodeIr) -> Result<()> {
         ] {
             push.extend_from_slice(&v.to_le_bytes());
         }
-        // separate Pareto keys: the three forms cost differently and the split is
+        // separate Pareto keys: the two forms cost differently and the split is
         // the thing to watch when a decoder's profile is read
-        let (key, source) = match variant {
-            Some((lanes, true)) => ("MatMulNBits_head", mmnb_head_source(lanes)),
-            Some((lanes, false)) => ("MatMulNBits_gemv", mmnb_decode_source(lanes)),
-            None => ("MatMulNBits", MMNB_MATMUL.to_string()),
+        let (operation, source) = match variant {
+            MmnbRoute::Wide { lanes } => ("MatMulNBits_wide", mmnb_wide_source(lanes)),
+            MmnbRoute::Row => ("MatMulNBits", MMNB_MATMUL.to_string()),
         };
+        let key = PipelineKey::tactic(operation, format!("{variant:?}"));
         with_pipeline(
             env.cache(),
             key,

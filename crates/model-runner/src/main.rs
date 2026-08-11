@@ -19,7 +19,9 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionOutputs};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, Value, ValueType};
+use serde::Serialize;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -89,6 +91,8 @@ struct Args {
     /// different random inputs, which on a dynamically-quantized graph is not a
     /// comparison at all (`plan.md` Phase 1.5).
     standalone: bool,
+    /// Writes per-output dtype-aware CPU-vs-second-backend metrics as JSON.
+    report_json: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -112,6 +116,7 @@ fn parse_args() -> Result<Args> {
         fill: HashMap::new(),
         decode: 0,
         standalone: false,
+        report_json: None,
     };
     while let Some(flag) = args.next() {
         if flag == "--no-mem-pattern" {
@@ -149,6 +154,7 @@ fn parse_args() -> Result<Args> {
             "--dump" => out.dump = value.parse()?,
             "--seed" => out.seed = value.parse()?,
             "--reference" => out.reference = Some(PathBuf::from(value)),
+            "--report-json" => out.report_json = Some(PathBuf::from(value)),
             other => bail!("flag sconosciuto: {other}"),
         }
     }
@@ -303,49 +309,98 @@ fn host_tensor_from(value: &Value) -> Result<onnx_vulkan::HostTensor> {
     })
 }
 
-/// Output values as `f64`, to compare graphs with different dtypes.
-fn extract(value: &Value) -> Result<Vec<f64>> {
+#[derive(Clone, Debug)]
+struct OutputTensor {
+    dtype: &'static str,
+    values: Vec<f64>,
+    exact: Option<Vec<i64>>,
+}
+
+impl Deref for OutputTensor {
+    type Target = [f64];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<'a> IntoIterator for &'a OutputTensor {
+    type Item = &'a f64;
+    type IntoIter = std::slice::Iter<'a, f64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+fn floating(dtype: &'static str, values: impl IntoIterator<Item = f64>) -> OutputTensor {
+    OutputTensor {
+        dtype,
+        values: values.into_iter().collect(),
+        exact: None,
+    }
+}
+
+fn exact(dtype: &'static str, values: impl IntoIterator<Item = i64>) -> OutputTensor {
+    let exact = values.into_iter().collect::<Vec<_>>();
+    OutputTensor {
+        dtype,
+        values: exact.iter().map(|&value| value as f64).collect(),
+        exact: Some(exact),
+    }
+}
+
+/// Output values preserve their dtype and exact integer representation.
+fn extract(value: &Value) -> Result<OutputTensor> {
     let ValueType::Tensor { ty, .. } = value.dtype() else {
         bail!("non-tensor output");
     };
     Ok(match ty {
-        TensorElementType::Float32 => value
-            .try_extract_tensor::<f32>()?
-            .1
-            .iter()
-            .map(|&v| f64::from(v))
-            .collect(),
-        TensorElementType::Int64 => value
-            .try_extract_tensor::<i64>()?
-            .1
-            .iter()
-            .map(|&v| v as f64)
-            .collect(),
-        TensorElementType::Int32 => value
-            .try_extract_tensor::<i32>()?
-            .1
-            .iter()
-            .map(|&v| f64::from(v))
-            .collect(),
-        TensorElementType::Bool => value
-            .try_extract_tensor::<bool>()?
-            .1
-            .iter()
-            .map(|&v| f64::from(u8::from(v)))
-            .collect(),
+        TensorElementType::Float32 => floating(
+            "float32",
+            value
+                .try_extract_tensor::<f32>()?
+                .1
+                .iter()
+                .map(|&v| f64::from(v)),
+        ),
+        TensorElementType::Int64 => exact(
+            "int64",
+            value.try_extract_tensor::<i64>()?.1.iter().copied(),
+        ),
+        TensorElementType::Int32 => exact(
+            "int32",
+            value
+                .try_extract_tensor::<i32>()?
+                .1
+                .iter()
+                .map(|&v| i64::from(v)),
+        ),
+        TensorElementType::Bool => exact(
+            "bool",
+            value
+                .try_extract_tensor::<bool>()?
+                .1
+                .iter()
+                .map(|&v| i64::from(v)),
+        ),
         // Quantized dtypes: most intermediates in int8 graphs.
-        TensorElementType::Uint8 => value
-            .try_extract_tensor::<u8>()?
-            .1
-            .iter()
-            .map(|&v| f64::from(v))
-            .collect(),
-        TensorElementType::Int8 => value
-            .try_extract_tensor::<i8>()?
-            .1
-            .iter()
-            .map(|&v| f64::from(v))
-            .collect(),
+        TensorElementType::Uint8 => exact(
+            "uint8",
+            value
+                .try_extract_tensor::<u8>()?
+                .1
+                .iter()
+                .map(|&v| i64::from(v)),
+        ),
+        TensorElementType::Int8 => exact(
+            "int8",
+            value
+                .try_extract_tensor::<i8>()?
+                .1
+                .iter()
+                .map(|&v| i64::from(v)),
+        ),
         other => bail!("output dtype {other:?} not handled by the runner"),
     })
 }
@@ -357,8 +412,115 @@ fn summarize(outputs: &SessionOutputs) -> Result<Outputs> {
         .collect()
 }
 
-/// Output of a run: value name and contents promoted to `f64`.
-type Outputs = Vec<(String, Vec<f64>)>;
+fn extract_host(value: &onnx_vulkan_core::HostTensor) -> Result<OutputTensor> {
+    use onnx_vulkan_core::host_ops::{BOOL, FLOAT, INT8, INT32, INT64, UINT8};
+    Ok(match value.dtype {
+        FLOAT => floating(
+            "float32",
+            value
+                .to_f32()
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .map(f64::from),
+        ),
+        INT64 => exact("int64", value.to_i64().map_err(anyhow::Error::msg)?),
+        INT32 => exact("int32", value.to_i64().map_err(anyhow::Error::msg)?),
+        INT8 => exact("int8", value.to_i64().map_err(anyhow::Error::msg)?),
+        UINT8 => exact("uint8", value.to_i64().map_err(anyhow::Error::msg)?),
+        BOOL => exact("bool", value.to_i64().map_err(anyhow::Error::msg)?),
+        dtype => bail!("output dtype {dtype} not handled by the runner"),
+    })
+}
+
+/// Output of a run: value name and dtype-preserving contents.
+type Outputs = Vec<(String, OutputTensor)>;
+
+fn compare_tensor(
+    reference: &OutputTensor,
+    candidate: &OutputTensor,
+    tol: f64,
+    rtol: f64,
+) -> onnx_vulkan_core::comparison::ComparisonReport {
+    use onnx_vulkan_core::comparison::{
+        ComparisonReport, FloatTolerance, compare_f64, compare_i64,
+    };
+    if reference.dtype != candidate.dtype {
+        return ComparisonReport {
+            dtype: reference.dtype,
+            reference_len: reference.len(),
+            candidate_len: candidate.len(),
+            mismatches: reference.len().max(candidate.len()),
+            max_abs: 0.0,
+            max_relative: 0.0,
+            matching_nan: 0,
+            nan_mismatches: 0,
+            matching_infinity: 0,
+            infinity_mismatches: 0,
+        };
+    }
+    match (&reference.exact, &candidate.exact) {
+        (Some(reference), Some(candidate)) => compare_i64(reference, candidate),
+        (None, None) => compare_f64(
+            &reference.values,
+            &candidate.values,
+            FloatTolerance::new(tol, rtol),
+        ),
+        _ => ComparisonReport {
+            dtype: reference.dtype,
+            reference_len: reference.len(),
+            candidate_len: candidate.len(),
+            mismatches: reference.len().max(candidate.len()),
+            max_abs: 0.0,
+            max_relative: 0.0,
+            matching_nan: 0,
+            nan_mismatches: 0,
+            matching_infinity: 0,
+            infinity_mismatches: 0,
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct ComparisonJson<'a> {
+    name: &'a str,
+    dtype: &'static str,
+    candidate_dtype: &'static str,
+    passed: bool,
+    reference_len: usize,
+    candidate_len: usize,
+    mismatches: usize,
+    max_abs: f64,
+    max_relative: f64,
+    matching_nan: usize,
+    nan_mismatches: usize,
+    matching_infinity: usize,
+    infinity_mismatches: usize,
+}
+
+fn comparison_json<'a>(
+    name: &'a str,
+    reference: &'a OutputTensor,
+    candidate: &'a OutputTensor,
+    tol: f64,
+    rtol: f64,
+) -> ComparisonJson<'a> {
+    let report = compare_tensor(reference, candidate, tol, rtol);
+    ComparisonJson {
+        name,
+        dtype: reference.dtype,
+        candidate_dtype: candidate.dtype,
+        passed: report.passed() && reference.dtype == candidate.dtype,
+        reference_len: report.reference_len,
+        candidate_len: report.candidate_len,
+        mismatches: report.mismatches,
+        max_abs: report.max_abs,
+        max_relative: report.max_relative,
+        matching_nan: report.matching_nan,
+        nan_mismatches: report.nan_mismatches,
+        matching_infinity: report.matching_infinity,
+        infinity_mismatches: report.infinity_mismatches,
+    }
+}
 
 /// The `input_*.pb` / `output_*.pb` pair of an ONNX model zoo
 /// `test_data_set_*` directory.
@@ -421,11 +583,7 @@ fn load_reference(dir: &Path, session: &Session) -> Result<Reference> {
         let host = onnx_vulkan_core::HostTensor::new(tensor.dtype, tensor.shape, tensor.data);
         outputs.push((
             name,
-            host.to_f32()
-                .map_err(|e| anyhow::anyhow!("{path}: {e}"))?
-                .into_iter()
-                .map(f64::from)
-                .collect(),
+            extract_host(&host).with_context(|| format!("{path}: extract output"))?,
         ));
     }
     anyhow::ensure!(!outputs.is_empty(), "{}: no output_*.pb", dir.display());
@@ -563,15 +721,7 @@ fn run_standalone(
         last = names
             .iter()
             .zip(outputs)
-            .map(|(name, tensor)| {
-                let values = tensor
-                    .to_f32()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .collect();
-                Ok((name.clone(), values))
-            })
+            .map(|(name, tensor)| Ok((name.clone(), extract_host(&tensor)?)))
             .collect::<Result<_>>()?;
         run.finish();
         // `Session::run` records deferred work. The inference is complete only
@@ -880,7 +1030,6 @@ fn main() -> Result<()> {
     } else {
         "Vulkan EP"
     };
-
     if args.decode > 0 {
         let ok = decode_loop(&mut cpu, &mut second, label, &args, &mut rng)?;
         drop(second);
@@ -941,30 +1090,18 @@ fn main() -> Result<()> {
     let mut worst = 0.0f64;
     let mut failed = false;
     for ((name, a), (_, b)) in cpu_out.iter().zip(&vk_out) {
-        if a.len() != b.len() {
-            println!("  {name}: different lengths ({} vs {})", a.len(), b.len());
-            failed = true;
-            continue;
-        }
-        let diff = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f64, f64::max);
+        let report = compare_tensor(a, b, args.tol, args.rtol);
+        let diff = report.max_abs;
         // reference scale, to give meaning to the absolute error
         let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let rel = if scale > 0.0 { diff / scale } else { 0.0 };
-        let mismatches = a
-            .iter()
-            .zip(b)
-            .filter(|(x, y)| (*x - *y).abs() > args.tol + args.rtol * x.abs())
-            .count();
+        let mismatches = report.mismatches;
         worst = worst.max(rel);
         println!(
             "  output {name:<28} n={:<9} max|Δ|={diff:.3e}  |ref|max={scale:.3e}               relative={rel:.2e}  beyond tolerance: {mismatches}",
             a.len()
         );
-        failed |= mismatches > 0;
+        failed |= !report.passed() || a.dtype != b.dtype;
         if args.dump > 0 {
             for (i, (x, y)) in a
                 .iter()
@@ -976,6 +1113,39 @@ fn main() -> Result<()> {
                 println!("    [{i}] cpu={x:+.6e}  vulkan={y:+.6e}");
             }
         }
+    }
+
+    if let Some(path) = &args.report_json {
+        #[derive(Serialize)]
+        struct Report<'a> {
+            schema_version: u32,
+            model: String,
+            reference_backend: &'static str,
+            candidate_backend: &'a str,
+            atol: f64,
+            rtol: f64,
+            outputs: Vec<ComparisonJson<'a>>,
+        }
+        let outputs = cpu_out
+            .iter()
+            .zip(&vk_out)
+            .map(|((name, reference), (_, candidate))| {
+                comparison_json(name, reference, candidate, args.tol, args.rtol)
+            })
+            .collect();
+        let report = Report {
+            schema_version: 1,
+            model: args.model.display().to_string(),
+            reference_backend: "cpu",
+            candidate_backend: label,
+            atol: args.tol,
+            rtol: args.rtol,
+            outputs,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&report)?;
+        bytes.push(b'\n');
+        std::fs::write(path, bytes)
+            .with_context(|| format!("writing comparison report {}", path.display()))?;
     }
 
     // third backend: the standalone engine, on the very same inputs. The EP run

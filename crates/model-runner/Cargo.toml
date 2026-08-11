@@ -21,3 +21,5 @@ onnx-vulkan = { path = "../onnx-vulkan" }
 # only to dump the profiler after a standalone run: nothing else does it, since
 # the Pareto is normally printed by the plugin's `OnRunEnd`
 vk-compute = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

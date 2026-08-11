@@ -21,6 +21,7 @@ a divergence, not for measuring performance.
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import onnx
@@ -51,7 +52,7 @@ def main(argv: list[str]) -> int:
     known = {vi.name: vi for vi in model.graph.value_info}
     existing = {o.name for o in model.graph.output}
 
-    exposed: list[tuple[str, str]] = []
+    exposed: list[dict[str, object]] = []
     added = 0
     for index, node in enumerate(model.graph.node):
         if index < start or index % every:
@@ -66,7 +67,17 @@ def main(argv: list[str]) -> int:
             model.graph.output.append(helper.ValueInfoProto())
             model.graph.output[-1].CopyFrom(vi)
             existing.add(name)
-            exposed.append((name, TensorProto.DataType.Name(vi.type.tensor_type.elem_type)))
+            exposed.append(
+                {
+                    "output_name": name,
+                    "dtype": TensorProto.DataType.Name(vi.type.tensor_type.elem_type),
+                    "node_index": index,
+                    "node_name": node.name,
+                    "domain": node.domain,
+                    "op": node.op_type,
+                    "tactic_family": f"{node.domain or 'ai.onnx'}::{node.op_type}",
+                }
+            )
             added += 1
             break
         if limit and added >= limit:
@@ -77,9 +88,28 @@ def main(argv: list[str]) -> int:
     # which is the first **quantized** intermediate, which in the model outputs
     # comes after the original ones and is not necessarily the first exposed
     names = dst.with_suffix(".outputs.txt")
-    names.write_text("".join(f"{n}\t{t}\n" for n, t in exposed), encoding="utf-8")
+    names.write_text(
+        "".join(f"{item['output_name']}\t{item['dtype']}\n" for item in exposed),
+        encoding="utf-8",
+    )
+    manifest = dst.with_suffix(".outputs.json")
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_model": str(src),
+                "instrumented_model": str(dst),
+                "original_output_count": len(model.graph.output) - len(exposed),
+                "intermediates": exposed,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     print(f"{added} intermediates exposed out of {len(model.graph.node)} nodes → {dst}")
     print(f"names in {names}")
+    print(f"manifest in {manifest}")
     return 0
 
 

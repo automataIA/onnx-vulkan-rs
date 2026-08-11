@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "created_by": {"onnx_vulkan_version":"0.0.1","git_commit":"abc","dirty":false,"command_line":["fixture"],"created_unix_seconds":1},
+  "device": {"name":"Other GPU","vendor_id":4098,"device_id":99,"driver_version":1,"api_version":4,"pipeline_cache_uuid":"ffffffffffffffffffffffffffffffff","subgroup_size":64,"features":[]},
+  "profile": {"model_digest":"1111111111111111111111111111111111111111111111111111111111111111","symbol_values":{"batch":1}},
+  "measurement_policy": {"warmup_iterations":2,"measured_iterations":20,"statistic":"median","clock":"vulkan_timestamp"},
+  "records": [
+    {"workload":{"domain":"","op":"Conv","inputs":[],"outputs":[],"attributes_digest":"2222222222222222222222222222222222222222222222222222222222222222"},"implementation_digest":"3333333333333333333333333333333333333333333333333333333333333333","tactic":{"family":"blocked","id":"tile64","parameters":{}},"measurement":{"samples":20,"median_gpu_ns":110,"min_gpu_ns":100,"max_gpu_ns":120},"correctness":{"kind":"max_abs_rel","passed":true}}
+  ]
+}

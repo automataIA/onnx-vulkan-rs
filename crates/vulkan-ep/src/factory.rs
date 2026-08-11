@@ -139,7 +139,7 @@ unsafe extern "C" fn get_version(_this: *const sys::OrtEpFactory) -> *const c_ch
 }
 
 /// Claims `OrtHardwareDevice`s of GPU type if Vulkan is available.
-/// If ORT exposes no GPU (e.g. WSL2) but Vulkan exists (lavapipe), as a
+/// If ORT exposes no GPU but Vulkan exists (lavapipe), as a
 /// development fallback it claims the CPU device.
 unsafe extern "C" fn get_supported_devices(
     this_ptr: *mut sys::OrtEpFactory,

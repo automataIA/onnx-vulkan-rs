@@ -10,12 +10,12 @@
 
 A Vulkan Execution Provider **plugin** for ONNX Runtime, entirely in Rust, plus
 a **standalone pure-Rust engine** (own ONNX parser, no ORT in the process) that
-shares the same kernels. Linux and Windows, NVIDIA/AMD GPUs (lavapipe as a CPU
+shares the same kernels. Linux, NVIDIA/AMD GPUs (lavapipe as a CPU
 fallback — correctness only, never performance).
 
 Runs int4 LLMs at **~160 tok/s** (gemma3-1b) and **~71 tok/s** (qwen2.5-VL),
-puts static int8 convolutions on the **tensor cores**, and reaches 9.07× the
-ORT CPU EP on rfdetr — while refusing at load time, loudly and completely, any
+puts static int8 convolutions on the **tensor cores**, and reaches 7.98× the
+ORT CPU EP on the Parakeet encoder — while refusing at load time, loudly and completely, any
 graph it cannot run end to end on the GPU. Reference app: STT with **Parakeet
 TDT 0.6B v3 (int8 ONNX)**.
 
@@ -77,11 +77,16 @@ Prerequisites: Rust ≥1.85, clang (for bindgen), Vulkan driver/loader
 (`libvulkan1`; on Linux without a GPU: `mesa-vulkan-drivers` for lavapipe).
 
 ```bash
-./scripts/fetch-deps.sh   # ORT 1.27.1 (linux+win) + Parakeet model (~700MB)
+./scripts/fetch-deps.sh   # ORT 1.27.1 (linux-x64) + Parakeet model (~700MB)
 cargo build --release
-cargo test                        # Vulkan kernel + core tests (run on lavapipe too)
+cargo test -- --test-threads=1    # Vulkan kernel + core tests (run on lavapipe too)
 cargo clippy --workspace -- -D warnings
 ```
+
+`--test-threads=1` is not optional on a real GPU: every test builds its own
+`VkContext`, and creating a dozen Vulkan devices concurrently wedges the NVIDIA
+Linux driver — the same suite that takes 2 s serialized did not finish in 25
+minutes in parallel. On lavapipe the default threading works.
 
 ## Usage
 
@@ -91,20 +96,15 @@ cargo run -p model-runner --release -- model.onnx --dim height=560 --dim width=5
 scripts/testsuite.sh --baseline runs/baseline.json    # the regression gate
 ```
 
+To tune the supported workloads of a concrete ONNX model into an exact,
+device-specific tactic artifact, see
+[`docs/autotune-model.md`](docs/autotune-model.md). The one-command entry point
+is `uv run scripts/autotune/model.py model.onnx --output tactics.json`.
+
 The plugin is loaded if present next to the executable
 (override: `VULKAN_EP_PATH`; disable: `STT_NO_VULKAN=1`;
 alternative ORT runtime: `ORT_DYLIB_PATH`; profiler: `VULKAN_EP_STATS=1`).
 The wav must be 16 kHz.
-
-### Windows (cross-build from Linux/WSL2)
-
-```bash
-rustup target add x86_64-pc-windows-msvc
-cargo xwin build --release --target x86_64-pc-windows-msvc -p vulkan-ep -p stt-app
-# from WSL2 you can run directly on the Windows host:
-export RUST_LOG=info ORT_DYLIB_PATH='third_party\onnxruntime\win-x64\lib\onnxruntime.dll'
-WSLENV=RUST_LOG:ORT_DYLIB_PATH ./target/x86_64-pc-windows-msvc/release/stt-app.exe models/en-sample.wav
-```
 
 ## Status
 
@@ -165,49 +165,76 @@ can trust.
 
 ## Performance
 
-RTX 4070, driver 610.74, batch 1, native Windows ORT, `runs/validation-gate2`
-(the promoted baseline — every number here is one the regression gate enforces).
-Ratio is against the ORT **CPU EP (MLAS)** on the same graph.
+RTX 4070, driver 595.84, Pop!_OS 24.04, batch 1, `runs/popos-3`.
+Ratio is against the ORT **CPU EP (MLAS)** on the same graph. `GPU` is the
+profiler's compute time, i.e. the part of the wall that is actually shaders.
 
-| model | wall | CPU EP | ratio | blocks | flush | GPU Pareto head |
-|---|---|---|---|---|---|---|
-| rfdetr | 41.4 ms | 375.4 ms | **9.07×** | 1 | 9 | `MatMul` 61% |
-| parakeet (encoder) | 46.4 ms | 342.9 ms | **7.39×** | 1 | 7 | `MMI_matmul_coop_k32` 60% |
-| yolov4 | 32.5 ms | 189.3 ms | **5.82×** | 1 | 4 | `Conv_split` 54% |
-| yolov8n | 7.1 ms | 27.1 ms | **3.82×** | 1 | 2 | `Conv_split` 41% |
-| qwen2.5-VL decoder (int4) | 28.2 ms | 95.9 ms | **3.40×** | 1 | 77 | `MatMulNBits_gemv` 35% |
-| roberta seq 128 | 18.7 ms | 54.7 ms | **2.93×** | 1 | 4 | `MatMul` 90% |
-| gemma3-1b (int4) | 15.5 ms | 34.0 ms | **2.19×** | 1 | 57 | `MatMulNBits` 26% |
-| roberta seq 1 | 3.6 ms | 7.7 ms | **2.14×** | 1 | 4 | `GEMV` 49% |
-| resnet50-int8 | 3.4 ms | 4.9 ms | **1.44×** | 1 | 2 | `ConvInteger_coop` 31% |
-| mobilenetv2 | 1.6 ms | 2.2 ms | **1.38×** | 1 | 2 | `Conv` 30% |
-| resnet50-qdq | 5.0 ms | 6.2 ms | **1.24×** | 1 | 2 | `Conv_split` 62% |
-| mobilenetv2-int8 | 2.1 ms | 1.1 ms | 0.52× | 1 | 2 | `Requantize` 30% |
+| model | wall | CPU EP | ratio | GPU | blocks | flush | GPU Pareto head |
+|---|---|---|---|---|---|---|---|
+| parakeet (encoder) | 39.4 ms | 314.3 ms | **7.98×** | 31.0 | 1 | 7 | `MMI_matmul_coop_k32` 58% |
+| rfdetr | 38.7 ms | 260.1 ms | **6.72×** | 34.0 | 1 | 9 | `MatMul` 60% |
+| yolov4 | 33.7 ms | 123.4 ms | **3.66×** | 19.6 | 1 | 4 | `Conv_split` 55% |
+| yolov8n | 6.5 ms | 22.1 ms | **3.40×** | 4.9 | 1 | 2 | `Conv_split` 41% |
+| roberta seq 1 | 3.3 ms | 9.4 ms | **2.85×** | 2.2 | 1 | 4 | `GEMV` 46% |
+| roberta seq 128 | 17.7 ms | 40.9 ms | **2.31×** | 16.2 | 1 | 4 | `MatMul` 88% |
+| qwen2.5-VL decoder (int4) | 28.5 ms | 57.6 ms | **2.02×** | 12.1 | 1 | 77 | `MatMulNBits_wide` 37% |
+| gemma3-1b (int4) | 17.3 ms | 18.9 ms | **1.09×** | 6.0 | 1 | 57 | `MatMulNBits` 29% |
+| resnet50-int8 | 3.4 ms | 3.6 ms | **1.06×** | 2.4 | 1 | 2 | `ConvInteger_coop` 40% |
+| resnet50-qdq | 4.7 ms | 4.9 ms | **1.04×** | 3.9 | 1 | 2 | `Conv_split` 61% |
+| mobilenetv2 | 1.5 ms | 1.2 ms | 0.80× | 1.1 | 1 | 2 | `Conv` 29% |
+| mobilenetv2-int8 | 1.8 ms | 0.7 ms | 0.39× | 0.9 | 1 | 2 | `Requantize` 29% |
+
+Correctness in the same run: `sync-check.sh` reports **12/12 models clean**
+under the Khronos synchronization-validation layer, both int8 classifiers are
+bit-exact against their golden data (`max|Δ| = 0.000e0`), and every golden
+argmax is reproduced.
 
 Generation, measured on the replayed decode loop rather than on a single
 forward: **gemma3-1b 6.24 ms/token (~160 tok/s)** and **qwen2.5-VL 14.09
-ms/token (~71 tok/s)**, zero device allocations per step, one flush.
+ms/token (~71 tok/s)**, zero device allocations per step, one flush. These two
+were taken on the previous Windows host and have **not** been re-measured since
+the move; at one flush per step they are the least exposed numbers here to the
+per-flush cost described below — which also means the fence fix should barely
+move them — but they are not confirmed either way.
 
 Read honestly:
 
-- **Structure is solved.** Every model is at 1 convex block. Boundary count is
-  no longer a lever — the suite is kernel-bound end to end.
-- **One model is below the CPU EP, and no kernel will move it.**
-  `mobilenetv2-int8` spends 0.9 of its 2.1 ms on the GPU; the rest is ORT and
+- **The biggest single win here was one Vulkan call, not a kernel.** Every
+  submit+fence used to create and destroy its fence. `cargo run --release -p
+  vk-compute --example flush_cost` times the round trip with nothing to compute:
+  0.496 ms through `flush()`, 0.136 ms with a pre-recorded command buffer and a
+  reused fence, and 0.494 ms again the moment the fence is created and destroyed
+  — so **0.358 ms of every flush was one fence allocation**, which the NVIDIA
+  driver charges dearly and lavapipe does not charge at all. Creating the fence
+  once and resetting it per submit took **qwen2.5-VL 69.4 → 28.5 ms** and
+  **gemma3-1b 41.2 → 17.3**, and moved all twelve models by 0.42–0.73 ms per
+  flush — a constant that now shows up identically from 2 flushes to 77.
+- **Structure is solved and the submit boundary is now cheap.** Every model is
+  at 1 convex block, so boundary *count* was already not a lever; each remaining
+  flush costs ~0.14 ms, which is the driver's own floor.
+- **The kernels are unchanged across all of this.** GPU compute matches the
+  previous Windows-host baseline within ±10% on every model (gemma3-1b 6.4 →
+  6.0 ms, rfdetr 34.9 → 34.0, yolov8n 4.83 → 4.86). Everything above and below
+  moved the wall around the shaders, never the shaders.
+- **Two models are below the CPU EP, and no kernel will move them.**
+  `mobilenetv2-int8` spends 0.9 of its 1.8 ms on the GPU; the rest is ORT and
   plugin overhead across 73 nodes. Its `ConvInteger` work is 17 depthwise
   convolutions with `K = 9` — not a GEMM, nothing to tile, nothing to split.
-  It is an overhead item, and it is labelled as one instead of being tuned.
+  They are overhead items, and they are labelled as such instead of tuned.
 - **The two models that used to be below 1× no longer are**, and neither was
   fixed by a bigger tile. roberta at `seq_len = 1` (0.76×) is a GEMV: 768 useful
   threads on a card that holds 70,656, so the fix was splitting `K` to
-  manufacture workgroups — now 2.14×, at 500–515 GB/s against the card's ~504,
+  manufacture workgroups — now 2.85×, at 500–515 GB/s against the card's ~504,
   which means that lever is spent rather than merely pulled. resnet50-qdq
-  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.24×. Full
-  attribution in `docs/resnet50-gap.md`.
-- **Ratios move because the reference moves.** The MLAS baseline drifted 4.5 →
-  6.2 ms on the same binary across consecutive runs. Compare milliseconds, and
-  treat `blocks` / `flushes` / `MB transferred` — which are deterministic — as
-  the primary metric.
+  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.04× against a
+  reference that reads 4.9 ms today and 7.0 ms a run ago. Full attribution in
+  `docs/resnet50-gap.md`.
+- **Ratios move because the reference moves, and this table is mostly ratios.**
+  The MLAS baseline drifted 4.5 → 6.2 ms on the same binary across consecutive
+  runs; between the two runs behind this table it moved up to 20% (gemma 21.8 →
+  18.9, roberta 7.8 → 9.4) while our own walls moved by tenths. Compare
+  milliseconds, and treat `blocks` / `flushes` / `MB transferred` — which are
+  deterministic — as the primary metric.
 - **lavapipe numbers mean nothing for performance**; the suite marks those runs
   `perf_valid: false`. They are still a valid *correctness* gate, because
   integer arithmetic is exact on any device.
@@ -249,4 +276,3 @@ at your option.
 **Models are not included.** The test suite downloads pre-trained models on
 demand; each model has its own license. See [NOTICE](NOTICE) for the full
 attribution table.
-

@@ -4,9 +4,10 @@
 
 use onnx_vulkan_core::host_ops::{FLOAT, HostTensor, INT8, UINT8};
 use onnx_vulkan_core::{
-    AttrValue, ExecutionEnv, GraphIr, InitializerIr, KernelCache, NodeIr, Tensor, execute,
+    AttrValue, ExecutionEnv, Executor, GraphIr, InitializerIr, KernelCache, NodeIr, Tensor, execute,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use vk_compute::VkContext;
 
 fn node(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrValue)]) -> NodeIr {
@@ -216,6 +217,128 @@ fn conv_f32_with_stride_pad_dilation_and_bias() {
         vec![r.n as i64, r.c_out as i64, h_out as i64, w_out as i64]
     );
     assert_close(&to_f32(&out), &want, 1e-4, "Conv 2D");
+}
+
+#[test]
+fn conv_exact_cache_hit_selects_owned_tactic_and_shape_miss_falls_back() {
+    use onnx_vulkan_core::ElementType;
+    use onnx_vulkan_core::shaders::conv::{Tactic, implementation_fingerprint, tuned_tactic};
+    use onnx_vulkan_core::tuning::{
+        DeviceFingerprint, Measurement, SelectionKind, TacticResolver, TensorSignature, TuningKey,
+        TuningMode, TuningRecord, TuningTable, WorkloadSignature, attributes_digest,
+    };
+
+    let context = VkContext::new().expect("Vulkan context");
+    let x = pseudo(3 * 7 * 9, 101);
+    let w = pseudo(4 * 3 * 3 * 3, 103);
+    let bias = pseudo(4, 107);
+    let attrs = [
+        ("kernel_shape", AttrValue::Ints(vec![3, 3])),
+        ("strides", AttrValue::Ints(vec![2, 1])),
+        ("pads", AttrValue::Ints(vec![1, 2, 1, 2])),
+        ("dilations", AttrValue::Ints(vec![1, 2])),
+    ];
+    let mut initializers = HashMap::new();
+    initializers.insert("w".into(), f32_init(vec![4, 3, 3, 3], &w));
+    initializers.insert("b".into(), f32_init(vec![4], &bias));
+    let ir = GraphIr {
+        nodes: conv_graph(&attrs, true),
+        initializers,
+        inputs: vec!["x".into()],
+        outputs: vec!["out".into()],
+        ..Default::default()
+    };
+
+    let input = HostTensor::from_f32(vec![1, 3, 7, 9], &x);
+    let control = Executor::new(&context, ir.clone()).expect("control executor");
+    let control_output = control
+        .run(vec![("x", Tensor::Host(input.clone()))])
+        .expect("control run")
+        .host("out")
+        .expect("control output")
+        .to_f32()
+        .expect("f32 output");
+
+    let selected = Tactic::ImplicitGemm {
+        output_tile: 8,
+        k_step: 8,
+    };
+    assert_ne!(selected, tuned_tactic(1, 36, 4, 27));
+    let (tactic, parameters) = selected.persistent_parts();
+    let workload = WorkloadSignature {
+        domain: String::new(),
+        op: "Conv".into(),
+        inputs: vec![
+            TensorSignature {
+                dtype: ElementType::Float32,
+                dimensions: vec![1, 3, 7, 9],
+            },
+            TensorSignature {
+                dtype: ElementType::Float32,
+                dimensions: vec![4, 3, 3, 3],
+            },
+            TensorSignature {
+                dtype: ElementType::Float32,
+                dimensions: vec![4],
+            },
+        ],
+        outputs: vec![TensorSignature {
+            dtype: ElementType::Float32,
+            dimensions: vec![1, 4, 4, 9],
+        }],
+        attributes_digest: attributes_digest(&ir.nodes[0]),
+    };
+    let key = TuningKey {
+        device: DeviceFingerprint::from(context.device_fingerprint()),
+        workload,
+        implementation: implementation_fingerprint(),
+    };
+    let mut table = TuningTable::new();
+    table.insert_best(
+        key,
+        TuningRecord::new(
+            tactic,
+            parameters,
+            Measurement::new(20, 100, 90, 110).expect("valid measurement"),
+        ),
+    );
+    let resolver = Arc::new(TacticResolver::new(TuningMode::CacheOnly, table));
+    let cached = Executor::with_tuning(&context, ir, resolver.clone()).expect("cached executor");
+    let cached_output = cached
+        .run(vec![("x", Tensor::Host(input))])
+        .expect("exact-hit run")
+        .host("out")
+        .expect("exact-hit output")
+        .to_f32()
+        .expect("f32 output");
+    assert_close(&cached_output, &control_output, 1e-4, "cached tactic");
+    assert!(cached.cache().pipeline_keys().iter().any(|pipeline| {
+        pipeline
+            .tactic_id()
+            .is_some_and(|id| id.contains("output_tile: 8"))
+    }));
+
+    let changed_shape = HostTensor::from_f32(vec![1, 3, 8, 9], &pseudo(3 * 8 * 9, 109));
+    cached
+        .run(vec![("x", Tensor::Host(changed_shape))])
+        .expect("shape miss safely runs fallback")
+        .finish();
+    let summary = resolver.summary();
+    assert_eq!(summary.len(), 2);
+    assert_eq!(
+        summary
+            .iter()
+            .filter(|event| event.kind == SelectionKind::Hit)
+            .count(),
+        1
+    );
+    assert_eq!(
+        summary
+            .iter()
+            .filter(|event| event.kind == SelectionKind::Miss)
+            .count(),
+        1
+    );
 }
 
 /// `K = C_in·KH·KW = 288` with a batch, so `conv::split_k` routes this to the

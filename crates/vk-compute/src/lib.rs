@@ -15,6 +15,6 @@ mod stream;
 
 pub use buffer::GpuBuffer;
 pub use capture::{CopyOp, DispatchOp, StreamOp, UploadOp};
-pub use context::{CoopMatU8, VkContext};
+pub use context::{ComputeLimits, CoopMatU8, DeviceFingerprint, VkContext};
 pub use pipeline::{BufferSlice, ComputePipeline};
 pub use shader::compile_wgsl;

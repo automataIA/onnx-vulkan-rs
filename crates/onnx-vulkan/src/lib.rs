@@ -156,6 +156,8 @@ impl Session {
     }
 
     fn from_model(model: onnx_vulkan_frontend::Model) -> Result<Self> {
+        let tuning = onnx_vulkan_tune::runtime_resolver_from_env()
+            .map_err(|error| Error::Device(format!("tuning configuration: {error}")))?;
         for conflict in &model.conflicts {
             log::warn!("shape inference: {conflict}");
         }
@@ -176,8 +178,10 @@ impl Session {
         };
         let inputs = describe(&model.graph.inputs);
         let outputs = describe(&model.graph.outputs);
+        let context = context()?;
+        let executor = Executor::with_tuning(context, model.graph, tuning)?;
         Ok(Self {
-            executor: Executor::new(context()?, model.graph)?,
+            executor,
             inputs,
             outputs,
         })
@@ -440,6 +444,22 @@ impl<'a> Decoder<'a> {
         if let Some(previous) = self.run.take() {
             previous.finish();
         }
+        // Step zero already has to warm the retained buffer pool and cannot
+        // participate in a stable plan. Run it without capture as the tactic
+        // resolution boundary too: every decode-stable concrete signature is
+        // selected before a later trace can store pipeline identity.
+        if self.step == 0 {
+            self.run = Some(
+                self.session.run_cached(
+                    supplied
+                        .iter()
+                        .map(|(name, tensor)| (name.as_str(), tensor.clone())),
+                    self.cache,
+                )?,
+            );
+            self.step += 1;
+            return Ok(());
+        }
         let (run, trace) = self.session.run_traced_cached(&supplied, self.cache)?;
         self.run = Some(run);
         self.traces.push_back(trace);
@@ -517,6 +537,12 @@ impl<'a> Decoder<'a> {
     /// Whether the loop is issuing a plan rather than walking the graph.
     pub fn planned(&self) -> bool {
         self.plan.is_some()
+    }
+
+    /// Structural/resource metadata of the verified live plan, if capture has
+    /// converged. No Vulkan identity or command payload is exposed.
+    pub fn plan_stats(&self) -> Option<onnx_vulkan_core::StepPlanStats> {
+        self.plan.as_ref().map(onnx_vulkan_core::StepPlan::stats)
     }
 
     /// Index of the largest element along the last axis of an output.

@@ -64,6 +64,30 @@ fn add_f32() {
     let result: Vec<f32> = from_bytes(&ctx.download(&buf_out).unwrap());
     assert_eq!(result, expected);
 
+    let samples = ctx
+        .measure_dispatch_gpu(
+            &pipeline,
+            &[&buf_a, &buf_b, &buf_out],
+            &(n as u32).to_le_bytes(),
+            groups,
+            20,
+            10,
+        )
+        .expect("GPU timestamp measurement");
+    assert_eq!(samples.len(), 20);
+    assert!(samples.iter().all(|sample| *sample > 0));
+    assert!(
+        ctx.measure_dispatch_gpu(
+            &pipeline,
+            &[&buf_a, &buf_b, &buf_out],
+            &(n as u32).to_le_bytes(),
+            groups,
+            20,
+            0,
+        )
+        .is_err()
+    );
+
     ctx.destroy_buffer(buf_a);
     ctx.destroy_buffer(buf_b);
     ctx.destroy_buffer(buf_out);

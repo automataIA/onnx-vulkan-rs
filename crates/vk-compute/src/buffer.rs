@@ -308,6 +308,7 @@ impl VkContext {
             let region = vk::BufferCopy::default().size(data.len() as u64);
             self.device
                 .cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &[region]);
+            Ok(())
         })?;
         self.destroy_buffer(staging);
         Ok(())
@@ -336,6 +337,7 @@ impl VkContext {
             let region = vk::BufferCopy::default().size(src.size);
             self.device
                 .cmd_copy_buffer(cmd, src.buffer, staging.buffer, &[region]);
+            Ok(())
         })?;
         let data = staging
             .allocation

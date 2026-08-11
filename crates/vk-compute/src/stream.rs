@@ -123,7 +123,11 @@ impl VkContext {
         };
         if ok {
             for (i, label) in state.ts_labels.iter().enumerate() {
-                let ticks = ts[i + 1].saturating_sub(ts[i]);
+                let ticks = crate::pipeline::timestamp_delta_ticks(
+                    ts[i],
+                    ts[i + 1],
+                    self.timestamp_valid_bits,
+                );
                 let ns = (ticks as f64 * self.timestamp_period as f64) as u64;
                 crate::stats::record_gpu(label, ns);
             }
@@ -442,16 +446,19 @@ impl VkContext {
         let device = &self.device;
         let _guard = self.submit_lock.lock().unwrap();
         let wall = std::time::Instant::now();
+        let fence = self.flush_fence;
         let result = unsafe {
             device.end_command_buffer(cmd)?;
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
             crate::stats::record_submit();
+            // reset before submitting, not after waiting: the previous flush
+            // left it signalled, and a fence that is never reset is waited on
+            // once and then satisfied instantly forever
             let r = device
-                .queue_submit(self.queue, &[submit], fence)
+                .reset_fences(&[fence])
+                .and_then(|()| device.queue_submit(self.queue, &[submit], fence))
                 .and_then(|()| device.wait_for_fences(&[fence], true, u64::MAX));
-            device.destroy_fence(fence, None);
             device.free_command_buffers(self.command_pool, &cmds);
             r
         };

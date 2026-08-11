@@ -9,6 +9,7 @@ members = [
     "crates/model-runner",
     "crates/onnx-vulkan-frontend",
     "crates/onnx-vulkan",
+    "crates/onnx-vulkan-tune",
 ]
 
 [workspace.package]
@@ -26,6 +27,9 @@ hound = "3.5"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+sha2 = { version = "0.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Internal crates: `version` is what crates.io sees, `path` is what local builds use.
 vk-compute = { version = "0.0.1", path = "crates/vk-compute" }
 onnx-vulkan-core = { version = "0.0.1", path = "crates/onnx-vulkan-core" }

@@ -27,8 +27,9 @@
 //! Run: `cargo run --release -p onnx-vulkan-core --example conv_blocked`
 
 use onnx_vulkan_core::shaders::conv;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
-use vk_compute::{VkContext, compile_wgsl};
+use vk_compute::{ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
 
 /// One `Conv` geometry, with how many nodes of the model run it.
 struct Shape {
@@ -291,6 +292,34 @@ fn floats(raw: &[u8]) -> Vec<f32> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = VkContext::new()?;
+    if std::env::args().any(|argument| argument == "--device-json") {
+        let device = ctx.device_fingerprint();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "device": {
+                    "name": device.name(), "vendor_id": device.vendor_id(),
+                    "device_id": device.device_id(), "driver_version": device.driver_version(),
+                    "api_version": device.api_version(),
+                    "pipeline_cache_uuid": hex(device.pipeline_cache_uuid()),
+                    "subgroup_size": device.subgroup_size(), "features": device.features(),
+                },
+                "implementation_digest": hex(conv::implementation_fingerprint().as_bytes()),
+            }))?
+        );
+        return Ok(());
+    }
+    let tune_shapes = tune_shape_arguments()?;
+    if !tune_shapes.is_empty() {
+        return tune_model_shapes(&ctx, &tune_shapes);
+    }
+    if std::env::args().any(|arg| arg == "--list") {
+        return report_candidate_space(&ctx);
+    }
+    if std::env::args().any(|arg| arg == "--search") {
+        return search_candidates(&ctx);
+    }
     let small = ctx.create_pipeline(
         &compile_wgsl(&conv::implicit_gemm())?,
         conv::BINDINGS,
@@ -330,6 +359,732 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  gate Conv {gate_ms:.2} ms -> {:.2} ms with the predicate; worst relative diff {rel:.2e}",
             gate_ms * routed_ms / small_ms,
         );
+    }
+    Ok(())
+}
+
+fn report_candidate_space(ctx: &VkContext) -> Result<(), Box<dyn std::error::Error>> {
+    let limits = conv::TacticLimits::from_vulkan(
+        ctx.compute_limits(),
+        ctx.compute_limits().max_storage_buffer_bytes,
+    );
+    let mut total_geometries = 0usize;
+    let mut total_before = 0usize;
+    let mut total_after = 0usize;
+    let mut total_control_rejected = 0usize;
+    let mut rejections = BTreeMap::<conv::TacticRejection, usize>::new();
+
+    for (model, shapes, _) in MODELS {
+        let mut model_before = 0usize;
+        let mut model_after = 0usize;
+        for shape in *shapes {
+            let pixels = shape.h_out * shape.h_out;
+            let kdepth = shape.c_in * shape.k * shape.k;
+            let geometry = conv::TacticGeometry {
+                batch: 1,
+                group: 1,
+                pixels: pixels as u32,
+                c_out: shape.c_out as u32,
+                kdepth: kdepth as u32,
+                total: (pixels * shape.c_out) as u64,
+            };
+            let candidates = conv::candidate_space(geometry.group);
+            model_before += candidates.len();
+            for candidate in candidates {
+                match candidate.viability(geometry, limits) {
+                    Ok(()) => model_after += 1,
+                    Err(reason) => *rejections.entry(reason).or_default() += 1,
+                }
+            }
+            let control = conv::control_tactic(1, pixels, shape.c_out, kdepth);
+            total_control_rejected += usize::from(!control.is_viable(geometry, limits));
+        }
+        println!(
+            "{{\"kind\":\"conv_candidate_space_model\",\"model\":\"{model}\",\"geometries\":{},\"before\":{model_before},\"after\":{model_after}}}",
+            shapes.len()
+        );
+        total_geometries += shapes.len();
+        total_before += model_before;
+        total_after += model_after;
+    }
+
+    let rejection_json = rejections
+        .iter()
+        .map(|(reason, count)| format!("\"{reason:?}\":{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "{{\"kind\":\"conv_candidate_space_summary\",\"geometries\":{total_geometries},\"candidates_per_group1_geometry\":{},\"before\":{total_before},\"after\":{total_after},\"control_rejected\":{total_control_rejected},\"rejections\":{{{rejection_json}}}}}",
+        conv::candidate_space(1).len()
+    );
+    Ok(())
+}
+
+const SEARCH_SAMPLES: u32 = 20;
+const SEARCH_RANDOM_SEED: u64 = 0x6f6e_6e78_766b_7273;
+const MAX_REL_ERROR: f32 = 1.0e-4;
+type Err = Box<dyn std::error::Error>;
+
+#[derive(Clone, Copy)]
+struct CandidateMeasurement {
+    ms: f64,
+    max_rel: f32,
+}
+
+fn tune_shape_arguments() -> Result<Vec<Shape>, Err> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut shapes = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] != "--tune-shape" {
+            index += 1;
+            continue;
+        }
+        let spec = arguments
+            .get(index + 1)
+            .ok_or("--tune-shape requires C_IN,C_OUT,K,H_IN,H_OUT,STRIDE,PAD")?;
+        let values = spec
+            .split(',')
+            .map(|value| value.parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.len() != 7 || values[..6].contains(&0) {
+            return Err(
+                "--tune-shape requires seven integers; all except PAD must be positive".into(),
+            );
+        }
+        shapes.push(Shape {
+            c_in: values[0],
+            c_out: values[1],
+            k: values[2],
+            h_in: values[3],
+            h_out: values[4],
+            stride: values[5],
+            pad: values[6],
+            count: 1,
+        });
+        index += 2;
+    }
+    Ok(shapes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
+    let limits = conv::TacticLimits::from_vulkan(
+        ctx.compute_limits(),
+        ctx.compute_limits().max_storage_buffer_bytes,
+    );
+    let geometries = shapes
+        .iter()
+        .map(|shape| conv::TacticGeometry {
+            batch: 1,
+            group: 1,
+            pixels: (shape.h_out * shape.h_out) as u32,
+            c_out: shape.c_out as u32,
+            kdepth: (shape.c_in * shape.k * shape.k) as u32,
+            total: (shape.h_out * shape.h_out * shape.c_out) as u64,
+        })
+        .collect::<Vec<_>>();
+    let mut pipeline_tactics = BTreeSet::new();
+    for tactic in conv::focused_search_space() {
+        if geometries
+            .iter()
+            .any(|geometry| tactic.is_viable(*geometry, limits))
+        {
+            pipeline_tactics.insert(normalized_pipeline_tactic(tactic));
+        }
+    }
+    for geometry in &geometries {
+        pipeline_tactics.insert(normalized_pipeline_tactic(conv::control_tactic(
+            1,
+            geometry.pixels as usize,
+            geometry.c_out as usize,
+            geometry.kdepth as usize,
+        )));
+    }
+    let mut pipelines = BTreeMap::new();
+    for tactic in pipeline_tactics {
+        let source = conv::generated_source(tactic)
+            .ok_or_else(|| format!("no generated source for {tactic:?}"))?;
+        pipelines.insert(
+            tactic,
+            ctx.create_pipeline(&compile_wgsl(&source)?, conv::BINDINGS, conv::PUSH_BYTES)?,
+        );
+    }
+    let reduce = ctx.create_pipeline(
+        &compile_wgsl(conv::SPLIT_REDUCE)?,
+        conv::SPLIT_REDUCE_BINDINGS,
+        conv::PUSH_BYTES,
+    )?;
+    let device = ctx.device_fingerprint();
+    for shape in shapes {
+        let prepared = PreparedShape::new(ctx, shape)?;
+        let geometry = prepared.geometry;
+        let control = conv::control_tactic(
+            1,
+            geometry.pixels as usize,
+            geometry.c_out as usize,
+            geometry.kdepth as usize,
+        );
+        prepared.execute(ctx, tactic_pipeline(&pipelines, control)?, &reduce, control)?;
+        let reference = prepared.output(ctx)?;
+        let mut candidates = conv::focused_search_space()
+            .into_iter()
+            .filter(|tactic| tactic.is_viable(geometry, limits))
+            .collect::<Vec<_>>();
+        if !candidates.contains(&control) {
+            candidates.push(control);
+        }
+        let mut measurements = BTreeMap::new();
+        for tactic in &candidates {
+            measurements.insert(
+                *tactic,
+                measure_candidate(ctx, &prepared, &pipelines, &reduce, *tactic, &reference)?,
+            );
+        }
+        let (provisional_winner, _) = best_of(&candidates, &measurements)
+            .ok_or("no Conv tactic passed the correctness gate")?;
+        let (control_ms, winner_ms) = interleaved_pair(
+            ctx,
+            &prepared,
+            &pipelines,
+            &reduce,
+            control,
+            provisional_winner,
+        )?;
+        let winner = if winner_ms < control_ms {
+            provisional_winner
+        } else {
+            control
+        };
+        let evidence = measurements
+            .get(&winner)
+            .and_then(|measurement| *measurement)
+            .ok_or("selected Conv tactic has no correctness evidence")?;
+        let samples = prepared.timestamp_samples(
+            ctx,
+            tactic_pipeline(&pipelines, winner)?,
+            &reduce,
+            winner,
+        )?;
+        let median = median_ns(samples.clone());
+        let minimum = *samples
+            .iter()
+            .min()
+            .ok_or("winner produced no timestamp sample")?;
+        let maximum = *samples
+            .iter()
+            .max()
+            .ok_or("winner produced no timestamp sample")?;
+        let (tactic_id, parameters) = winner.persistent_parts();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "family": "conv-f32",
+                "geometry": {
+                    "c_in": shape.c_in, "c_out": shape.c_out, "kernel": shape.k,
+                    "h_in": shape.h_in, "h_out": shape.h_out,
+                    "stride": shape.stride, "pad": shape.pad,
+                },
+                "device": {
+                    "name": device.name(), "vendor_id": device.vendor_id(),
+                    "device_id": device.device_id(), "driver_version": device.driver_version(),
+                    "api_version": device.api_version(),
+                    "pipeline_cache_uuid": hex(device.pipeline_cache_uuid()),
+                    "subgroup_size": device.subgroup_size(), "features": device.features(),
+                },
+                "implementation_digest": hex(conv::implementation_fingerprint().as_bytes()),
+                "tactic": {
+                    "family": tactic_id.family(), "id": tactic_id.variant(),
+                    "parameters": parameters,
+                },
+                "measurement": {
+                    "samples": samples.len(), "median_gpu_ns": median,
+                    "min_gpu_ns": minimum, "max_gpu_ns": maximum,
+                    "diagnostic_samples_gpu_ns": samples,
+                },
+                "correctness": {"kind": "max_rel", "passed": true, "max_rel": evidence.max_rel},
+                "candidate_count": candidates.len(),
+                "interleaved": {
+                    "control_ms": control_ms, "provisional_winner_ms": winner_ms,
+                    "selected_control": winner == control,
+                },
+            }))?
+        );
+        prepared.destroy(ctx);
+    }
+    ctx.destroy_pipeline(reduce);
+    for (_, pipeline) in pipelines {
+        ctx.destroy_pipeline(pipeline);
+    }
+    Ok(())
+}
+
+struct PreparedShape {
+    x: GpuBuffer,
+    w: GpuBuffer,
+    b: GpuBuffer,
+    out: GpuBuffer,
+    partials: GpuBuffer,
+    push: Vec<u8>,
+    geometry: conv::TacticGeometry,
+}
+
+impl PreparedShape {
+    fn new(ctx: &VkContext, shape: &Shape) -> Result<Self, Err> {
+        let pixels = shape.h_out * shape.h_out;
+        let kdepth = shape.c_in * shape.k * shape.k;
+        let total = shape.c_out * pixels;
+        let x = pseudo(shape.c_in * shape.h_in * shape.h_in, 3);
+        let w = pseudo(shape.c_out * kdepth, 5);
+        let b = pseudo(shape.c_out, 7);
+        let x_buf = ctx.create_storage_buffer((4 * x.len()) as u64)?;
+        let w_buf = ctx.create_storage_buffer((4 * w.len()) as u64)?;
+        let b_buf = ctx.create_storage_buffer((4 * b.len()) as u64)?;
+        let out = ctx.create_storage_buffer((4 * total) as u64)?;
+        let partials = ctx.create_storage_buffer((4 * total * 32) as u64)?;
+        ctx.stream_upload(&x_buf, &bytes(&x))?;
+        ctx.stream_upload(&w_buf, &bytes(&w))?;
+        ctx.stream_upload(&b_buf, &bytes(&b))?;
+        ctx.flush()?;
+
+        let mut push = Vec::with_capacity(conv::PUSH_BYTES as usize);
+        for value in [
+            total as u32,
+            shape.c_in as u32,
+            shape.c_out as u32,
+            1,
+            shape.h_in as u32,
+            shape.h_in as u32,
+            shape.h_out as u32,
+            shape.h_out as u32,
+            shape.k as u32,
+            shape.k as u32,
+            shape.stride as u32,
+            shape.stride as u32,
+            shape.pad as u32,
+            shape.pad as u32,
+            1,
+            1,
+            shape.c_in as u32,
+            1,
+            1,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(Self {
+            x: x_buf,
+            w: w_buf,
+            b: b_buf,
+            out,
+            partials,
+            push,
+            geometry: conv::TacticGeometry {
+                batch: 1,
+                group: 1,
+                pixels: pixels as u32,
+                c_out: shape.c_out as u32,
+                kdepth: kdepth as u32,
+                total: total as u64,
+            },
+        })
+    }
+
+    fn push_for(&self, tactic: conv::Tactic) -> Vec<u8> {
+        let mut push = self.push.clone();
+        push[72..76].copy_from_slice(&tactic.split().to_le_bytes());
+        push
+    }
+
+    fn execute(
+        &self,
+        ctx: &VkContext,
+        pipeline: &ComputePipeline,
+        reduce: &ComputePipeline,
+        tactic: conv::Tactic,
+    ) -> Result<(), Err> {
+        let push = self.push_for(tactic);
+        let grid = tactic.dispatch_grid(
+            self.geometry.total as u32,
+            self.geometry.pixels,
+            self.geometry.c_out,
+            self.geometry.batch,
+        );
+        if tactic.split() > 1 {
+            ctx.stream_dispatch(
+                pipeline,
+                &[&self.x, &self.w, &self.b, &self.partials],
+                &push,
+                grid,
+            )?;
+            ctx.stream_dispatch(
+                reduce,
+                &[&self.partials, &self.b, &self.out],
+                &push,
+                [(self.geometry.total as u32).div_ceil(256), 1, 1],
+            )?;
+        } else {
+            ctx.stream_dispatch(
+                pipeline,
+                &[&self.x, &self.w, &self.b, &self.out],
+                &push,
+                grid,
+            )?;
+        }
+        ctx.flush()?;
+        Ok(())
+    }
+
+    fn output(&self, ctx: &VkContext) -> Result<Vec<f32>, Err> {
+        Ok(floats(&ctx.stream_download(
+            &self.out,
+            self.geometry.total as usize * 4,
+        )?))
+    }
+
+    fn timestamp_samples(
+        &self,
+        ctx: &VkContext,
+        pipeline: &ComputePipeline,
+        reduce: &ComputePipeline,
+        tactic: conv::Tactic,
+    ) -> Result<Vec<u64>, Err> {
+        let push = self.push_for(tactic);
+        let grid = tactic.dispatch_grid(
+            self.geometry.total as u32,
+            self.geometry.pixels,
+            self.geometry.c_out,
+            self.geometry.batch,
+        );
+        let main_buffers = if tactic.split() > 1 {
+            [&self.x, &self.w, &self.b, &self.partials]
+        } else {
+            [&self.x, &self.w, &self.b, &self.out]
+        };
+        let mut samples =
+            ctx.measure_dispatch_gpu(pipeline, &main_buffers, &push, grid, SEARCH_SAMPLES, 1)?;
+        if tactic.split() > 1 {
+            let reduction = ctx.measure_dispatch_gpu(
+                reduce,
+                &[&self.partials, &self.b, &self.out],
+                &push,
+                [(self.geometry.total as u32).div_ceil(256), 1, 1],
+                SEARCH_SAMPLES,
+                1,
+            )?;
+            for (sample, reduction) in samples.iter_mut().zip(reduction) {
+                *sample = sample.saturating_add(reduction);
+            }
+        }
+        Ok(samples)
+    }
+
+    fn destroy(self, ctx: &VkContext) {
+        for buffer in [self.x, self.w, self.b, self.out, self.partials] {
+            ctx.destroy_buffer(buffer);
+        }
+    }
+}
+
+fn normalized_pipeline_tactic(tactic: conv::Tactic) -> conv::Tactic {
+    match tactic {
+        conv::Tactic::SplitK {
+            output_tile,
+            k_step,
+            micro_tile,
+            ..
+        } => conv::Tactic::SplitK {
+            output_tile,
+            k_step,
+            micro_tile,
+            split: 2,
+        },
+        other => other,
+    }
+}
+
+fn median_ns(mut samples: Vec<u64>) -> u64 {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+fn compare(reference: &[f32], candidate: &[f32]) -> Option<f32> {
+    let mut max_rel = 0.0f32;
+    for (&expected, &actual) in reference.iter().zip(candidate) {
+        if !expected.is_finite() || !actual.is_finite() {
+            return None;
+        }
+        max_rel = max_rel.max((expected - actual).abs() / expected.abs().max(1.0));
+    }
+    (max_rel <= MAX_REL_ERROR).then_some(max_rel)
+}
+
+fn random_candidates(
+    geometry: conv::TacticGeometry,
+    limits: conv::TacticLimits,
+) -> Vec<conv::Tactic> {
+    let mut candidates = conv::reduced_exhaustive_space()
+        .into_iter()
+        .filter(|&tactic| tactic.is_viable(geometry, limits))
+        .collect::<Vec<_>>();
+    let mut state = SEARCH_RANDOM_SEED
+        ^ u64::from(geometry.pixels)
+        ^ (u64::from(geometry.c_out) << 21)
+        ^ (u64::from(geometry.kdepth) << 42);
+    for index in (1..candidates.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        candidates.swap(index, (state as usize) % (index + 1));
+    }
+    candidates.truncate(conv::focused_search_space().len());
+    candidates
+}
+
+fn tactic_pipeline(
+    pipelines: &BTreeMap<conv::Tactic, ComputePipeline>,
+    tactic: conv::Tactic,
+) -> Result<&ComputePipeline, Err> {
+    pipelines
+        .get(&normalized_pipeline_tactic(tactic))
+        .ok_or_else(|| format!("missing pipeline for {tactic:?}").into())
+}
+
+fn measure_candidate(
+    ctx: &VkContext,
+    prepared: &PreparedShape,
+    pipelines: &BTreeMap<conv::Tactic, ComputePipeline>,
+    reduce: &ComputePipeline,
+    tactic: conv::Tactic,
+    reference: &[f32],
+) -> Result<Option<CandidateMeasurement>, Err> {
+    let pipeline = tactic_pipeline(pipelines, tactic)?;
+    prepared.execute(ctx, pipeline, reduce, tactic)?;
+    let output = prepared.output(ctx)?;
+    let Some(max_rel) = compare(reference, &output) else {
+        return Ok(None);
+    };
+    let samples = prepared.timestamp_samples(ctx, pipeline, reduce, tactic)?;
+    Ok(Some(CandidateMeasurement {
+        ms: median_ns(samples) as f64 / 1.0e6,
+        max_rel,
+    }))
+}
+
+fn best_of(
+    candidates: &[conv::Tactic],
+    measurements: &BTreeMap<conv::Tactic, Option<CandidateMeasurement>>,
+) -> Option<(conv::Tactic, CandidateMeasurement)> {
+    candidates
+        .iter()
+        .filter_map(|tactic| {
+            measurements
+                .get(tactic)
+                .and_then(|m| m.map(|m| (*tactic, m)))
+        })
+        .min_by(|a, b| a.1.ms.total_cmp(&b.1.ms))
+}
+
+fn interleaved_pair(
+    ctx: &VkContext,
+    prepared: &PreparedShape,
+    pipelines: &BTreeMap<conv::Tactic, ComputePipeline>,
+    reduce: &ComputePipeline,
+    control: conv::Tactic,
+    winner: conv::Tactic,
+) -> Result<(f64, f64), Err> {
+    if control == winner {
+        let samples = prepared.timestamp_samples(
+            ctx,
+            tactic_pipeline(pipelines, control)?,
+            reduce,
+            control,
+        )?;
+        let ms = median_ns(samples) as f64 / 1.0e6;
+        return Ok((ms, ms));
+    }
+    let mut control_samples = Vec::new();
+    let mut winner_samples = Vec::new();
+    for round in 0..3 {
+        let pair = if round % 2 == 0 {
+            [
+                (control, &mut control_samples),
+                (winner, &mut winner_samples),
+            ]
+        } else {
+            [
+                (winner, &mut winner_samples),
+                (control, &mut control_samples),
+            ]
+        };
+        for (tactic, samples) in pair {
+            samples.extend(prepared.timestamp_samples(
+                ctx,
+                tactic_pipeline(pipelines, tactic)?,
+                reduce,
+                tactic,
+            )?);
+        }
+    }
+    Ok((
+        median_ns(control_samples) as f64 / 1.0e6,
+        median_ns(winner_samples) as f64 / 1.0e6,
+    ))
+}
+
+fn search_candidates(ctx: &VkContext) -> Result<(), Err> {
+    let limits = conv::TacticLimits::from_vulkan(
+        ctx.compute_limits(),
+        ctx.compute_limits().max_storage_buffer_bytes,
+    );
+    let all_geometries = MODELS
+        .iter()
+        .flat_map(|(_, shapes, _)| *shapes)
+        .map(|shape| {
+            let pixels = shape.h_out * shape.h_out;
+            conv::TacticGeometry {
+                batch: 1,
+                group: 1,
+                pixels: pixels as u32,
+                c_out: shape.c_out as u32,
+                kdepth: (shape.c_in * shape.k * shape.k) as u32,
+                total: (pixels * shape.c_out) as u64,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut pipeline_tactics = BTreeSet::new();
+    for tactic in conv::reduced_exhaustive_space() {
+        if all_geometries
+            .iter()
+            .any(|&geometry| tactic.is_viable(geometry, limits))
+        {
+            pipeline_tactics.insert(normalized_pipeline_tactic(tactic));
+        }
+    }
+    for geometry in &all_geometries {
+        pipeline_tactics.insert(normalized_pipeline_tactic(conv::control_tactic(
+            1,
+            geometry.pixels as usize,
+            geometry.c_out as usize,
+            geometry.kdepth as usize,
+        )));
+    }
+    let mut pipelines = BTreeMap::new();
+    for tactic in pipeline_tactics {
+        let source = conv::generated_source(tactic)
+            .ok_or_else(|| format!("no generated source for {tactic:?}"))?;
+        pipelines.insert(
+            tactic,
+            ctx.create_pipeline(&compile_wgsl(&source)?, conv::BINDINGS, conv::PUSH_BYTES)?,
+        );
+    }
+    let reduce = ctx.create_pipeline(
+        &compile_wgsl(conv::SPLIT_REDUCE)?,
+        conv::SPLIT_REDUCE_BINDINGS,
+        conv::PUSH_BYTES,
+    )?;
+
+    for (model, shapes, _) in MODELS {
+        let mut control_total = 0.0;
+        let mut focus_total = 0.0;
+        let mut random_total = 0.0;
+        let mut proposed_total = 0.0;
+        let mut focus_wins = 0usize;
+        let mut random_wins = 0usize;
+        let mut proposed_wins = 0usize;
+        for shape in *shapes {
+            let prepared = PreparedShape::new(ctx, shape)?;
+            let geometry = prepared.geometry;
+            let control = conv::control_tactic(
+                1,
+                geometry.pixels as usize,
+                geometry.c_out as usize,
+                geometry.kdepth as usize,
+            );
+            let control_pipeline = tactic_pipeline(&pipelines, control)?;
+            prepared.execute(ctx, control_pipeline, &reduce, control)?;
+            let reference = prepared.output(ctx)?;
+
+            let mut focused = conv::focused_search_space()
+                .into_iter()
+                .filter(|&tactic| tactic.is_viable(geometry, limits))
+                .collect::<Vec<_>>();
+            if !focused.contains(&control) {
+                focused.push(control);
+            }
+            let proposed = conv::tuned_tactic(
+                1,
+                geometry.pixels as usize,
+                geometry.c_out as usize,
+                geometry.kdepth as usize,
+            );
+            if !focused.contains(&proposed) {
+                focused.push(proposed);
+            }
+            let mut random = random_candidates(geometry, limits);
+            if !random.contains(&control) {
+                random.push(control);
+            }
+            let union = focused
+                .iter()
+                .chain(&random)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let mut measurements = BTreeMap::new();
+            for tactic in union {
+                measurements.insert(
+                    tactic,
+                    measure_candidate(ctx, &prepared, &pipelines, &reduce, tactic, &reference)?,
+                );
+            }
+            let control_measurement = measurements
+                .get(&control)
+                .and_then(|measurement| *measurement)
+                .ok_or_else(|| format!("control rejected for {geometry:?}"))?;
+            let (focus_tactic, focus_measurement) =
+                best_of(&focused, &measurements).ok_or("focused search found no valid tactic")?;
+            let (random_tactic, random_measurement) =
+                best_of(&random, &measurements).ok_or("random search found no valid tactic")?;
+            let (control_interleaved, focus_interleaved) =
+                interleaved_pair(ctx, &prepared, &pipelines, &reduce, control, focus_tactic)?;
+            let (proposed_control_ms, proposed_ms) =
+                interleaved_pair(ctx, &prepared, &pipelines, &reduce, control, proposed)?;
+            focus_wins += usize::from(focus_interleaved < control_interleaved);
+            random_wins += usize::from(random_measurement.ms < control_measurement.ms);
+            proposed_wins += usize::from(proposed_ms < proposed_control_ms);
+            let count = shape.count as f64;
+            control_total += control_interleaved * count;
+            focus_total += focus_interleaved * count;
+            random_total += random_measurement.ms * count;
+            proposed_total += proposed_ms * count;
+            println!(
+                "{{\"kind\":\"conv_search_geometry\",\"model\":\"{model}\",\"c_in\":{},\"c_out\":{},\"kernel\":{},\"pixels\":{},\"count\":{},\"focused_candidates\":{},\"random_candidates\":{},\"control\":\"{control:?}\",\"focused_winner\":\"{focus_tactic:?}\",\"random_winner\":\"{random_tactic:?}\",\"proposed\":\"{proposed:?}\",\"control_ms\":{control_interleaved:.9},\"focused_ms\":{focus_interleaved:.9},\"random_ms\":{:.9},\"proposed_control_ms\":{proposed_control_ms:.9},\"proposed_ms\":{proposed_ms:.9},\"focused_max_rel\":{:.9},\"random_max_rel\":{:.9}}}",
+                shape.c_in,
+                shape.c_out,
+                shape.k,
+                geometry.pixels,
+                shape.count,
+                focused.len(),
+                random.len(),
+                random_measurement.ms,
+                focus_measurement.max_rel,
+                random_measurement.max_rel,
+            );
+            prepared.destroy(ctx);
+        }
+        println!(
+            "{{\"kind\":\"conv_search_model\",\"model\":\"{model}\",\"geometries\":{},\"focused_strict_wins\":{focus_wins},\"random_strict_wins\":{random_wins},\"proposed_strict_wins\":{proposed_wins},\"control_ms\":{control_total:.9},\"focused_ms\":{focus_total:.9},\"random_ms\":{random_total:.9},\"proposed_ms\":{proposed_total:.9},\"focused_speedup\":{:.9},\"random_speedup\":{:.9},\"proposed_speedup\":{:.9}}}",
+            shapes.len(),
+            control_total / focus_total,
+            control_total / random_total,
+            control_total / proposed_total,
+        );
+    }
+
+    ctx.destroy_pipeline(reduce);
+    for (_, pipeline) in pipelines {
+        ctx.destroy_pipeline(pipeline);
     }
     Ok(())
 }

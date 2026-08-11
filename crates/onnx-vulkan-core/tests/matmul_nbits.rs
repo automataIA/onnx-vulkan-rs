@@ -197,12 +197,13 @@ fn a_partial_last_block_is_not_read_past_k() {
     });
 }
 
-/// `N` above `shaders::matmul_nbits::DECODE_MIN_N` routes a decode step to the
-/// wide-column kernel — 16 columns per workgroup instead of one — and this is
-/// what says the two agree. Its own reduction and column mapping are different,
-/// so nothing about the small-`N` cases above covers it.
+/// `N` above `shaders::matmul_nbits::WIDE_MIN_N` routes a decode step to the
+/// wide-column kernel — 64 columns per workgroup instead of one, whole blocks
+/// read as `vec4<u32>` and unpacked with four accumulators — and this is what
+/// says the two agree. Its reduction and its mapping from threads to columns are
+/// both different, so nothing about the small-`N` cases above covers it.
 #[test]
-fn a_wide_decode_step_takes_the_gemv_kernel() {
+fn a_wide_decode_step_takes_the_wide_kernel() {
     run_case(Case {
         m: 1,
         k: 128,
@@ -211,11 +212,11 @@ fn a_wide_decode_step_takes_the_gemv_kernel() {
     });
 }
 
-/// And above `HEAD_MIN_N` it takes the unembedding kernel, which reads whole
-/// blocks as `vec4<u32>` and unpacks them with four accumulators — a third code
-/// path, with a third mapping from threads to columns.
+/// The same kernel carries the unembedding widths, where it was the only claimed
+/// form before the threshold was lowered to one. `N = 65536` is kept as a case
+/// because its grid folds over two axes.
 #[test]
-fn an_unembedding_width_takes_the_head_kernel() {
+fn an_unembedding_width_takes_the_wide_kernel() {
     run_case(Case {
         m: 1,
         k: 96,

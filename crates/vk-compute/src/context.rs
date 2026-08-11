@@ -19,6 +19,96 @@ pub struct CoopMatU8 {
     pub acc_signed: bool,
 }
 
+/// Vulkan compute limits that constrain generated kernel tactics.
+///
+/// The values are copied verbatim from `VkPhysicalDeviceLimits`; policy such
+/// as how much memory an autotuning trial may consume belongs to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ComputeLimits {
+    pub max_workgroup_count: [u32; 3],
+    pub max_workgroup_invocations: u32,
+    pub max_workgroup_size: [u32; 3],
+    pub max_shared_memory_bytes: u32,
+    pub max_storage_buffer_bytes: u64,
+}
+
+/// Exact Vulkan device identity and enabled kernel-relevant capabilities.
+///
+/// Feature identifiers are sorted and deduplicated at construction time so
+/// this value is suitable as part of an exact tuning-cache key. The raw Vulkan
+/// version integers are intentionally preserved: formatting them is a
+/// presentation concern and must not weaken cache matching.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceFingerprint {
+    name: String,
+    vendor_id: u32,
+    device_id: u32,
+    driver_version: u32,
+    api_version: u32,
+    pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+    subgroup_size: u32,
+    features: Vec<String>,
+}
+
+impl DeviceFingerprint {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        vendor_id: u32,
+        device_id: u32,
+        driver_version: u32,
+        api_version: u32,
+        pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+        subgroup_size: u32,
+        mut features: Vec<String>,
+    ) -> Self {
+        features.sort_unstable();
+        features.dedup();
+        Self {
+            name,
+            vendor_id,
+            device_id,
+            driver_version,
+            api_version,
+            pipeline_cache_uuid,
+            subgroup_size,
+            features,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn vendor_id(&self) -> u32 {
+        self.vendor_id
+    }
+
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    pub fn driver_version(&self) -> u32 {
+        self.driver_version
+    }
+
+    pub fn api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    pub fn pipeline_cache_uuid(&self) -> &[u8; vk::UUID_SIZE] {
+        &self.pipeline_cache_uuid
+    }
+
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
+    }
+
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+}
+
 pub struct VkContext {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -38,15 +128,25 @@ pub struct VkContext {
     pub subgroup_size: u32,
     pub device_name: String,
     pub vendor_id: u32,
+    device_fingerprint: DeviceFingerprint,
+    compute_limits: ComputeLimits,
     pub(crate) allocator: Mutex<Option<Allocator>>,
     /// Serializes command pool + queue submit (not thread-safe in Vulkan).
     pub(crate) submit_lock: Mutex<()>,
+    /// The one fence every `flush()` waits on, created here and reset per
+    /// submit rather than created and destroyed each time: on the NVIDIA Linux
+    /// driver that pair costs **0.358 ms**, against a 0.136 ms round trip
+    /// (`example flush_cost`). Sound because `submit_lock` serializes submits,
+    /// so at most one flush is ever waiting on it.
+    pub(crate) flush_fence: vk::Fence,
     /// Deferred command stream (see `stream.rs`).
     pub(crate) stream: Mutex<crate::stream::StreamState>,
     /// Arena of reusable descriptor pools (see `descriptor.rs`).
     pub(crate) descriptors: Mutex<crate::descriptor::DescriptorArena>,
     /// ns per GPU timestamp tick (0 = unsupported).
     pub(crate) timestamp_period: f32,
+    /// Number of meaningful low bits in queue timestamps (0 = unsupported).
+    pub(crate) timestamp_valid_bits: u32,
     /// Alignment required for storage buffer offset in a
     /// descriptor (`minStorageBufferOffsetAlignment`).
     pub storage_offset_alignment: u64,
@@ -197,7 +297,6 @@ impl VkContext {
                 None,
             )
         }?;
-
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
@@ -218,6 +317,42 @@ impl VkContext {
             props.vendor_id
         );
 
+        let flush_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .context("creating the flush fence")?;
+
+        let mut fingerprint_features = Vec::new();
+        if has_integer_dot_product {
+            fingerprint_features.push("shader_integer_dot_product".to_owned());
+        }
+        fingerprint_features.extend(coop_u8.iter().map(|config| {
+            let accumulator = if config.acc_signed {
+                "sint32"
+            } else {
+                "uint32"
+            };
+            format!(
+                "cooperative_matrix_u8:m16:n16:k{}:acc_{accumulator}",
+                config.k_tile
+            )
+        }));
+        let device_fingerprint = DeviceFingerprint::new(
+            device_name.clone(),
+            props.vendor_id,
+            props.device_id,
+            props.driver_version,
+            props.api_version,
+            props.pipeline_cache_uuid,
+            subgroup_size,
+            fingerprint_features,
+        );
+        let compute_limits = ComputeLimits {
+            max_workgroup_count: props.limits.max_compute_work_group_count,
+            max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
+            max_workgroup_size: props.limits.max_compute_work_group_size,
+            max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
+            max_storage_buffer_bytes: u64::from(props.limits.max_storage_buffer_range),
+        };
+
         Ok(Self {
             entry,
             instance,
@@ -231,8 +366,11 @@ impl VkContext {
             subgroup_size,
             device_name,
             vendor_id: props.vendor_id,
+            device_fingerprint,
+            compute_limits,
             allocator: Mutex::new(Some(allocator)),
             submit_lock: Mutex::new(()),
+            flush_fence,
             stream: Mutex::new(Default::default()),
             descriptors: Mutex::new(Default::default()),
             capture: Mutex::new(None),
@@ -243,11 +381,23 @@ impl VkContext {
             } else {
                 0.0
             },
+            timestamp_valid_bits,
             query_pool: Mutex::new(None),
             staging_pool: Mutex::new(Default::default()),
             storage_pool: Mutex::new(Default::default()),
             storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment.max(1),
         })
+    }
+
+    /// Returns the exact identity used to scope hardware tuning records.
+    pub fn device_fingerprint(&self) -> &DeviceFingerprint {
+        &self.device_fingerprint
+    }
+
+    /// Returns the limits used to reject impossible compute tactics before
+    /// shader compilation or allocation.
+    pub const fn compute_limits(&self) -> &ComputeLimits {
+        &self.compute_limits
     }
 
     /// Enumerates physical devices with compute queues: (name, vendor_id, type).
@@ -304,7 +454,10 @@ impl VkContext {
     }
 
     /// One-shot command buffer: records, submits, waits for completion.
-    pub(crate) fn run_commands(&self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+    pub(crate) fn run_commands(
+        &self,
+        record: impl FnOnce(vk::CommandBuffer) -> Result<()>,
+    ) -> Result<()> {
         let device = &self.device;
         let _guard = self.submit_lock.lock().unwrap();
         unsafe {
@@ -314,22 +467,24 @@ impl VkContext {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )?[0];
-            device.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            record(cmd);
-            device.end_command_buffer(cmd)?;
-
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cmds = [cmd];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            crate::stats::record_submit();
-            let result = device
-                .queue_submit(self.queue, &[submit], fence)
-                .and_then(|()| device.wait_for_fences(&[fence], true, u64::MAX));
-            device.destroy_fence(fence, None);
+            let result: Result<()> = (|| {
+                device.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                record(cmd)?;
+                device.end_command_buffer(cmd)?;
+
+                let fence = self.flush_fence;
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                crate::stats::record_submit();
+                device.reset_fences(&[fence])?;
+                device.queue_submit(self.queue, &[submit], fence)?;
+                device.wait_for_fences(&[fence], true, u64::MAX)?;
+                Ok(())
+            })();
             device.free_command_buffers(self.command_pool, &cmds);
             result?;
         }
@@ -341,6 +496,7 @@ impl Drop for VkContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_fence(self.flush_fence, None);
             if let Some(pool) = self.query_pool.lock().unwrap().take() {
                 self.device.destroy_query_pool(pool, None);
             }
@@ -353,5 +509,47 @@ impl Drop for VkContext {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceFingerprint;
+
+    #[test]
+    fn fingerprint_features_are_canonical() {
+        let fingerprint = DeviceFingerprint::new(
+            "device".to_owned(),
+            1,
+            2,
+            3,
+            4,
+            [5; 16],
+            32,
+            vec!["z".to_owned(), "a".to_owned(), "z".to_owned()],
+        );
+
+        assert_eq!(fingerprint.features(), ["a", "z"]);
+    }
+
+    #[test]
+    fn fingerprint_equality_is_exact() {
+        let fingerprint = || {
+            DeviceFingerprint::new(
+                "device".to_owned(),
+                1,
+                2,
+                3,
+                4,
+                [5; 16],
+                32,
+                vec!["feature".to_owned()],
+            )
+        };
+
+        let mut different_driver = fingerprint();
+        different_driver.driver_version += 1;
+        assert_eq!(fingerprint(), fingerprint());
+        assert_ne!(fingerprint(), different_driver);
     }
 }

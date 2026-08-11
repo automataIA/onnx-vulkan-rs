@@ -3,8 +3,8 @@
 #
 # Only cooperative-matrix kernels live in GLSL (naga's WGSL frontend has no
 # 8-bit scalars and only square cooperative matrix shapes). The SPIR-V is
-# committed so that neither the build nor cross-compilation needs a GLSL
-# toolchain; run this by hand after editing a .comp file.
+# committed so that the build needs no GLSL toolchain; run this by hand after
+# editing a .comp file.
 #
 # GLSLANG=/path/to/glslangValidator scripts/build-glsl.sh
 set -euo pipefail
@@ -14,12 +14,9 @@ shaders="$root/crates/onnx-vulkan-core/src/shaders"
 glslang="${GLSLANG:-}"
 
 if [[ -z "$glslang" ]]; then
-    for candidate in glslangValidator /mnt/c/VulkanSDK/*/Bin/glslangValidator.exe; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            glslang="$candidate"
-            break
-        fi
-    done
+    if command -v glslangValidator >/dev/null 2>&1; then
+        glslang=glslangValidator
+    fi
 fi
 if [[ -z "$glslang" ]]; then
     echo "glslangValidator not found; set GLSLANG=<path>" >&2

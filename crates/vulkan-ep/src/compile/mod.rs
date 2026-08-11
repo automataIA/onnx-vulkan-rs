@@ -66,9 +66,12 @@ pub fn is_fusible_node(
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VULKAN_EP_COMPILE")
+        let explicitly_enabled = std::env::var("VULKAN_EP_COMPILE")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let tuning_enabled = std::env::var("ONNX_VULKAN_TUNING_MODE")
+            .is_ok_and(|mode| !mode.is_empty() && mode != "off");
+        explicitly_enabled || tuning_enabled
     })
 }
 
@@ -109,6 +112,9 @@ unsafe fn compile_impl(
     node_compute_infos: *mut *mut sys::OrtNodeComputeInfo,
 ) -> Result<()> {
     unsafe {
+        // One artifact read and resolver for the entire ORT compile call,
+        // shared by every fused subgraph and its selection summary.
+        let tuning = onnx_vulkan_tune::runtime_resolver_from_env()?;
         let graphs = std::slice::from_raw_parts(graphs, count);
         let fused = std::slice::from_raw_parts(fused_nodes, count);
         for (i, &graph) in graphs.iter().enumerate() {
@@ -140,7 +146,7 @@ unsafe fn compile_impl(
             // `Executor::new` rejects an unimplemented node: if
             // `GetCapability` claimed something the interpreter cannot
             // execute, it is discovered here and not midway through the first inference
-            let executor = Executor::new(crate::vk::context()?, ir)?;
+            let executor = Executor::with_tuning(crate::vk::context()?, ir, tuning.clone())?;
             let boxed = Box::new(VulkanNodeComputeInfo {
                 base,
                 executor,

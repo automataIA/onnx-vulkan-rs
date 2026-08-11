@@ -227,6 +227,174 @@ impl VkContext {
         self.flush()
     }
 
+    /// Measures repeated dispatches with Vulkan timestamp queries.
+    ///
+    /// The returned vector contains one amortized GPU-duration sample per
+    /// dispatch in nanoseconds. Pending stream work is flushed first; all
+    /// measured batches then share one command buffer and one queue submission.
+    /// Each interval contains `dispatches_per_sample` dispatches and is divided
+    /// by that count, amortizing timestamp-command observer overhead while host
+    /// recording, process startup, and fence latency remain excluded.
+    pub fn measure_dispatch_gpu(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[&GpuBuffer],
+        push_constants: &[u8],
+        groups: [u32; 3],
+        sample_count: u32,
+        dispatches_per_sample: u32,
+    ) -> Result<Vec<u64>> {
+        anyhow::ensure!(
+            sample_count > 0,
+            "GPU timestamp sample count must be positive"
+        );
+        anyhow::ensure!(
+            dispatches_per_sample > 0,
+            "dispatches per GPU timestamp sample must be positive"
+        );
+        anyhow::ensure!(
+            self.timestamp_valid_bits > 0 && self.timestamp_period > 0.0,
+            "the selected Vulkan compute queue does not support timestamps"
+        );
+        anyhow::ensure!(
+            self.timestamp_valid_bits <= 64,
+            "invalid Vulkan timestampValidBits {}",
+            self.timestamp_valid_bits
+        );
+        let query_count = sample_count
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("GPU timestamp sample count overflow"))?;
+        anyhow::ensure!(
+            query_count <= crate::context::TS_CAPACITY,
+            "GPU timestamp sample count {sample_count} exceeds the limit {}",
+            crate::context::TS_CAPACITY / 2
+        );
+
+        self.flush()?;
+        let buffer_slices: Vec<BufferSlice<'_>> =
+            buffers.iter().map(|buffer| (*buffer).into()).collect();
+        // SAFETY: the device is live and the validated query count is non-zero.
+        let query_pool = unsafe {
+            self.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(query_count),
+                None,
+            )?
+        };
+        let result = (|| {
+            self.run_commands(|cmd| {
+                // SAFETY: `run_commands` supplies an actively recording command
+                // buffer, and this query pool stays alive until its fence passes.
+                unsafe {
+                    self.device
+                        .cmd_reset_query_pool(cmd, query_pool, 0, query_count);
+                }
+                for sample in 0..sample_count {
+                    let barrier = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        );
+                    // SAFETY: the command buffer is recording and the barrier
+                    // references no external memory or transient handles.
+                    unsafe {
+                        self.device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[barrier],
+                            &[],
+                            &[],
+                        );
+                        // Two independent endpoints keep the inter-dispatch
+                        // barrier outside every measured interval.
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            query_pool,
+                            sample * 2,
+                        );
+                    }
+                    for repetition in 0..dispatches_per_sample {
+                        if repetition > 0 {
+                            let barrier = vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(
+                                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                                );
+                            // SAFETY: as above, the command buffer is recording
+                            // and the barrier references no external handles.
+                            unsafe {
+                                self.device.cmd_pipeline_barrier(
+                                    cmd,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::DependencyFlags::empty(),
+                                    &[barrier],
+                                    &[],
+                                    &[],
+                                );
+                            }
+                        }
+                        self.record_dispatch(
+                            cmd,
+                            pipeline,
+                            &buffer_slices,
+                            push_constants,
+                            groups,
+                        )?;
+                    }
+                    // SAFETY: the query index is below `query_count`, and the
+                    // pool remains alive through submission and readback.
+                    unsafe {
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            query_pool,
+                            sample * 2 + 1,
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+
+            let mut timestamps = vec![0u64; query_count as usize];
+            // SAFETY: `run_commands` waited for its submission fence, so every
+            // requested query is complete and the destination slice is sized
+            // to exactly `query_count` 64-bit results.
+            unsafe {
+                self.device.get_query_pool_results(
+                    query_pool,
+                    0,
+                    &mut timestamps,
+                    vk::QueryResultFlags::TYPE_64,
+                )?;
+            }
+            timestamps
+                .chunks_exact(2)
+                .enumerate()
+                .map(|(index, pair)| {
+                    let ticks = timestamp_delta_ticks(pair[0], pair[1], self.timestamp_valid_bits);
+                    let nanoseconds = (ticks as f64 * self.timestamp_period as f64
+                        / dispatches_per_sample as f64)
+                        .round() as u64;
+                    anyhow::ensure!(
+                        nanoseconds > 0,
+                        "GPU timestamp sample {index} has zero duration"
+                    );
+                    Ok(nanoseconds)
+                })
+                .collect()
+        })();
+        self.reset_descriptors();
+        // SAFETY: the measurement submission has completed (or was never
+        // submitted), and no command buffer can still reference this pool.
+        unsafe { self.device.destroy_query_pool(query_pool, None) };
+        result
+    }
+
     pub fn destroy_pipeline(&self, pipeline: ComputePipeline) {
         unsafe {
             self.device.destroy_pipeline(pipeline.pipeline, None);
@@ -236,5 +404,26 @@ impl VkContext {
             self.device
                 .destroy_shader_module(pipeline.shader_module, None);
         }
+    }
+}
+
+pub(crate) fn timestamp_delta_ticks(start: u64, end: u64, valid_bits: u32) -> u64 {
+    let delta = end.wrapping_sub(start);
+    if valid_bits == 64 {
+        delta
+    } else {
+        delta & ((1u64 << valid_bits) - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timestamp_delta_ticks;
+
+    #[test]
+    fn timestamp_delta_handles_full_width_and_wrapping_counters() {
+        assert_eq!(timestamp_delta_ticks(10, 25, 64), 15);
+        assert_eq!(timestamp_delta_ticks(u64::MAX - 4, 3, 64), 8);
+        assert_eq!(timestamp_delta_ticks(250, 5, 8), 11);
     }
 }

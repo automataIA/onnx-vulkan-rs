@@ -161,6 +161,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "MatMul"
             | "MatMulNBits"
             | "Gather"
+            | "GatherND"
             | "GatherBlockQuantized"
             | "Slice"
             | "Where"
@@ -181,6 +182,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "And"
             | "Equal"
             | "Less"
+            | "LessOrEqual"
             | "Greater"
             | "Gelu"
             | "GatherElements"
@@ -199,8 +201,11 @@ pub fn is_implemented(op: &str) -> bool {
             | "ReduceMax"
             | "ReduceMin"
             | "ArgMax"
+            | "ArgMin"
             | "Flatten"
             | "LeakyRelu"
+            | "Elu"
+            | "IsNaN"
             | "CumSum"
             | "GridSample"
             | "Gemm"
@@ -430,7 +435,8 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         // `select_last_index = 1` reverses the tie-break, and the kernel keeps
         // the first occurrence; a graph that asks for the last one is refused
         // rather than answered with the other index
-        "ArgMax" => int_attr("select_last_index", 0) == 0,
+        "ArgMax" | "ArgMin" => int_attr("select_last_index", 0) == 0,
+        "GatherND" => int_attr("batch_dims", 0) == 0,
         "GridSample" => {
             string_attr("mode", "bilinear") == "bilinear"
                 && matches!(
@@ -876,6 +882,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "MatMul" => matmul_fp32(env, node),
         "MatMulNBits" => matmul_nbits(env, node),
         "Gather" => gather(env, node),
+        "GatherND" => gather_nd(env, node),
         "GatherBlockQuantized" => gather_block_quantized(env, node),
         "Slice" => slice(env, node),
         "Where" => where_op(env, node),
@@ -896,6 +903,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "And" => host_cmp(env, node, host_ops::CmpOp::And),
         "Equal" => host_cmp(env, node, host_ops::CmpOp::Equal),
         "Less" => host_cmp(env, node, host_ops::CmpOp::Less),
+        "LessOrEqual" => host_cmp(env, node, host_ops::CmpOp::LessOrEqual),
         "Greater" => host_cmp(env, node, host_ops::CmpOp::Greater),
         "GatherElements" => gather_elements(env, node),
         "ScatterND" => scatter_nd(env, node),
@@ -914,8 +922,11 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "ReduceMax" => reduce(env, node, ReduceKind::Max),
         "ReduceMin" => reduce(env, node, ReduceKind::Min),
         "ArgMax" => argmax(env, node),
+        "ArgMin" => argmin(env, node),
         "Flatten" => flatten(env, node),
         "LeakyRelu" => leaky_relu(env, node),
+        "Elu" => elu(env, node),
+        "IsNaN" => host_unary(env, node, host_ops::is_nan),
         "CumSum" => cumsum(env, node),
         "Gemm" => gemm(env, node),
         "Resize" => resize(env, node),
@@ -1083,6 +1094,23 @@ fn leaky_relu(env: &mut Env, node: &NodeIr) -> Result<()> {
         node,
         "LeakyRelu",
         &format!("select({alpha:?} * v, v, v >= 0.0)"),
+    )
+}
+
+/// ONNX `Elu`: positive values pass through, negative values use
+/// `alpha * (exp(x) - 1)`. Qwen3-TTS exports the default alpha, but preserving
+/// the attribute keeps the implementation schema-correct.
+fn elu(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let alpha = node
+        .attrs
+        .get("alpha")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or(1.0);
+    unary(
+        env,
+        node,
+        "Elu",
+        &format!("select({alpha:?} * (exp(v) - 1.0), v, v >= 0.0)"),
     )
 }
 
@@ -2125,6 +2153,24 @@ fn gather_elements(env: &mut Env, node: &NodeIr) -> Result<()> {
         .and_then(AttrValue::as_i64)
         .unwrap_or(0);
     let out = host_ops::gather_elements(&data, &indices, axis)?;
+    env.set(&node.outputs[0], Tensor::Host(out));
+    Ok(())
+}
+
+/// `GatherND` emitted by the codec uses the standard `batch_dims = 0` form.
+fn gather_nd(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let batch_dims = node
+        .attrs
+        .get("batch_dims")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0);
+    ensure!(
+        batch_dims == 0,
+        "GatherND: batch_dims={batch_dims} is not supported"
+    );
+    let data = env.host(&node.inputs[0])?;
+    let indices = env.host(&node.inputs[1])?;
+    let out = host_ops::gather_nd(&data, &indices)?;
     env.set(&node.outputs[0], Tensor::Host(out));
     Ok(())
 }
@@ -6004,6 +6050,14 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
 /// that ends in `ArgMax` gets the same kernel a generation loop asks for through
 /// [`argmax_of`].
 fn argmax(env: &mut Env, node: &NodeIr) -> Result<()> {
+    arg_extreme(env, node, false)
+}
+
+fn argmin(env: &mut Env, node: &NodeIr) -> Result<()> {
+    arg_extreme(env, node, true)
+}
+
+fn arg_extreme(env: &mut Env, node: &NodeIr, minimum: bool) -> Result<()> {
     let x_name = node.inputs[0].clone();
     let x_shape = env.shape_of(&x_name)?;
     let rank = x_shape.len() as i64;
@@ -6015,7 +6069,8 @@ fn argmax(env: &mut Env, node: &NodeIr) -> Result<()> {
     let axis = if raw < 0 { raw + rank } else { raw };
     ensure!(
         (0..rank).contains(&axis),
-        "ArgMax: axis {axis} out of rank {rank}"
+        "{}: axis {axis} out of rank {rank}",
+        if minimum { "ArgMin" } else { "ArgMax" }
     );
     let keepdims = node
         .attrs
@@ -6023,7 +6078,7 @@ fn argmax(env: &mut Env, node: &NodeIr) -> Result<()> {
         .and_then(AttrValue::as_i64)
         .unwrap_or(1)
         != 0;
-    let out = argmax_axis(env, &x_name, axis as usize, keepdims)?;
+    let out = arg_extreme_axis(env, &x_name, axis as usize, keepdims, minimum)?;
     env.set(&node.outputs[0], out);
     Ok(())
 }
@@ -6042,7 +6097,7 @@ pub fn argmax_of(env: &mut Env<'_, '_>, name: &str) -> crate::Result<Vec<i64>> {
 fn argmax_last_axis(env: &mut Env<'_, '_>, name: &str) -> Result<Vec<i64>> {
     let shape = env.shape_of(name)?;
     ensure!(!shape.is_empty(), "{name} is a scalar: it has no axis");
-    let out = argmax_axis(env, name, shape.len() - 1, false)?;
+    let out = arg_extreme_axis(env, name, shape.len() - 1, false, false)?;
     let key = format!("{name}#argmax");
     env.set(&key, out);
     Ok(env.host(&key)?.to_i64()?)
@@ -6053,11 +6108,12 @@ fn argmax_last_axis(env: &mut Env<'_, '_>, name: &str) -> Result<Vec<i64>> {
 /// The input must be f32 on the device. A non-f32 axis (an int64 mask, say) goes
 /// host-side, like the value reductions: the support check looks at the node and
 /// cannot see the dtype, so every dtype needs a path that works.
-fn argmax_axis(
+fn arg_extreme_axis(
     env: &mut Env,
     x_name: &str,
     axis: usize,
     keepdims: bool,
+    minimum: bool,
 ) -> Result<Tensor<'static>> {
     let x_shape = env.shape_of(x_name)?;
     let c = x_shape[axis].max(0) as usize;
@@ -6076,11 +6132,16 @@ fn argmax_axis(
         for r in 0..rows {
             let j = r % inner;
             let base = (r / inner) * c * inner + j;
-            let mut best = f32::NEG_INFINITY;
+            let mut best = if minimum {
+                f32::INFINITY
+            } else {
+                f32::NEG_INFINITY
+            };
             let mut at = 0i64;
             for k in 0..c {
-                if x[base + k * inner] > best {
-                    best = x[base + k * inner];
+                let candidate = x[base + k * inner];
+                if (minimum && candidate < best) || (!minimum && candidate > best) {
+                    best = candidate;
                     at = k as i64;
                 }
             }
@@ -6110,12 +6171,38 @@ fn argmax_axis(
         for v in [c as u32, inner as u32, rows as u32, splits as u32, stride] {
             push.extend_from_slice(&v.to_le_bytes());
         }
+        let partial_source = if minimum {
+            ARGMAX_PARTIAL
+                .replace("-3.4028235e38", "3.4028235e38")
+                .replace("v > bv", "v < bv")
+                .replace("sv[o] > sv[lid.x]", "sv[o] < sv[lid.x]")
+        } else {
+            ARGMAX_PARTIAL.to_string()
+        };
+        let final_source = if minimum {
+            ARGMAX_FINAL
+                .replace("-3.4028235e38", "3.4028235e38")
+                .replace("v > bv", "v < bv")
+                .replace("sv[o] > sv[lid.x]", "sv[o] < sv[lid.x]")
+        } else {
+            ARGMAX_FINAL.to_string()
+        };
+        let partial_key = if minimum {
+            "ArgMin_partial"
+        } else {
+            "ArgMax_partial"
+        };
+        let final_key = if minimum {
+            "ArgMin_final"
+        } else {
+            "ArgMax_final"
+        };
         with_pipeline(
             env.cache(),
-            "ArgMax_partial",
+            partial_key,
             || {
                 ctx.create_pipeline(
-                    &compile_wgsl(ARGMAX_PARTIAL)?,
+                    &compile_wgsl(&partial_source)?,
                     ARGMAX_BINDINGS,
                     ARGMAX_PARTIAL_PUSH_BYTES,
                 )
@@ -6130,10 +6217,10 @@ fn argmax_axis(
         }
         with_pipeline(
             env.cache(),
-            "ArgMax_final",
+            final_key,
             || {
                 ctx.create_pipeline(
-                    &compile_wgsl(ARGMAX_FINAL)?,
+                    &compile_wgsl(&final_source)?,
                     ARGMAX_BINDINGS,
                     ARGMAX_FINAL_PUSH_BYTES,
                 )

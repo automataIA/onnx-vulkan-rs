@@ -133,7 +133,7 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         // `rotary_embedding_dim` are a copy
         "RotaryEmbedding" => 3 * out_elems()?,
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceL2" | "ArgMax"
-        | "GlobalAveragePool" | "MaxPool" | "AveragePool" => in_elems()?,
+        | "ArgMin" | "GlobalAveragePool" | "MaxPool" | "AveragePool" => in_elems()?,
         "Add"
         | "Sub"
         | "Mul"
@@ -146,6 +146,7 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         | "Sigmoid"
         | "Relu"
         | "LeakyRelu"
+        | "Elu"
         | "Clip"
         | "Tanh"
         | "Gelu"
@@ -157,12 +158,13 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         | "Equal"
         | "Greater"
         | "Less"
+        | "LessOrEqual"
         | "QuantizeLinear"
         | "DequantizeLinear"
         | "DynamicQuantizeLinear" => out_elems()?,
         // pure movement: no arithmetic, but the traffic is real
         "Reshape" | "Squeeze" | "Unsqueeze" | "Transpose" | "Concat" | "Slice" | "Gather"
-        | "Cast" | "Identity" | "Pad" | "Expand" | "Split" | "Resize" | "Tile" => 0,
+        | "GatherND" | "Cast" | "Identity" | "Pad" | "Expand" | "Split" | "Resize" | "Tile" => 0,
         _ => return None,
     };
     Some(Work { flops, bytes })

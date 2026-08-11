@@ -355,6 +355,7 @@ fn bc_offset(out_strides: &[u32], strides: &[u32], i: usize) -> usize {
 pub enum CmpOp {
     Equal,
     Less,
+    LessOrEqual,
     Greater,
     And,
 }
@@ -372,6 +373,7 @@ pub fn compare(a: &HostTensor, b: &HostTensor, op: CmpOp) -> Result<HostTensor> 
             *o = match op {
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
+                CmpOp::LessOrEqual => x <= y,
                 CmpOp::Greater => x > y,
                 CmpOp::And => x != 0 && y != 0,
             } as u8;
@@ -384,6 +386,7 @@ pub fn compare(a: &HostTensor, b: &HostTensor, op: CmpOp) -> Result<HostTensor> 
             *o = match op {
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
+                CmpOp::LessOrEqual => x <= y,
                 CmpOp::Greater => x > y,
                 CmpOp::And => x != 0.0 && y != 0.0,
             } as u8;
@@ -793,6 +796,75 @@ pub fn gather(data: &HostTensor, indices: &HostTensor, axis: i64) -> Result<Host
         out[o * es..(o + 1) * es].copy_from_slice(&data.data[src * es..(src + 1) * es]);
     }
     Ok(HostTensor::new(data.dtype, out_shape, out))
+}
+
+/// `GatherND` without `batch_dims`: each row in the last index dimension
+/// addresses a prefix of `data`; the remaining dimensions form the copied
+/// slice. This is the form emitted by the Qwen3-TTS codec.
+pub fn gather_nd(data: &HostTensor, indices: &HostTensor) -> Result<HostTensor> {
+    data.validate()?;
+    indices.validate()?;
+    ensure!(
+        !indices.shape.is_empty(),
+        "GatherND: indices must have rank >= 1"
+    );
+    let es = elem_size(data.dtype);
+    ensure!(es > 0, "GatherND: dtype {} with no size", data.dtype);
+    let k = *indices.shape.last().unwrap_or(&0);
+    ensure!(k >= 1, "GatherND: last indices dimension must be positive");
+    let k = k as usize;
+    ensure!(
+        k <= data.shape.len(),
+        "GatherND: {k} coordinates for rank {} data",
+        data.shape.len()
+    );
+
+    let tuples: usize = indices.shape[..indices.shape.len() - 1]
+        .iter()
+        .product::<i64>()
+        .max(0) as usize;
+    let slice_len: usize = data.shape[k..].iter().product::<i64>().max(1) as usize;
+    let strides = row_major_strides(&data.shape);
+    let idx = indices.to_i64()?;
+    ensure!(idx.len() == tuples * k, "GatherND: invalid indices storage");
+
+    let mut out_shape = indices.shape[..indices.shape.len() - 1].to_vec();
+    out_shape.extend_from_slice(&data.shape[k..]);
+    let mut out = vec![0u8; tuples * slice_len * es];
+    for tuple in 0..tuples {
+        let mut base = 0i64;
+        for axis in 0..k {
+            let mut coordinate = idx[tuple * k + axis];
+            if coordinate < 0 {
+                coordinate += data.shape[axis];
+            }
+            ensure!(
+                (0..data.shape[axis]).contains(&coordinate),
+                "GatherND: index {coordinate} out of range on axis {axis}"
+            );
+            base += coordinate * strides[axis];
+        }
+        let src = base as usize * es;
+        let dst = tuple * slice_len * es;
+        let bytes = slice_len * es;
+        out[dst..dst + bytes].copy_from_slice(&data.data[src..src + bytes]);
+    }
+    Ok(HostTensor::new(data.dtype, out_shape, out))
+}
+
+/// IEEE-754 NaN classification used by ONNX `IsNaN`.
+pub fn is_nan(input: &HostTensor) -> Result<HostTensor> {
+    ensure!(
+        input.dtype == FLOAT,
+        "IsNaN: expected float32, got {}",
+        input.dtype
+    );
+    let out = input
+        .to_f32()?
+        .into_iter()
+        .map(|value| value.is_nan() as u8)
+        .collect();
+    Ok(HostTensor::new(BOOL, input.shape.clone(), out))
 }
 
 /// `GatherElements` along `axis`: `out[i][j][k] = data[i][idx[i][j][k]][k]` for

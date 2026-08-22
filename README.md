@@ -21,7 +21,7 @@ TDT 0.6B v3 (int8 ONNX)**.
 
 ONNX Runtime has no official Vulkan EP: this project implements one out-of-tree
 using the [Plugin EP API](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries/usage.html)
-(ORT ≥ 1.23, pinned here to **1.27.1**). The long-term target is the standalone
+(ORT ≥ 1.23, pinned here to **1.29.0**). The long-term target is the standalone
 library (`plan.md`); the plugin is how the kernels get validated against a real
 runtime on real models.
 
@@ -77,7 +77,7 @@ Prerequisites: Rust ≥1.85, clang (for bindgen), Vulkan driver/loader
 (`libvulkan1`; on Linux without a GPU: `mesa-vulkan-drivers` for lavapipe).
 
 ```bash
-./scripts/fetch-deps.sh   # ORT 1.27.1 (linux-x64) + Parakeet model (~700MB)
+./scripts/fetch-deps.sh   # ORT 1.29.0 (linux-x64) + Parakeet model (~700MB)
 cargo build --release
 cargo test -- --test-threads=1    # Vulkan kernel + core tests (run on lavapipe too)
 cargo clippy --workspace -- -D warnings
@@ -165,24 +165,31 @@ can trust.
 
 ## Performance
 
-RTX 4070, driver 595.84, Pop!_OS 24.04, batch 1, `runs/popos-3`.
+RTX 4070, driver 595.84, Pop!_OS 24.04, batch 1, ORT 1.29.0. Every cell is the
+**median of three back-to-back full matrix runs** (`runs/ort129{,-b,-c}`).
 Ratio is against the ORT **CPU EP (MLAS)** on the same graph. `GPU` is the
 profiler's compute time, i.e. the part of the wall that is actually shaders.
 
 | model | wall | CPU EP | ratio | GPU | blocks | flush | GPU Pareto head |
 |---|---|---|---|---|---|---|---|
-| parakeet (encoder) | 39.4 ms | 314.3 ms | **7.98×** | 31.0 | 1 | 7 | `MMI_matmul_coop_k32` 58% |
-| rfdetr | 38.7 ms | 260.1 ms | **6.72×** | 34.0 | 1 | 9 | `MatMul` 60% |
-| yolov4 | 33.7 ms | 123.4 ms | **3.66×** | 19.6 | 1 | 4 | `Conv_split` 55% |
-| yolov8n | 6.5 ms | 22.1 ms | **3.40×** | 4.9 | 1 | 2 | `Conv_split` 41% |
-| roberta seq 1 | 3.3 ms | 9.4 ms | **2.85×** | 2.2 | 1 | 4 | `GEMV` 46% |
-| roberta seq 128 | 17.7 ms | 40.9 ms | **2.31×** | 16.2 | 1 | 4 | `MatMul` 88% |
-| qwen2.5-VL decoder (int4) | 28.5 ms | 57.6 ms | **2.02×** | 12.1 | 1 | 77 | `MatMulNBits_wide` 37% |
-| gemma3-1b (int4) | 17.3 ms | 18.9 ms | **1.09×** | 6.0 | 1 | 57 | `MatMulNBits` 29% |
-| resnet50-int8 | 3.4 ms | 3.6 ms | **1.06×** | 2.4 | 1 | 2 | `ConvInteger_coop` 40% |
-| resnet50-qdq | 4.7 ms | 4.9 ms | **1.04×** | 3.9 | 1 | 2 | `Conv_split` 61% |
-| mobilenetv2 | 1.5 ms | 1.2 ms | 0.80× | 1.1 | 1 | 2 | `Conv` 29% |
-| mobilenetv2-int8 | 1.8 ms | 0.7 ms | 0.39× | 0.9 | 1 | 2 | `Requantize` 29% |
+| parakeet (encoder) | 43.3 ms | 343.8 ms | **7.94×** | 32.8 | 1 | 7 | `MMI_matmul_coop_k32` 59% |
+| rfdetr | 40.9 ms | 306.8 ms | **7.50×** | 34.7 | 1 | 9 | `MatMul` 61% |
+| yolov4 | 35.5 ms | 176.8 ms | **4.98×** | 19.1 | 1 | 4 | `Conv_split` 54% |
+| yolov8n | 7.1 ms | 29.9 ms | **4.21×** | 4.8 | 1 | 2 | `Conv_split` 41% |
+| roberta seq 1 | 3.5 ms | 13.3 ms | **3.80×** | 2.2 | 1 | 4 | `GEMV` 46% |
+| qwen2.5-VL decoder (int4) | 29.2 ms | 85.4 ms | **2.92×** | 12.7 | 1 | 77 | `MatMulNBits_wide` 37% |
+| roberta seq 128 | 19.5 ms | 55.0 ms | **2.82×** | 17.1 | 1 | 4 | `MatMul` 89% |
+| resnet50-int8 | 3.3 ms | 6.7 ms | **2.03×** | 2.4 | 1 | 2 | `ConvInteger_coop` 35% |
+| resnet50-qdq | 5.1 ms | 9.0 ms | **1.76×** | 3.6 | 1 | 2 | `Conv_split` 62% |
+| gemma3-1b (int4) | 16.4 ms | 27.1 ms | **1.65×** | 6.5 | 1 | 57 | `MatMulNBits` 29% |
+| mobilenetv2 | 1.7 ms | 1.3 ms | 0.76× | 1.1 | 1 | 2 | `Conv` 21% |
+| mobilenetv2-int8 | 1.8 ms | 0.8 ms | 0.44× | 0.9 | 1 | 2 | `Requantize` 30% |
+
+**These ratios are not comparable with the ORT 1.27.1 table they replace.** Our
+walls are 3–8% higher and our GPU compute moved with them (parakeet 30.95 →
+32.84 with no kernel touched), i.e. the host is slightly slower today; the CPU
+EP reference moved much more, and upward (yolov4 123.4 → 176.8, roberta seq 1
+9.4 → 13.3). The improved ratios are ORT's CPU path, not our kernels.
 
 Correctness in the same run: `sync-check.sh` reports **12/12 models clean**
 under the Khronos synchronization-validation layer, both int8 classifiers are
@@ -224,15 +231,17 @@ Read honestly:
 - **The two models that used to be below 1× no longer are**, and neither was
   fixed by a bigger tile. roberta at `seq_len = 1` (0.76×) is a GEMV: 768 useful
   threads on a card that holds 70,656, so the fix was splitting `K` to
-  manufacture workgroups — now 2.85×, at 500–515 GB/s against the card's ~504,
+  manufacture workgroups — now 3.80×, at 500–515 GB/s against the card's ~504,
   which means that lever is spent rather than merely pulled. resnet50-qdq
-  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.04× against a
-  reference that reads 4.9 ms today and 7.0 ms a run ago. Full attribution in
-  `docs/resnet50-gap.md`.
+  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.76×, against a
+  reference so unstable it reads 13.4 / 7.1 / 9.0 ms across three consecutive
+  runs. Full attribution in `docs/resnet50-gap.md`.
 - **Ratios move because the reference moves, and this table is mostly ratios.**
-  The MLAS baseline drifted 4.5 → 6.2 ms on the same binary across consecutive
-  runs; between the two runs behind this table it moved up to 20% (gemma 21.8 →
-  18.9, roberta 7.8 → 9.4) while our own walls moved by tenths. Compare
+  Across the three runs behind this table it swung by **1.9×** on the same
+  binary (resnet50-qdq 13.4 / 7.1 / 9.0 ms, roberta seq 1 13.4 / 9.9 / 13.3)
+  while our own walls repeated to a tenth (yolov8n 7.1 / 7.1 / 7.1) — which is
+  why every cell above is a median of three and no single run is quotable for
+  the small models. Compare
   milliseconds, and treat `blocks` / `flushes` / `MB transferred` — which are
   deterministic — as the primary metric.
 - **lavapipe numbers mean nothing for performance**; the suite marks those runs

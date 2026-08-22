@@ -29,7 +29,11 @@ DEFAULT_MANIFEST = ROOT / "tests" / "models.toml"
 # `standalone` is the odd one: it adds a third backend to the comparison — the
 # `onnx-vulkan` facade, driven in the same process as ORT and the EP, so all
 # three see the same generated tensors (`plan.md` §9.5 P1).
-MODES = ("cpu", "registry", "compile", "standalone")
+#
+# `webgpu` adds a fourth, the same way and for the same reason: ORT's standalone
+# WebGPU plugin EP, which on Linux runs on Dawn → Vulkan. It is an **external
+# reference**, not a gated row — see the wall-gate exemption in `report.py`.
+MODES = ("cpu", "registry", "compile", "standalone", "webgpu")
 SEP = "\x1f"  # field separator: non-whitespace, so empty fields are preserved
 
 JOB_FIELDS = (
@@ -76,8 +80,11 @@ def job_rows(model: dict, mode: str, iters: int | None) -> dict:
         "iters": str(iters if iters else model.get("iters", 1)),
         "path": model.get("path", ""),
         "args": json.dumps(model.get("args", [])),
-        # the VULKAN_EP_STATS=1 pass makes no sense without the plugin
-        "stats": "0" if mode == "cpu" else ("1" if model.get("stats", True) else "0"),
+        # the VULKAN_EP_STATS=1 pass makes no sense without the plugin, and in
+        # `webgpu` mode the number under test is not ours to profile
+        "stats": (
+            "0" if mode in ("cpu", "webgpu") else ("1" if model.get("stats", True) else "0")
+        ),
         "validate": model.get("validate", "outputs"),
         "expect": model.get("expect", ""),
         "instrument": json.dumps(model["instrument"]) if "instrument" in model else "",
@@ -104,6 +111,14 @@ def job_rows(model: dict, mode: str, iters: int | None) -> dict:
     elif mode == "standalone" and not model.get("standalone", True):
         row["status"] = "skip"
         row["reason"] = model.get("standalone_reason", "excluded from standalone parity")
+    elif mode == "webgpu" and row["runner"] != "model-runner":
+        # same reason as `standalone`: only model-runner drives more than one
+        # backend over one set of inputs
+        row["status"] = "skip"
+        row["reason"] = "webgpu comparison needs model-runner"
+    elif mode == "webgpu" and not model.get("webgpu", True):
+        row["status"] = "skip"
+        row["reason"] = model.get("webgpu_reason", "excluded from the webgpu comparison")
     return row
 
 

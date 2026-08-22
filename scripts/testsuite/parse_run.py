@@ -55,6 +55,20 @@ RE_PARITY_ROW = re.compile(
     r"relative=([\d.e+-]+)\s+beyond tolerance: (\d+)"
 )
 
+# --- external reference backend (`--webgpu`) --------------------------------
+# ORT's standalone WebGPU plugin EP, run in the same process on the same inputs.
+# It is a reference, not a gated path: `report.py` exempts this mode from the
+# wall gate, because its performance is not ours to regress.
+RE_WEBGPU = re.compile(r"^webgpu:\s+([\d.]+) ms(?:.*?\[min ([\d.]+) max ([\d.]+)\])?")
+# ORT's own partitioning verdict, from a separate `ORT_LOG=verbose` pass. It is
+# the fairness caveat made into data: unlike our all-or-nothing contract, the
+# WebGPU EP claims what it supports and leaves the rest on the CPU EP, so a wall
+# compared without this is not necessarily a GPU wall.
+RE_PLACEMENTS = re.compile(r"Node placements")
+RE_PLACED_ALL = re.compile(r"All nodes placed on \[(\w+)\]\. Number of nodes: (\d+)")
+RE_PLACED_ONE = re.compile(r"Node\(s\) placed on \[(\w+)\]\. Number of nodes: (\d+)")
+WEBGPU_EP_NAME = "WebGpuExecutionProvider"
+
 # --- stt-app ----------------------------------------------------------------
 RE_ENC_ITER = re.compile(r"encoder iter (\d+)/(\d+): ([\d.]+) ms")
 
@@ -182,28 +196,73 @@ def parse_parity(lines: list[str]) -> dict | None:
     }
 
 
-def parse_wall(lines: list[str], runner: str, mode: str = "") -> tuple[dict | None, float | None]:
-    """(steady-state wall of the path under test, CPU EP time if the runner measures it)."""
+def parse_placement(lines: list[str], ep: str) -> dict | None:
+    """How ORT partitioned the *last* session in the log, which is `ep`'s.
+
+    Three sessions are created in a `webgpu` run — CPU EP, our EP, then the
+    WebGPU EP — and each logs its own placement, so only the last block answers
+    the question being asked.
+    """
+    starts = [i for i, line in enumerate(lines) if RE_PLACEMENTS.search(line)]
+    if not starts:
+        return None
+    tail = lines[starts[-1] :]
+    # ORT logs one line per EP when the graph is split, and a single
+    # "All nodes placed on" line when it is not
+    for line in tail:
+        if m := RE_PLACED_ALL.search(line):
+            return {
+                "by_provider": {m.group(1): int(m.group(2))},
+                "nodes": int(m.group(2)),
+                "fully_on": m.group(1) == ep,
+            }
+    by_provider: dict[str, int] = {}
+    for line in tail:
+        if m := RE_PLACED_ONE.search(line):
+            by_provider[m.group(1)] = by_provider.get(m.group(1), 0) + int(m.group(2))
+    if not by_provider:
+        return None
+    return {
+        "by_provider": by_provider,
+        "nodes": sum(by_provider.values()),
+        "fully_on": list(by_provider) == [ep],
+    }
+
+
+def parse_wall(
+    lines: list[str], runner: str, mode: str = ""
+) -> tuple[dict | None, float | None, float | None]:
+    """(steady-state wall of the path under test, CPU EP time, our EP's own time).
+
+    The third figure is only distinct from the first in the modes that put a
+    second path under test in the same process (`standalone`, `webgpu`): there
+    the log carries our EP's wall as well, and it is what the reference has to
+    be read against.
+    """
     if runner == "stt-app":
         times = [float(m.group(3)) for m in map(RE_ENC_ITER.search, lines) if m]
-        return steady(times), None
+        return steady(times), None, None
     cpu_ms = None
     wall = None
-    # in `standalone` the path under test is the facade, not the EP: the same
+    ep_ms = None
+    # in `standalone` and `webgpu` the path under test is not the EP: the same
     # log carries both timings and picking the wrong one would benchmark the
     # thing the mode exists to avoid
-    second = RE_STANDALONE if mode == "standalone" else RE_SECOND
+    second = {"standalone": RE_STANDALONE, "webgpu": RE_WEBGPU}.get(mode, RE_SECOND)
     for line in lines:
         if m := RE_CPU_EP.match(line):
             cpu_ms = float(m.group(1))
-        elif m := second.match(line):
+            continue
+        if m := RE_SECOND.match(line):
+            ep_ms = float(m.group(1))
+        if m := second.match(line):
             wall = {
                 "median": float(m.group(1)),
                 "min": float(m.group(2)) if m.group(2) else None,
                 "max": float(m.group(3)) if m.group(3) else None,
                 "iters_used": None,
             }
-    return wall, cpu_ms
+    return wall, cpu_ms, ep_ms
 
 
 def parse_accuracy(lines: list[str], kind: str, expect: str, exposed: list[str]) -> dict:
@@ -441,6 +500,12 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=1)
     ap.add_argument("--stdout", type=Path, required=True)
     ap.add_argument("--stats-log", type=Path)
+    ap.add_argument(
+        "--placement-log",
+        type=Path,
+        help="an ORT_LOG=verbose log; the last 'Node placements' block is read "
+        "to record whether the external EP took the whole graph",
+    )
     ap.add_argument("--metrics", type=Path)
     ap.add_argument("--validate", default="outputs")
     ap.add_argument("--expect", default="")
@@ -465,7 +530,7 @@ def main() -> int:
 
     clean = read(args.stdout)
     stats = read(args.stats_log)
-    wall, cpu_ms = parse_wall(clean, args.runner, args.mode)
+    wall, cpu_ms, ep_ms = parse_wall(clean, args.runner, args.mode)
     device = next((m.group(1) for m in map(RE_DEVICE.search, clean + stats) if m), None)
 
     # env.json first: it names the GPU the run was launched on, which on the
@@ -511,6 +576,12 @@ def main() -> int:
         or bool(device and not any(s in device.lower() for s in SOFTWARE_DEVICES)),
         "wall_ms": wall,
         "cpu_ep_ms": cpu_ms,
+        # only set where the mode measures something other than our EP in the
+        # same process: it is the number the reference has to be read against
+        "ep_ms": ep_ms if args.mode in ("standalone", "webgpu") else None,
+        "placement": parse_placement(read(args.placement_log), WEBGPU_EP_NAME)
+        if args.mode == "webgpu"
+        else None,
         "accuracy": parse_accuracy(clean, args.validate, args.expect, read(args.exposed)),
         "parity": parity,
         "reference": parse_reference(clean),
@@ -518,7 +589,10 @@ def main() -> int:
         # recorded next to the numbers derived from them: a Roofline read
         # against the wrong peaks is worse than no Roofline
         "peaks": device_peaks or None,
-        "blocks": parse_blocks(stats or clean),
+        # in `webgpu` mode our EP runs too and logs its own partitioning, but
+        # attributing it to this row would duplicate the `compile` row's number
+        # under a label that means something else
+        "blocks": None if args.mode == "webgpu" else parse_blocks(stats or clean),
         "system": parse_metrics(args.metrics),
         "raw": {
             "stdout": args.stdout.name,

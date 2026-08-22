@@ -23,3 +23,4 @@ onnx-vulkan = { path = "../onnx-vulkan" }
 vk-compute = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ep-registry = { workspace = true }

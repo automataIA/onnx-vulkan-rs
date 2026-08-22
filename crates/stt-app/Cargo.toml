@@ -15,3 +15,4 @@ hound = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+ep-registry = { workspace = true }

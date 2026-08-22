@@ -35,7 +35,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ep_api.display());
 
     let bindings = bindgen::Builder::default()
-        // onnxruntime_c_api.h in turn includes onnxruntime_ep_c_api.h (line ~8651);
+        // onnxruntime_c_api.h in turn includes onnxruntime_ep_c_api.h (line ~8737);
         // the EP header is not standalone.
         .header(c_api.to_str().unwrap())
         .clang_arg(format!("-I{}", include_dir.display()))

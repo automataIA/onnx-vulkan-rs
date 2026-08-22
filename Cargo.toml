@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ort-ep-sys",
+    "crates/ep-registry",
     "crates/onnx-vulkan-core",
     "crates/vk-compute",
     "crates/vulkan-ep",
@@ -34,3 +35,4 @@ serde_json = "1"
 vk-compute = { version = "0.0.1", path = "crates/vk-compute" }
 onnx-vulkan-core = { version = "0.0.1", path = "crates/onnx-vulkan-core" }
 onnx-vulkan-frontend = { version = "0.0.1", path = "crates/onnx-vulkan-frontend" }
+ep-registry = { version = "0.0.1", path = "crates/ep-registry" }

@@ -12,9 +12,8 @@
 //!
 //! Dynamic dimensions default to 1 if not specified with `--dim`.
 
-mod plugin;
-
 use anyhow::{Context, Result, bail};
+use ep_registry::PluginEp;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionOutputs};
 use ort::tensor::TensorElementType;
@@ -91,6 +90,21 @@ struct Args {
     /// different random inputs, which on a dynamically-quantized graph is not a
     /// comparison at all (`plan.md` Phase 1.5).
     standalone: bool,
+    /// `--webgpu`: also run the graph through Microsoft's standalone WebGPU
+    /// plugin EP, in the same process and on the same inputs.
+    ///
+    /// It is a **reference backend, not a gated one**: on Linux it runs on
+    /// Dawn → Vulkan, i.e. the same device our EP uses, which makes it the
+    /// sharpest external number our kernels can be read against. Unlike our
+    /// all-or-nothing contract it partitions and falls back to the CPU EP for
+    /// ops it lacks, so its wall is not necessarily a fully-GPU wall — read it
+    /// with that caveat, and at the EP's defaults (no graph capture, no layout
+    /// override).
+    webgpu: bool,
+    /// `--webgpu-lib PATH`: where `libonnxruntime_providers_webgpu.so` lives.
+    /// Default: `third_party/webgpu-ep/`, where `scripts/fetch-webgpu-ep.sh`
+    /// puts it.
+    webgpu_lib: Option<PathBuf>,
     /// Writes per-output dtype-aware CPU-vs-second-backend metrics as JSON.
     report_json: Option<PathBuf>,
 }
@@ -116,6 +130,8 @@ fn parse_args() -> Result<Args> {
         fill: HashMap::new(),
         decode: 0,
         standalone: false,
+        webgpu: false,
+        webgpu_lib: None,
         report_json: None,
     };
     while let Some(flag) = args.next() {
@@ -133,6 +149,10 @@ fn parse_args() -> Result<Args> {
         }
         if flag == "--standalone" {
             out.standalone = true;
+            continue;
+        }
+        if flag == "--webgpu" {
+            out.webgpu = true;
             continue;
         }
         let value = args
@@ -154,6 +174,7 @@ fn parse_args() -> Result<Args> {
             "--dump" => out.dump = value.parse()?,
             "--seed" => out.seed = value.parse()?,
             "--reference" => out.reference = Some(PathBuf::from(value)),
+            "--webgpu-lib" => out.webgpu_lib = Some(PathBuf::from(value)),
             "--report-json" => out.report_json = Some(PathBuf::from(value)),
             other => bail!("flag sconosciuto: {other}"),
         }
@@ -186,6 +207,13 @@ fn plugin_path() -> PathBuf {
                 .and_then(|p| p.parent().map(|d| d.join(lib)))
                 .unwrap_or_else(|| PathBuf::from(lib))
         })
+}
+
+/// Where `scripts/fetch-webgpu-ep.sh` leaves Microsoft's WebGPU plugin. It is
+/// a third-party artifact, not a build output, so it is not next to our binary.
+fn webgpu_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/webgpu-ep/libonnxruntime_providers_webgpu.so")
 }
 
 /// Deterministic generator: the same inputs for the two sessions, without
@@ -1007,6 +1035,7 @@ fn main() -> Result<()> {
 
     // second session: Vulkan EP, or CPU without optimizations in self-check.
     // Built before the first run because `--decode` interleaves the two.
+    let vulkan_ep = PluginEp::vulkan(plugin_path());
     let mut registered = false;
     let mut second = if args.self_check {
         Session::builder()?
@@ -1014,14 +1043,16 @@ fn main() -> Result<()> {
             .with_optimization_level(GraphOptimizationLevel::Disable)?
             .commit_from_file(&args.model)?
     } else {
-        let path = plugin_path();
-        if !path.exists() {
-            bail!("plugin not found in {} (VULKAN_EP_PATH)", path.display());
+        if !vulkan_ep.library.exists() {
+            bail!(
+                "plugin not found in {} (VULKAN_EP_PATH)",
+                vulkan_ep.library.display()
+            );
         }
-        plugin::register(&path)?;
+        vulkan_ep.register()?;
         registered = true;
         let mut builder = opt(Session::builder()?.with_memory_pattern(args.mem_pattern)?)?;
-        let devices = plugin::append_to_session(&mut builder)?;
+        let devices = vulkan_ep.append_to_session(&mut builder)?;
         println!("(Vulkan EP: {devices} device)");
         builder.commit_from_file(&args.model)?
     };
@@ -1034,7 +1065,7 @@ fn main() -> Result<()> {
         let ok = decode_loop(&mut cpu, &mut second, label, &args, &mut rng)?;
         drop(second);
         if registered {
-            plugin::unregister()?;
+            vulkan_ep.unregister()?;
         }
         if !ok {
             bail!(
@@ -1167,6 +1198,40 @@ fn main() -> Result<()> {
         None
     };
 
+    // fourth backend: Microsoft's standalone WebGPU plugin EP, on the very same
+    // inputs. Registered last and torn down inside this block, for the reason
+    // the standalone run has: Dawn opens its own Vulkan device on this GPU.
+    //
+    // Its outputs are compared but **never** set `failed`: this is an external
+    // reference, and a divergence in it is not a defect of ours.
+    let webgpu_out = if args.webgpu {
+        let ep = PluginEp::webgpu(args.webgpu_lib.clone().unwrap_or_else(webgpu_path));
+        if !ep.library.exists() {
+            bail!(
+                "WebGPU EP not found at {} — run scripts/fetch-webgpu-ep.sh",
+                ep.library.display()
+            );
+        }
+        ep.register()?;
+        // the EP's own defaults: no graph capture, no preferred-layout
+        // override. Tuning one side and not the other is not a comparison.
+        let mut builder = opt(Session::builder()?.with_memory_pattern(args.mem_pattern)?)?;
+        let devices = ep.append_to_session(&mut builder)?;
+        println!("(WebGPU EP: {devices} device)");
+        let mut session = builder.commit_from_file(&args.model)?;
+        let (out, times) = run(&mut session, &inputs, args.iters)?;
+        let (ms, min, max) = steady(&times);
+        println!("webgpu:    {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
+        let (rel_ep, _) = compare("webgpu vs EP      ", &vk_out, &out, args.tol, args.rtol);
+        let (rel_cpu, _) = compare("webgpu vs CPU     ", &cpu_out, &out, args.tol, args.rtol);
+        println!("reference: webgpu vs EP relative={rel_ep:.2e}, vs CPU EP relative={rel_cpu:.2e}");
+        drop(session);
+        ep.unregister()?;
+        Some(out)
+    } else {
+        None
+    };
+
     if let Some(reference) = &reference {
         let backend = if args.self_check {
             "cpu-no-opt"
@@ -1177,6 +1242,10 @@ fn main() -> Result<()> {
         let second_ok = check_reference(backend, &vk_out, reference, args.tol, args.rtol);
         if let Some(out) = &standalone_out {
             failed |= !check_reference("standalone", out, reference, args.tol, args.rtol);
+        }
+        if let Some(out) = &webgpu_out {
+            // printed, not gated: see the block above
+            check_reference("webgpu", out, reference, args.tol, args.rtol);
         }
         if !cpu_ok {
             // the CPU EP out of tolerance from the golden says nothing about
@@ -1189,7 +1258,7 @@ fn main() -> Result<()> {
 
     drop(second);
     if registered {
-        plugin::unregister()?;
+        vulkan_ep.unregister()?;
     }
 
     if failed {

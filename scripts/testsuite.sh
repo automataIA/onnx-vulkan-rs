@@ -19,6 +19,7 @@ HELPERS="$ROOT/scripts/testsuite"
 MANIFEST="$ROOT/tests/models.toml"
 BIN_DIR="$ROOT/target/release"
 ORT_LIB="$ROOT/third_party/onnxruntime/linux-x64/lib/libonnxruntime.so"
+WEBGPU_LIB="$ROOT/third_party/webgpu-ep/libonnxruntime_providers_webgpu.so"
 
 MODELS=() MODES=() ITERS="" BUILD=1 SAMPLE_MS=100
 BASELINE="" TAG="" KEEP=20 DRY=0 DESC="" METRIC_SEL="" METRIC_PATH=""
@@ -33,7 +34,8 @@ usage() {
     cat <<'EOF'
 
   -m, --model NAME    only this model (repeatable; default: the manifest's `default` entries)
-  -M, --mode MODE     cpu | registry | compile (repeatable; default: cpu,compile)
+  -M, --mode MODE     cpu | registry | compile | standalone | webgpu
+                      (repeatable; default: cpu,compile)
   -i, --iters N       iterations per run (default: from the manifest)
   -n, --no-build      skip the build and reuse target/release as it is
       --sample MS     metric sampling period (0 = disable; default 100)
@@ -147,6 +149,15 @@ if [ "$DRY" != 1 ]; then
         "$BIN_DIR/model-runner" \
         "$BIN_DIR/stt-app" \
         "$BIN_DIR/libonnxruntime_ep_vulkan.so"
+fi
+
+# The WebGPU EP is deliberately outside `check_fresh`: it is a third-party
+# artifact with no sources under `crates/`, so the staleness invariant says
+# nothing about it. What does apply is that it must be there *before* the matrix
+# starts rather than half way through it.
+if [ "$DRY" != 1 ] && [[ " $(printf '%s ' ${MODES+"${MODES[@]}"})" == *" webgpu "* ]]; then
+    [ -f "$WEBGPU_LIB" ] ||
+        die "WebGPU EP missing: $WEBGPU_LIB (run ./scripts/fetch-webgpu-ep.sh)"
 fi
 
 MODEL_ARGS=()
@@ -278,6 +289,43 @@ while IFS=$'\x1f' read -r name mode runner iters path args stats validate expect
 
     # runner command line
     mapfile -t extra < <(echo "$args" | jq -r '.[]')
+    if [ "$mode" = webgpu ]; then
+        # `--webgpu` adds a fourth backend: ORT's standalone WebGPU plugin EP
+        # (Dawn -> Vulkan on Linux), in the same process and on the same
+        # generated tensors. Our EP still runs, which is what keeps the
+        # `Vulkan device:` line — and therefore `perf_valid` — in this log.
+        #
+        # No VULKAN_EP_STATS pass: the number under test here is not ours, and
+        # our Pareto is already recorded by the `compile` row of the same model.
+        cmdline="$BIN_DIR/model-runner $model_path --iters $iters --webgpu --webgpu-lib $WEBGPU_LIB"
+        for a in ${extra+"${extra[@]}"}; do cmdline+=" $a"; done
+        [ -n "$reference" ] && cmdline+=" --reference $reference"
+        start_sampler model-runner "$out_dir/$mode.metrics.csv"
+        native_exec "VULKAN_EP_COMPILE=1 " "$cmdline" >"$out_dir/$mode.stdout.log"
+        code=$?
+        stop_sampler
+        # second pass, one iteration, purely to read ORT's partitioning verdict:
+        # the WebGPU EP claims what it supports and leaves the rest on the CPU
+        # EP, and a wall compared without knowing that is not a GPU wall. Kept
+        # out of the timed pass because verbose ORT logging is not free.
+        native_exec "VULKAN_EP_COMPILE=1 ORT_LOG=verbose " \
+            "${cmdline/--iters $iters/--iters 1}" >"$out_dir/$mode.placement.log"
+        if [ "$DRY" = 0 ]; then
+            "$HELPERS/parse_run.py" --model "$name" --mode "$mode" --runner "$runner" \
+                --iters "$iters" --stdout "$out_dir/$mode.stdout.log" \
+                --placement-log "$out_dir/$mode.placement.log" \
+                --metrics "$out_dir/$mode.metrics.csv" \
+                --validate "$validate" --expect "$expect" \
+                --size-mb "${size_mb:-0}" --perf-tol "${perf_tol:-10}" --exit-code "$code" \
+                --env "$RUN_DIR/env.json" \
+                $([ "$golden" = 1 ] && echo --golden) --out "$out_dir/$mode.json" ||
+                die "parsing failed for $name/$mode"
+            jq -r '"   webgpu \(.wall_ms.median // "—") ms · EP \(.ep_ms // "—") ms · CPU EP \(.cpu_ep_ms // "—") ms · placement \((.placement.providers // ["?"]) | join("+")) · result \(if .ok then "ok" else "KO" end)"' \
+                "$out_dir/$mode.json"
+            jq -e '.ok' "$out_dir/$mode.json" >/dev/null || failures=$((failures + 1))
+        fi
+        continue
+    fi
     if [ "$mode" = standalone ]; then
         # `--standalone` adds the third backend: the same generated tensors go
         # through ORT, the EP and the facade in one process. Two separate

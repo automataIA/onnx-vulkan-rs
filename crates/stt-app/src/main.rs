@@ -5,11 +5,11 @@
 //! override with `ORT_DYLIB_PATH`.
 
 mod audio;
-mod plugin;
 mod tdt;
 mod vocab;
 
 use anyhow::{Context, Result};
+use ep_registry::PluginEp;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::{Path, PathBuf};
@@ -67,21 +67,21 @@ fn main() -> Result<()> {
                     .and_then(|p| p.parent().map(|d| d.join(lib)))
                     .unwrap_or_else(|| PathBuf::from(lib))
             });
-        path.exists().then_some(path)
+        path.exists().then(|| PluginEp::vulkan(path))
     };
 
     let mut features_session =
         Session::builder()?.commit_from_file(model_dir.join("nemo128.onnx"))?;
     let mut encoder_builder = Session::builder()?;
-    if let Some(path) = &vulkan_ep {
-        plugin::register(path)?;
-        let n = plugin::append_to_session(&mut encoder_builder)?;
+    if let Some(ep) = &vulkan_ep {
+        ep.register()?;
+        let n = ep.append_to_session(&mut encoder_builder)?;
         log::info!(
-            "VulkanEP registrato da {}: {n} device aggiunti alla sessione encoder",
-            path.display()
+            "VulkanEP registered from {}: {n} devices added to the encoder session",
+            ep.library.display()
         );
     } else {
-        log::info!("VulkanEP non attivo (plugin assente o STT_NO_VULKAN)");
+        log::info!("VulkanEP inactive (plugin missing or STT_NO_VULKAN)");
     }
     let mut encoder =
         encoder_builder.commit_from_file(model_dir.join("encoder-model.int8.onnx"))?;
@@ -153,8 +153,8 @@ fn main() -> Result<()> {
     drop(features_session);
     drop(encoder);
     drop(decoder);
-    if vulkan_ep.is_some() {
-        plugin::unregister()?;
+    if let Some(ep) = &vulkan_ep {
+        ep.unregister()?;
     }
     Ok(())
 }

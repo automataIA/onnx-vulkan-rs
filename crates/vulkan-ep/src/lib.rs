@@ -37,7 +37,13 @@ pub unsafe extern "system" fn CreateEpFactories(
     let get_api = api_base.GetApi.expect("OrtApiBase::GetApi is null");
     let ort_api = unsafe { get_api(sys::ORT_API_VERSION) };
     if ort_api.is_null() {
-        // runtime older than the headers we are compiled against
+        // Runtime older than the headers we are compiled against. ORT reports
+        // this as zero factories and no message, so name the version here: it
+        // is the first thing to check after bumping the ORT pin.
+        log::error!(
+            "GetApi({}) returned null — the loaded libonnxruntime is older than the headers this plugin was built against; no factory created",
+            sys::ORT_API_VERSION
+        );
         return std::ptr::null_mut();
     }
     let ort_api = unsafe { &*ort_api };
@@ -58,8 +64,8 @@ pub unsafe extern "system" fn CreateEpFactories(
     let factory = match VulkanEpFactory::new(ort_api, ep_api) {
         Ok(f) => Box::new(f),
         Err(e) => {
-            log::error!("VulkanEP: creazione factory fallita: {e:#}");
-            return ort_util::error_status(&format!("creazione factory fallita: {e:#}")).cast();
+            log::error!("VulkanEP: factory creation failed: {e:#}");
+            return ort_util::error_status(&format!("factory creation failed: {e:#}")).cast();
         }
     };
     unsafe {
@@ -67,7 +73,7 @@ pub unsafe extern "system" fn CreateEpFactories(
         *num_factories = 1;
     }
     log::info!(
-        "VulkanEP factory creata (ORT_API_VERSION={})",
+        "VulkanEP factory created (ORT_API_VERSION={})",
         sys::ORT_API_VERSION
     );
     std::ptr::null_mut()

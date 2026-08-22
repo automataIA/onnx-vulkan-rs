@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Downloads ONNX Runtime 1.27.1 (linux-x64) and the Parakeet TDT 0.6B v3 int8 model.
+# Downloads ONNX Runtime 1.29.0 (linux-x64) and the Parakeet TDT 0.6B v3 int8 model.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ORT_VERSION="1.27.1"
+ORT_VERSION="1.29.0"
 ORT_DIR="$ROOT/third_party/onnxruntime"
 MODELS_DIR="$ROOT/models/parakeet-tdt-0.6b-v3-onnx"
 HF_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
@@ -24,7 +24,15 @@ fetch() { # url, dest
 ORT_GH="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION"
 
 fetch "$ORT_GH/onnxruntime-linux-x64-$ORT_VERSION.tgz" "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION.tgz"
-if [ ! -d "$ORT_DIR/linux-x64" ]; then
+# The guard is on the extracted tree's own VERSION_NUMBER, not on the directory
+# existing: bumping ORT_VERSION alone used to download the new tarball and then
+# silently keep the old headers and .so, which is exactly the drift a version
+# bump exists to catch.
+installed=""
+[ -f "$ORT_DIR/linux-x64/VERSION_NUMBER" ] && installed="$(cat "$ORT_DIR/linux-x64/VERSION_NUMBER")"
+if [ "$installed" != "$ORT_VERSION" ]; then
+    [ -n "$installed" ] && echo "replacing extracted ORT $installed with $ORT_VERSION"
+    rm -rf "$ORT_DIR/linux-x64" "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION"
     tar -xzf "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION.tgz" -C "$ORT_DIR"
     mv "$ORT_DIR/onnxruntime-linux-x64-$ORT_VERSION" "$ORT_DIR/linux-x64"
 fi

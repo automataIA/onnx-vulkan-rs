@@ -298,6 +298,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ep-registry"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ort",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,6 +643,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "env_logger",
+ "ep-registry",
  "log",
  "onnx-vulkan",
  "onnx-vulkan-core",
@@ -1148,6 +1157,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "env_logger",
+ "ep-registry",
  "hound",
  "log",
  "ort",

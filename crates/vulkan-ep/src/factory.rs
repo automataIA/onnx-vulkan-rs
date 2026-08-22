@@ -260,7 +260,7 @@ unsafe extern "C" fn create_allocator(
     allocator: *mut *mut sys::OrtAllocator,
 ) -> sys::OrtStatusPtr {
     let _factory = unsafe { VulkanEpFactory::from_ptr(this_ptr) };
-    log::info!("VulkanEP: CreateAllocator chiamata");
+    log::info!("VulkanEP: CreateAllocator called");
     let boxed = Box::new(crate::device_mem::VulkanOrtAllocator::new(memory_info));
     unsafe { *allocator = Box::into_raw(boxed).cast::<sys::OrtAllocator>() };
     ptr::null_mut()
@@ -279,7 +279,7 @@ unsafe extern "C" fn create_data_transfer(
     _this: *mut sys::OrtEpFactory,
     data_transfer: *mut *mut sys::OrtDataTransferImpl,
 ) -> sys::OrtStatusPtr {
-    log::info!("VulkanEP: CreateDataTransfer chiamata");
+    log::info!("VulkanEP: CreateDataTransfer called");
     unsafe { *data_transfer = crate::data_transfer::VulkanDataTransfer::new_boxed() };
     ptr::null_mut()
 }

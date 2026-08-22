@@ -127,7 +127,12 @@ def markdown(summary: dict) -> str:
         "measurement. `ref` is the class expected by the model zoo's official data",
         "(`test_data_set_*`), with ✓ if the backend reproduces it exactly and `~` if it",
         "reproduces the class but not the values (see docs/testsuite.md).",
+        "A `webgpu` row is ORT's own WebGPU plugin EP (Dawn → Vulkan), measured in the",
+        "same process on the same inputs: its `wall` is an **external reference**, read",
+        "against the same model's `compile` row, and it is exempt from the wall gate.",
+        "It has no `blocks`/`flushes` because those counters are ours.",
     ]
+    notes += placement_notes(summary)
     notes += roofline_table(summary)
     invalid = sorted({r["model"] for r in summary["results"] if r.get("perf_valid") is False})
     if invalid:
@@ -135,6 +140,34 @@ def markdown(summary: dict) -> str:
             f"\n⚠ perf invalid (software or unknown device): {', '.join(invalid)}."
         )
     return "\n".join(head + rows + notes) + "\n"
+
+
+def placement_notes(summary: dict) -> list[str]:
+    """How ORT partitioned each `webgpu` run — the fairness caveat, as data.
+
+    Our EP is all-or-nothing; the WebGPU EP claims what it supports and leaves
+    the rest on the CPU EP. A wall quoted without saying which of the two
+    happened is not a comparison, so the split is printed next to the number
+    instead of being remembered as prose.
+    """
+    rows = []
+    for r in summary["results"]:
+        if r.get("mode") != "webgpu" or r.get("status") == "skip":
+            continue
+        place = r.get("placement")
+        if not place:
+            rows.append(f"- `{r['model']}`: partitioning unknown (no verbose pass in this run)")
+            continue
+        split = ", ".join(f"{n} on {ep}" for ep, n in place["by_provider"].items())
+        if place.get("fully_on"):
+            rows.append(f"- `{r['model']}`: whole graph on WebGPU ({place['nodes']} nodes)")
+        else:
+            rows.append(
+                f"- `{r['model']}`: **split** — {split}; its wall is not a fully-GPU wall"
+            )
+    if not rows:
+        return []
+    return ["", "### WebGPU EP partitioning", "", *rows]
 
 
 def roofline_table(summary: dict) -> list[str]:
@@ -259,8 +292,11 @@ def gate(summary: dict, baseline: dict) -> list[str]:
         # to the EP can affect it, so comparing it spends the threshold on host
         # noise. It stays in the report as a reference, not in the gate.
         # and golden models do not measure the product: they are there for
-        # correctness, with low `iters` and inputs fixed by the reference
-        if cur["mode"] == "cpu" or cur.get("golden"):
+        # correctness, with low `iters` and inputs fixed by the reference.
+        # `webgpu` measures a third-party EP: its wall is an external reference,
+        # and failing our own gate when Microsoft's number moves would be a gate
+        # on someone else's release cadence.
+        if cur["mode"] in ("cpu", "webgpu") or cur.get("golden"):
             om = nm = None
         if om and nm and cur.get("perf_valid") and old.get("perf_valid"):
             delta = 100 * (nm - om) / om

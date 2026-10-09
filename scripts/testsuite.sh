@@ -126,9 +126,11 @@ fi
 # like a kernel regression and cost a bisection to attribute.
 #
 # The invariant is per artifact, not between them: every artifact must be newer
-# than every source it could have been built from.
+# than every source it could have been built from. Integration tests,
+# examples and benches are not: cargo does not relink an artifact for them.
 stale_source() { # artifact -> prints the first source newer than it, or nothing
     find "$ROOT/crates" \
+        \( -path '*/tests/*' -o -path '*/examples/*' -o -path '*/benches/*' \) -prune -o \
         \( -name '*.rs' -o -name '*.wgsl' -o -name '*.toml' \) \
         -newer "$1" -print -quit 2>/dev/null
 }

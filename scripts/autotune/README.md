@@ -1,8 +1,7 @@
 # Persistent Vulkan autotune orchestration
 
 For the end-to-end ONNX model workflow, including coverage inspection,
-artifact generation and runtime use, see
-[`../../docs/autotune-model.md`](../../docs/autotune-model.md):
+artifact generation and runtime use:
 
 ```bash
 uv run scripts/autotune/model.py model.onnx --output tactics.json --strict

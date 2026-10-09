@@ -12,6 +12,8 @@ import html
 import json
 import os
 import random
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -61,27 +63,100 @@ def require_int(value: dict[str, Any], name: str) -> int:
 
 
 class Runner:
-    def __init__(self, binary: Path, geometry: str) -> None:
+    def __init__(
+        self,
+        binary: Path,
+        geometry: str,
+        *,
+        response_timeout: float = 30.0,
+        process_timeout: float = 0.0,
+    ) -> None:
+        if response_timeout <= 0 or process_timeout < 0:
+            raise ValueError("timeouts must be positive (process timeout may be zero)")
         self.process = subprocess.Popen(
             [str(binary), "--serve", "--geom", geometry],
             cwd=ROOT,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            bufsize=0,
+            start_new_session=(os.name == "posix"),
         )
+        self.response_timeout = response_timeout
+        self.process_deadline = (
+            time.monotonic() + process_timeout if process_timeout else None
+        )
+        self._stdout_buffer = bytearray()
         self.closed = False
+
+    def _terminate(self) -> None:
+        if self.process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(self.process.pid, signal.SIGTERM)
+                else:
+                    self.process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=min(2.0, self.response_timeout))
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix":
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    else:
+                        self.process.kill()
+                except ProcessLookupError:
+                    pass
+                self.process.wait(timeout=2.0)
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+
+    def _readline(self) -> bytes:
+        if self.process.stdout is None:
+            raise RuntimeError("runner pipes are unavailable")
+        deadline = time.monotonic() + self.response_timeout
+        if self.process_deadline is not None:
+            deadline = min(deadline, self.process_deadline)
+        fd = self.process.stdout.fileno()
+        while True:
+            newline = self._stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._stdout_buffer[: newline + 1])
+                del self._stdout_buffer[: newline + 1]
+                return line
+            if self.process.poll() is not None:
+                if self._stdout_buffer:
+                    raise RuntimeError("Rust runner exited with a truncated response")
+                raise RuntimeError(
+                    f"Rust runner exited without a response (exit {self.process.returncode})"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate()
+                raise TimeoutError("Rust runner response/process timeout")
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                self._terminate()
+                raise TimeoutError("Rust runner response/process timeout")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                continue
+            self._stdout_buffer.extend(chunk)
 
     def request(self, value: dict[str, Any]) -> dict[str, Any]:
         if self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError("runner pipes are unavailable")
-        self.process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
+        if self.process_deadline is not None and time.monotonic() >= self.process_deadline:
+            self._terminate()
+            raise TimeoutError("Rust runner process timeout")
+        self.process.stdin.write(
+            (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+        )
         self.process.stdin.flush()
-        line = self.process.stdout.readline()
-        if not line:
-            code = self.process.poll()
-            raise RuntimeError(f"Rust runner exited without a response (exit {code})")
-        response = json.loads(line)
+        response = json.loads(self._readline().decode("utf-8"))
         if response.get("schema_version") != 1:
             raise RuntimeError("unsupported Rust runner response schema")
         if response.get("ok") is False:
@@ -95,16 +170,10 @@ class Runner:
         try:
             if self.process.poll() is None:
                 self.request({"op": "shutdown"})
-        except (BrokenPipeError, json.JSONDecodeError, RuntimeError):
+        except (BrokenPipeError, json.JSONDecodeError, RuntimeError, TimeoutError, OSError):
             pass
         finally:
-            if self.process.stdin is not None:
-                self.process.stdin.close()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
-                self.process.wait(timeout=10)
+            self._terminate()
 
     def __enter__(self) -> Runner:
         return self
@@ -117,10 +186,17 @@ def load_state(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for number, line in enumerate(lines, 1):
+        truncated = not line.endswith("\n")
         try:
             row = json.loads(line)
         except json.JSONDecodeError as error:
+            # A crash after writing a record can leave a final partial line.
+            # Completed malformed records remain fatal so corruption cannot be
+            # silently hidden by resume.
+            if truncated and number == len(lines):
+                continue
             raise RuntimeError(f"{path}:{number}: invalid JSONL state: {error}") from error
         if row.get("schema_version") != 1:
             raise RuntimeError(f"{path}:{number}: unsupported state schema")
@@ -181,7 +257,12 @@ def tune_geometry(
     }
     started = time.monotonic()
     new_rows: list[dict[str, Any]] = []
-    with Runner(args.binary, geometry) as runner:
+    with Runner(
+        args.binary,
+        geometry,
+        response_timeout=args.response_timeout,
+        process_timeout=args.process_timeout,
+    ) as runner:
         metadata = runner.request({"op": "list"})
         if metadata.get("family") != "matmul_nbits":
             raise RuntimeError("Rust runner did not expose the MatMulNBits family")
@@ -378,13 +459,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=60, help="maximum trials per geometry")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wall-seconds", type=float, default=0.0, help="budget per geometry; 0 disables")
+    parser.add_argument("--response-timeout", type=float, default=30.0, help="seconds allowed for each runner response")
+    parser.add_argument("--process-timeout", type=float, default=0.0, help="maximum seconds for one runner process; 0 disables")
     parser.add_argument("--vram-bytes", type=int, default=0, help="resident workload ceiling; 0 disables")
     parser.add_argument("--bin", type=Path)
     parser.add_argument("--state", type=Path, default=ROOT / "runs" / "autotune" / "study.jsonl")
     parser.add_argument("--study", type=Path, default=ROOT / "runs" / "autotune" / "optuna.sqlite3")
     parser.add_argument("--report", type=Path, default=ROOT / "runs" / "autotune" / "report.json")
     args = parser.parse_args()
-    if args.trials <= 0 or args.wall_seconds < 0 or args.vram_bytes < 0:
+    if (
+        args.trials <= 0
+        or args.wall_seconds < 0
+        or args.vram_bytes < 0
+        or args.response_timeout <= 0
+        or args.process_timeout < 0
+    ):
         parser.error("budgets must be positive, or zero where documented")
     args.geom = args.geom or ["1152,6912"]
     return args

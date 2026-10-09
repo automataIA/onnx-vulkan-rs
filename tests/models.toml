@@ -40,7 +40,7 @@ size_mb = 14
 # cannot — not "do the two backends agree" but "is the answer the correct
 # one". Downloaded by the suite if missing.
 reference = "models/zoo/mobilenetv2/test_data_set_0"
-fetch = { dir = "models/zoo/mobilenetv2/test_data_set_0", member = "mobilenetv2-12/test_data_set_0", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-12.tar.gz" }
+fetch = { dir = "models/zoo/mobilenetv2/test_data_set_0", member = "mobilenetv2-12/test_data_set_0", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/classification/mobilenet/model/mobilenetv2-12.tar.gz", sha256 = "5f83b422708a708b592a5fd56d84710038511789df3ae510b84123930c37762d" }
 
 [[model]]
 name = "rfdetr"
@@ -169,10 +169,22 @@ name = "qwen25vl-vision"
 path = "models/zoo/qwen25vl/vision_encoder_q4.onnx"
 skip = "incoherent synthetic inputs: image_grid_thw not consistent with pixel_values (plan-test.md §7)"
 
+# Random inputs put point labels and indices out of range, so this entry runs
+# on real ones: one positive point on a photo, the vision encoder's CPU EP
+# embeddings, and the CPU EP (no graph optimizations) outputs. Local data,
+# like the model. int8 dynamic: the verdict is standalone↔EP parity, so run
+# it with `-M standalone`; `compile` fails against the CPU EP tolerance by
+# construction (worst relative error 2.8e-3 on pred_masks).
 [[model]]
 name = "sam3-prompt-int8"
 path = "models/zoo/sam3/prompt_encoder_mask_decoder_int8.onnx"
-skip = "incoherent synthetic inputs: indices out of range (plan-test.md §7)"
+runner = "model-runner"
+args = ["--no-opt"]
+reference = "models/zoo/sam3/test_data_set_prompt_0"
+iters = 3
+default = false
+validate = "none"
+size_mb = 10
 
 # ---------------------------------------------------------------- golden
 #
@@ -212,7 +224,7 @@ size_mb = 499
 # It remains a real and distinct regime — autoregressive decoding is exactly
 # this — but **it does not represent the model**: see `roberta-seq128` below.
 reference = "models/zoo/golden/roberta-base-11/test_data_set_0"
-fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz" }
+fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz", sha256 = "16134da10f8fee3283d22a0d70928fe5ceea1ca2ea23507fe0b0f295108a8815" }
 
 [[model]]
 name = "roberta-seq128"
@@ -233,7 +245,7 @@ iters = 20
 default = true
 validate = "outputs"
 size_mb = 499
-fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz" }
+fetch = { dir = "models/zoo/golden/roberta-base-11", member = "roberta-base-11", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/text/machine_comprehension/roberta/model/roberta-base-11.tar.gz", sha256 = "16134da10f8fee3283d22a0d70928fe5ceea1ca2ea23507fe0b0f295108a8815" }
 
 [[model]]
 name = "yolov4-golden"
@@ -253,7 +265,7 @@ size_mb = 245
 # this is where an off-by-one in the offsets or a badly propagated shape shows up.
 # yolov8n measures performance but has no official data; this one does.
 reference = "models/zoo/golden/yolov4/test_data_set_0"
-fetch = { dir = "models/zoo/golden/yolov4", member = "yolov4", url = "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/yolov4/model/yolov4.tar.gz" }
+fetch = { dir = "models/zoo/golden/yolov4", member = "yolov4", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/object_detection_segmentation/yolov4/model/yolov4.tar.gz", sha256 = "7d06db57b6b4fff4f75dd3bd16f29b32faec4552d763869d5a3c37d25542cbb2" }
 
 [[model]]
 name = "resnet50-qdq-golden"
@@ -286,7 +298,7 @@ size_mb = 25
 # once. Keeping both is what makes the 3% divergence documented above
 # attributable to the format rather than to a bug.
 reference = "models/zoo/golden/resnet50-v1-12-qdq/test_data_set_0"
-fetch = { dir = "models/zoo/golden/resnet50-v1-12-qdq", member = "resnet50-v1-12-qdq", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v1-12-qdq.tar.gz" }
+fetch = { dir = "models/zoo/golden/resnet50-v1-12-qdq", member = "resnet50-v1-12-qdq", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/classification/resnet/model/resnet50-v1-12-qdq.tar.gz", sha256 = "6a93ba624ecab599d3f8511b1409f5103beb2f1708a85955397a3132ca423d99" }
 
 # The two QOperator (static int8) models: `QLinearConv` / `QLinearMatMul` with
 # scales and zero-points passed to the operator itself, instead of the QDQ pairs
@@ -316,7 +328,7 @@ golden = true
 validate = "outputs"
 size_mb = 25
 reference = "models/zoo/golden/resnet50-v1-12-int8/test_data_set_0"
-fetch = { dir = "models/zoo/golden/resnet50-v1-12-int8", member = "resnet50-v1-12-int8", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v1-12-int8.tar.gz" }
+fetch = { dir = "models/zoo/golden/resnet50-v1-12-int8", member = "resnet50-v1-12-int8", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/classification/resnet/model/resnet50-v1-12-int8.tar.gz", sha256 = "662710f50cafe29f44727b9cd8be5430fb06da18d3004cf5f9d9645c0dc39d71" }
 
 [[model]]
 name = "mobilenetv2-int8-golden"
@@ -332,7 +344,7 @@ size_mb = 4
 # a different kernel path from the grouped-by-1 case, so it is not redundant
 # with resnet50 even though both are QOperator classifiers.
 reference = "models/zoo/golden/mobilenetv2-12-int8/test_data_set_0"
-fetch = { dir = "models/zoo/golden/mobilenetv2-12-int8", member = "mobilenetv2-12-int8", url = "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-12-int8.tar.gz" }
+fetch = { dir = "models/zoo/golden/mobilenetv2-12-int8", member = "mobilenetv2-12-int8", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/classification/mobilenet/model/mobilenetv2-12-int8.tar.gz", sha256 = "dfcf1dc15b78611489f22a19902de12e304bf0380e185bde499fcf70f7647455" }
 
 [[model]]
 name = "fasterrcnn-golden"
@@ -350,4 +362,4 @@ size_mb = 168
 # the CPU EP. Out of the default until those are covered: the graph breaks in
 # too many places for the result to say anything about our shaders.
 reference = "models/zoo/golden/FasterRCNN-12/test_data_set_0"
-fetch = { dir = "models/zoo/golden/FasterRCNN-12", member = "FasterRCNN-12", url = "https://github.com/onnx/models/raw/main/validated/vision/object_detection_segmentation/faster-rcnn/model/FasterRCNN-12.tar.gz" }
+fetch = { dir = "models/zoo/golden/FasterRCNN-12", member = "FasterRCNN-12", url = "https://github.com/onnx/models/raw/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/object_detection_segmentation/faster-rcnn/model/FasterRCNN-12.tar.gz", sha256 = "67208685047b27a201c1b50a3a7a0ea25161e9988bc4211adb74c85637c33860" }

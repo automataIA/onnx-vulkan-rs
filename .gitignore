@@ -1,6 +1,7 @@
 /target
 /info
-/docs
+/docs/*
+docs/
 /repo-reference
 /models
 /third_party
@@ -10,3 +11,12 @@ __pycache__/
 *.pyc
 *.md
 !README.md
+!/SECURITY.md
+
+# Local recipes and notes (not distributed with the repository).
+/recipes
+
+# Local LLM instructions and skills (not distributed with the repository).
+/AGENTS.md
+/.agents/
+/CLAUDE.md

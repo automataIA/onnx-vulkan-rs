@@ -16,6 +16,9 @@ WEBGPU_EP_VERSION="0.2.1"
 WEBGPU_DIR="$ROOT/third_party/webgpu-ep"
 SO_NAME="libonnxruntime_providers_webgpu.so"
 PYPI_JSON="https://pypi.org/pypi/onnxruntime-ep-webgpu/$WEBGPU_EP_VERSION/json"
+# sha256 of the manylinux x86_64 wheel of this version, as listed by PyPI. Kept
+# here rather than read from the same JSON, so a swapped wheel cannot vouch for itself.
+WHEEL_SHA256="3ba8e49e09bac60501e71e66a5d8376f5e5fa71b94d71fe90330c4487eb0bd82"
 
 command -v jq >/dev/null || {
     echo "jq is required (the test suite needs it too): apt install jq" >&2
@@ -46,6 +49,11 @@ wheel_url="$(curl -fL --retry 3 "$PYPI_JSON" |
 wheel="$WEBGPU_DIR/$(basename "$wheel_url")"
 echo "downloading: $wheel_url"
 curl -fL --retry 3 -o "$wheel.part" "$wheel_url"
+echo "$WHEEL_SHA256  $wheel.part" | sha256sum -c --quiet || {
+    echo "sha256 mismatch: $wheel_url" >&2
+    rm -f "$wheel.part"
+    exit 1
+}
 mv "$wheel.part" "$wheel"
 
 # the wheel lays the payload out under onnxruntime_ep_webgpu/; flatten it,

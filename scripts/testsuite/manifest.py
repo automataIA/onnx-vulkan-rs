@@ -138,6 +138,7 @@ def fetch(name: str, spec: dict) -> None:
     url, member = spec["url"], spec["member"]
     print(f"== {name}: downloading {url}", file=sys.stderr)
 
+    import hashlib
     import shutil
     import tarfile
     import tempfile
@@ -151,6 +152,12 @@ def fetch(name: str, spec: dict) -> None:
             # without network the suite must continue: the reference is an
             # additional check, not a precondition to measure
             print(f"   ! download failed ({e}); {name} will run without it", file=sys.stderr)
+            return
+        # checked before extraction: the URL is pinned to a commit, and the
+        # digest is the LFS sha256 recorded for that commit
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != spec["sha256"]:
+            print(f"   ! sha256 mismatch ({digest}); {name} will run without it", file=sys.stderr)
             return
         with tarfile.open(archive) as tar:
             wanted = [m for m in tar.getmembers() if m.name.startswith(member)]

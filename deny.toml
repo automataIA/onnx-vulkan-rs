@@ -1,0 +1,19 @@
+# `cargo deny check` policy. Advisories, bans and sources use the defaults.
+
+[licenses]
+# Permissive licenses only, compatible with distributing under MIT OR Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+# Workspace crates with `publish = false` declare no license of their own.
+ignore = true

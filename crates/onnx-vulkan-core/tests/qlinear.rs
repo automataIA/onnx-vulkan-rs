@@ -152,6 +152,56 @@ fn a_convolution_accumulates_in_int32_and_requantizes_once() {
     assert_eq!(out, want);
 }
 
+/// A **per-tensor** weight scale with a per-channel bias — what ONNX Runtime's
+/// `quantize_static(per_channel=False)` writes. The epilogue must still add
+/// `bias[c]` per output channel even though there is a single `ratio`.
+#[test]
+fn a_per_tensor_weight_scale_keeps_the_per_channel_bias() {
+    let x: Vec<i32> = vec![130, 120, 140, 128, 200, 60, 10, 250, 128];
+    let w: Vec<i32> = vec![1, -2, 3, 4, -5, 6, -7, 8];
+    let (x_scale, w_scale, y_scale) = (0.02f32, 0.01f32, 0.05f32);
+    let (x_zp, y_zp) = (128i32, 10i32);
+    let bias = [7i32, -400];
+
+    let out = run(
+        node(
+            "QLinearConv",
+            &[
+                "x", "x_scale", "x_zp", "w", "w_scale", "w_zp", "y_scale", "y_zp", "B",
+            ],
+            &[("kernel_shape", AttrValue::Ints(vec![2, 2]))],
+        ),
+        &[
+            ("x", bytes(UINT8, &[1, 1, 3, 3], &x)),
+            ("x_scale", f32s(&[], &[x_scale])),
+            ("x_zp", bytes(UINT8, &[], &[x_zp])),
+            ("w", bytes(INT8, &[2, 1, 2, 2], &w)),
+            ("w_scale", f32s(&[], &[w_scale])),
+            ("w_zp", bytes(INT8, &[], &[0])),
+            ("y_scale", f32s(&[], &[y_scale])),
+            ("y_zp", bytes(UINT8, &[], &[y_zp])),
+            ("B", i32s(&[2], &bias)),
+        ],
+    );
+
+    let mut want = Vec::new();
+    for (c, b) in bias.iter().enumerate() {
+        for oh in 0..2usize {
+            for ow in 0..2usize {
+                let mut acc = *b;
+                for r in 0..2usize {
+                    for s in 0..2usize {
+                        let xv = x[(oh + r) * 3 + ow + s] - x_zp;
+                        acc += xv * w[c * 4 + r * 2 + s];
+                    }
+                }
+                want.push(requantize(acc, x_scale * w_scale / y_scale, y_zp, false));
+            }
+        }
+    }
+    assert_eq!(out, want);
+}
+
 /// The same node without a bias: the schema makes it optional, and the kernel
 /// must not read the binding it still has to bind.
 #[test]
@@ -255,10 +305,86 @@ fn an_add_broadcasts_and_lands_on_the_output_scale() {
 
     let want: Vec<i64> = (0..6)
         .map(|i| {
-            let sum = a_scale / c_scale * (a[i] - a_zp) as f32
-                + b_scale / c_scale * (b[i % 3] - b_zp) as f32;
-            i64::from((sum.round_ties_even() as i32 + c_zp).clamp(0, 255))
+            let p = [a_scale, b_scale, c_scale];
+            mlas_add(a[i], b[i % 3], p, [a_zp, b_zp, c_zp])
         })
+        .collect();
+    assert_eq!(out, want);
+}
+
+/// MLAS's AVX2 `QLinearAdd` for `uint8`, operation for operation: the zero
+/// points folded into one fused addend, two fused multiply-adds, one rounding.
+fn mlas_add(a: i32, b: i32, [sa, sb, sc]: [f32; 3], [za, zb, zc]: [i32; 3]) -> i64 {
+    let (ra, rb) = (sa / sc, sb / sc);
+    let fixed = zc as f32 - ra.mul_add(za as f32, rb * zb as f32);
+    let y = (a as f32).mul_add(ra, (b as f32).mul_add(rb, fixed));
+    y.round_ties_even().clamp(0.0, 255.0) as i64
+}
+
+fn qlinear_add(
+    a: (&[i64], &[i32]),
+    b: (&[i64], &[i32]),
+    scales: [f32; 3],
+    zps: [i32; 3],
+) -> Vec<i64> {
+    run(
+        node(
+            "QLinearAdd",
+            &[
+                "A", "A_scale", "A_zp", "B", "B_scale", "B_zp", "C_scale", "C_zp",
+            ],
+            &[],
+        ),
+        &[
+            ("A", bytes(UINT8, a.0, a.1)),
+            ("A_scale", f32s(&[], &[scales[0]])),
+            ("A_zp", bytes(UINT8, &[], &[zps[0]])),
+            ("B", bytes(UINT8, b.0, b.1)),
+            ("B_scale", f32s(&[], &[scales[1]])),
+            ("B_zp", bytes(UINT8, &[], &[zps[1]])),
+            ("C_scale", f32s(&[], &[scales[2]])),
+            ("C_zp", bytes(UINT8, &[], &[zps[2]])),
+        ],
+    )
+}
+
+/// Every input pair of the quantized mobilenetv2 `QLinearAdd` whose first
+/// output code diverged from ORT. `round(ra·(A − a_zp) + rb·(B − b_zp)) + c_zp`
+/// is the same sum rounded in another order and gave 83, 149 and 215 for the
+/// three pairs ORT 1.29 maps to 82, 148 and 214; one code off in this residual
+/// add moved the argmax of the logits.
+#[test]
+fn an_add_rounds_like_the_cpu_reference_on_every_input_pair() {
+    let scales = [0.032_075_05_f32, 0.061_237_868, 0.067_996_934];
+    let zps = [116, 145, 125];
+    let a: Vec<i32> = (0..65536).map(|i| i % 256).collect();
+    let b: Vec<i32> = (0..65536).map(|i| i / 256).collect();
+    let out = qlinear_add((&[65536], &a), (&[65536], &b), scales, zps);
+
+    for (a, b, cpu) in [(129, 91, 82), (162, 147, 148), (195, 203, 214)] {
+        assert_eq!(out[(b * 256 + a) as usize], cpu, "A={a} B={b}");
+    }
+    let want: Vec<i64> = (0..65536)
+        .map(|i| mlas_add(a[i], b[i], scales, zps))
+        .collect();
+    assert_eq!(out, want);
+}
+
+/// ORT passes MLAS the operands exchanged when A is the broadcast scalar,
+/// and the zero-point addend is not symmetric: at `B = 195` the unexchanged
+/// formula gives 41 where ORT gives 40.
+#[test]
+fn a_broadcast_first_operand_is_exchanged_as_on_the_cpu() {
+    let scales = [0.264_079_f32, 0.081_802, 0.010_314];
+    let zps = [128, 205, 43];
+    let b: Vec<i32> = (0..256).collect();
+    let out = qlinear_add((&[1], &[131]), (&[256], &b), scales, zps);
+
+    assert_eq!(out[195], 40);
+    let [sa, sb, sc] = scales;
+    let [za, zb, zc] = zps;
+    let want: Vec<i64> = (0..256)
+        .map(|v| mlas_add(v, 131, [sb, sa, sc], [zb, za, zc]))
         .collect();
     assert_eq!(out, want);
 }

@@ -410,6 +410,119 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+pub const TO_HWC_KEY: &str = "ConvInteger_to_hwc";
+pub const TO_HWC_BINDINGS: u32 = 2;
+/// channels, pixels.
+pub const TO_HWC_PUSH_BYTES: u32 = 8;
+/// Channels and pixels per [`TO_HWC`] workgroup.
+pub const TO_HWC_TILE: u32 = 64;
+
+/// u8 `[C, P]` to `[P, C]` (CHW to HWC), both packed four bytes to a word,
+/// through a 64 × 64 tile in workgroup memory so that both the read along P
+/// and the write along C are whole coalesced words. Needs `C` and `P`
+/// multiples of four, so that every plane and every pixel starts on a word.
+///
+/// It feeds [`IM2COL_HWC`]: [`IM2COL`] reads its bytes straight from CHW, and
+/// neighbouring threads there read neighbouring K, i.e. different channel
+/// planes `H·W` bytes apart, one byte at a time. On SAM 3's 288² pixel decoder
+/// (C = 256, 3×3) that pass wrote its 191 MB at ~60 GB/s, more than twice the
+/// time of the tensor-core multiply it feeds.
+pub const TO_HWC: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<u32>;     // u8 packed [C, P]
+@group(0) @binding(1) var<storage, read_write> xt: array<u32>; // u8 packed [P, C]
+
+struct Push { channels: u32, pixels: u32 }
+var<immediate> pc: Push;
+
+// 64 channels x 16 words (64 pixels), one word of padding per row
+var<workgroup> tile: array<u32, 1088>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let p0 = wg.x * 64u;
+    let c0 = wg.y * 64u;
+    let pixel_words = pc.pixels / 4u;
+    for (var t = 0u; t < 4u; t = t + 1u) {
+        let idx = lid + t * 256u;
+        let cl = idx / 16u;
+        let pw = idx % 16u;
+        let c = c0 + cl;
+        let word = p0 / 4u + pw;
+        var v = 0u;
+        if (c < pc.channels && word < pixel_words) {
+            v = x[c * pixel_words + word];
+        }
+        tile[cl * 17u + pw] = v;
+    }
+    workgroupBarrier();
+    let channel_words = pc.channels / 4u;
+    for (var t = 0u; t < 4u; t = t + 1u) {
+        let idx = lid + t * 256u;
+        let pl = idx / 16u;
+        let cw = idx % 16u;
+        let p = p0 + pl;
+        let c = c0 + cw * 4u;
+        if (p < pc.pixels && c < pc.channels) {
+            var word = 0u;
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let byte = (tile[(cw * 4u + j) * 17u + pl / 4u] >> ((pl % 4u) * 8u)) & 0xffu;
+                word = word | (byte << (j * 8u));
+            }
+            xt[p * channel_words + c / 4u] = word;
+        }
+    }
+}
+"#;
+
+pub const IM2COL_HWC_KEY: &str = "ConvInteger_im2col_hwc";
+pub const IM2COL_HWC_BINDINGS: u32 = 3;
+/// 14 u32 fields, all geometry plus the sign flip.
+pub const IM2COL_HWC_PUSH_BYTES: u32 = 56;
+
+/// [`IM2COL`] from an HWC activation ([`TO_HWC`]), with K ordered
+/// `(kh, kw, c)` instead of ONNX's `(c, kh, kw)`: every word of a row is four
+/// consecutive channels of one tap, one whole word of `xt`, and neighbouring
+/// threads read neighbouring words. The weight is permuted to
+/// `[C_out, KH, KW, C_in]` to match, once per session. The `i32` sum over K is
+/// exact in any order, so the product is the one [`IM2COL`] feeds.
+///
+/// Out-of-bounds taps get the activation zero point in all four bytes, as in
+/// [`IM2COL`], and `flip` is the same sign flip. Grid-stride, so the grid can
+/// stay within the dispatch limit.
+pub const IM2COL_HWC: &str = r#"
+@group(0) @binding(0) var<storage, read> xt: array<u32>;   // u8 packed [H, W, C]
+@group(0) @binding(1) var<storage, read> azp: array<u32>;
+@group(0) @binding(2) var<storage, read_write> col: array<u32>;  // u8 packed [P, KH, KW, C]
+
+struct Push {
+    words: u32, row_words: u32, channel_words: u32,
+    h_in: u32, w_in: u32, w_out: u32, kw: u32,
+    sh: u32, sw: u32, phb: u32, pwb: u32, dh: u32, dw: u32,
+    flip: u32,
+}
+var<immediate> pc: Push;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let padding = (azp[0] & 0xffu) * 0x01010101u;
+    for (var i = gid.x; i < pc.words; i = i + groups.x * 256u) {
+        let p = i / pc.row_words;
+        let w = i % pc.row_words;
+        let tap = w / pc.channel_words;
+        let cw = w % pc.channel_words;
+        let r = tap / pc.kw;
+        let s = tap % pc.kw;
+        let ih = i32((p / pc.w_out) * pc.sh + r * pc.dh) - i32(pc.phb);
+        let iw = i32((p % pc.w_out) * pc.sw + s * pc.dw) - i32(pc.pwb);
+        var word = padding;
+        if (ih >= 0 && iw >= 0 && ih < i32(pc.h_in) && iw < i32(pc.w_in)) {
+            word = xt[(u32(ih) * pc.w_in + u32(iw)) * pc.channel_words + cw];
+        }
+        col[i] = word ^ pc.flip;
+    }
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -424,5 +537,7 @@ mod tests {
         }
         vk_compute::compile_wgsl(super::SPLIT_REDUCE).expect("shader ConvInteger reduce valido");
         vk_compute::compile_wgsl(super::IM2COL).expect("shader ConvInteger im2col valido");
+        vk_compute::compile_wgsl(super::TO_HWC).expect("shader ConvInteger to_hwc valido");
+        vk_compute::compile_wgsl(super::IM2COL_HWC).expect("shader ConvInteger im2col_hwc valido");
     }
 }

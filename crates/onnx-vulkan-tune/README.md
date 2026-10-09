@@ -5,8 +5,8 @@ The executable never creates a Vulkan context: `inspect`, `validate`, `diff`,
 and `merge` operate entirely on JSON artifacts, while `build` canonicalizes a
 validated draft produced by an in-process family runner.
 
-The user-facing ONNX-to-artifact workflow is documented in
-[`../../docs/autotune-model.md`](../../docs/autotune-model.md). Its GPU-free
+The user-facing ONNX-to-artifact workflow is
+[`scripts/autotune/model.py`](../../scripts/autotune/README.md). Its GPU-free
 inventory boundary is:
 
 ```text

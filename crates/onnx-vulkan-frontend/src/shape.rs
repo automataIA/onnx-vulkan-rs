@@ -327,6 +327,7 @@ fn infer_node(
         | "Sqrt"
         | "Abs"
         | "Neg"
+        | "Sign"
         | "Floor"
         | "Ceil"
         | "Round"

@@ -17,7 +17,8 @@
 
 use onnx_vulkan_core::shaders::matmul_integer::{
     COOP_BINDINGS, COOP_PUSH_BYTES, MATMUL_BINDINGS, MATMUL_PUSH_BYTES, PACK_B, PACK_BINDINGS,
-    PACK_PUSH_BYTES, SIGN_FLIP_BYTE, SIGN_FLIP_WORD, TILE_SIZE, coop_applies, coop_variant, matmul,
+    PACK_PUSH_BYTES, SIGN_FLIP_BYTE, SIGN_FLIP_WORD, TILE_SIZE, coop_applies, coop_variant,
+    coop_variants, matmul,
 };
 use vk_compute::{VkContext, compile_wgsl};
 
@@ -143,102 +144,103 @@ fn both_variants_match_the_cpu_reference() {
     assert_eq!(packed, vector, "the two variants must match");
 }
 
-/// The cooperative matrix variant against the same CPU reference.
+/// Every cooperative matrix variant the device runs against the same CPU
+/// reference.
 ///
 /// Shapes are chosen to exercise what the shader does differently from the WGSL
 /// kernels: M and N are not multiples of the 16×16 tile, so the last row and
 /// column bands are computed by *clamped, overlapping* tiles rather than by
-/// padding, and a mistake there shows up as wrong values in the overlap. K is a
-/// multiple of 32 so that both the K=32 and the K=16 configurations apply.
+/// padding, and a mistake there shows up as wrong values in the overlap. The
+/// larger shape also spans two 128×128 blocks, with a partial one in each
+/// direction. K is a multiple of 32 so that both the K=32 and the K=16
+/// configurations apply, and 96 is not a multiple of the 64 bytes the
+/// shared-memory variant stages per chunk, so its zero-filled tail runs too.
 ///
 /// Skipped, loudly, where the device has no cooperative matrix support (any CPU
 /// runtime, so this never runs in a lavapipe CI): there is nothing to compare.
 #[test]
 fn coop_variant_matches_the_cpu_reference() {
-    const CM: usize = 20;
-    const CK: usize = 64;
-    const CN: usize = 18;
-
     let ctx = VkContext::new().expect("contesto Vulkan");
-    let Some(variant) = coop_variant(&ctx.coop_u8, ctx.subgroup_size) else {
+    let variants = coop_variants(&ctx);
+    if variants.is_empty() {
         eprintln!(
             "SKIP: {} does not expose a usable u8 cooperative matrix \
              (coop_u8={:?}, subgroup={})",
             ctx.device_name, ctx.coop_u8, ctx.subgroup_size
         );
         return;
-    };
-    assert!(
-        coop_applies(variant, CM, CK, CN, false),
-        "le dimensioni del test devono ricadere nel percorso cooperative"
-    );
-    eprintln!("variante cooperative: {}", variant.key);
+    }
 
-    let a = pseudo(CM * CK, 5);
-    let b = pseudo(CK * CN, 17);
-    let (azp, bzp) = (37u8, 211u8);
+    for (cm, ck, cn) in [(20, 64, 18), (150, 96, 90)] {
+        let a = pseudo(cm * ck, 5);
+        let b = pseudo(ck * cn, 17);
+        let (azp, bzp) = (37u8, 211u8);
 
-    let mut b_t = vec![0u8; CN * CK];
-    for i in 0..CK {
-        for col in 0..CN {
-            b_t[col * CK + i] = b[i * CN + col];
+        let mut b_t = vec![0u8; cn * ck];
+        for i in 0..ck {
+            for col in 0..cn {
+                b_t[col * ck + i] = b[i * cn + col];
+            }
+        }
+
+        let mut want = vec![0i32; cm * cn];
+        for (row, out) in want.chunks_exact_mut(cn).enumerate() {
+            for (col, cell) in out.iter_mut().enumerate() {
+                *cell = (0..ck)
+                    .map(|k| {
+                        (i32::from(a[row * ck + k]) - i32::from(azp))
+                            * (i32::from(b[k * cn + col]) - i32::from(bzp))
+                    })
+                    .sum();
+            }
+        }
+
+        let buf_a = ctx.create_storage_buffer((cm * ck) as u64).unwrap();
+        let buf_b = ctx.create_storage_buffer((cn * ck) as u64).unwrap();
+        let buf_azp = ctx.create_storage_buffer(4).unwrap();
+        let buf_bzp = ctx.create_storage_buffer(4).unwrap();
+        let buf_out = ctx.create_storage_buffer((cm * cn * 4) as u64).unwrap();
+        ctx.upload(&buf_a, &a).unwrap();
+        ctx.upload(&buf_b, &b_t).unwrap();
+        ctx.upload(&buf_azp, &[azp, 0, 0, 0]).unwrap();
+        ctx.upload(&buf_bzp, &[bzp, 0, 0, 0]).unwrap();
+
+        let mut push = Vec::with_capacity(COOP_PUSH_BYTES as usize);
+        // m, k, n, a_zp_xor, b_zp_xor
+        for v in [cm as u32, ck as u32, cn as u32, 0, 0] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+
+        for variant in &variants {
+            assert!(
+                coop_applies(variant, cm, ck, cn, false),
+                "le dimensioni del test devono ricadere nel percorso cooperative"
+            );
+            let pipeline = ctx
+                .create_pipeline(&variant.spirv(), COOP_BINDINGS, COOP_PUSH_BYTES)
+                .unwrap();
+            ctx.upload(&buf_out, &vec![0u8; cm * cn * 4]).unwrap();
+            ctx.dispatch(
+                &pipeline,
+                &[&buf_a, &buf_b, &buf_azp, &buf_bzp, &buf_out],
+                &push,
+                variant.grid(cm, cn),
+            )
+            .unwrap();
+            ctx.destroy_pipeline(pipeline);
+
+            let bytes = ctx.download(&buf_out).unwrap();
+            let got: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(got, want, "{} on {cm}×{ck}×{cn}", variant.key);
+        }
+
+        for buffer in [buf_a, buf_b, buf_azp, buf_bzp, buf_out] {
+            ctx.destroy_buffer(buffer);
         }
     }
-
-    let mut want = vec![0i32; CM * CN];
-    for (row, out) in want.chunks_exact_mut(CN).enumerate() {
-        for (col, cell) in out.iter_mut().enumerate() {
-            *cell = (0..CK)
-                .map(|k| {
-                    (i32::from(a[row * CK + k]) - i32::from(azp))
-                        * (i32::from(b[k * CN + col]) - i32::from(bzp))
-                })
-                .sum();
-        }
-    }
-
-    let buf_a = ctx.create_storage_buffer((CM * CK) as u64).unwrap();
-    let buf_b = ctx.create_storage_buffer((CN * CK) as u64).unwrap();
-    let buf_azp = ctx.create_storage_buffer(4).unwrap();
-    let buf_bzp = ctx.create_storage_buffer(4).unwrap();
-    let buf_out = ctx.create_storage_buffer((CM * CN * 4) as u64).unwrap();
-    ctx.upload(&buf_a, &a).unwrap();
-    ctx.upload(&buf_b, &b_t).unwrap();
-    ctx.upload(&buf_azp, &[azp, 0, 0, 0]).unwrap();
-    ctx.upload(&buf_bzp, &[bzp, 0, 0, 0]).unwrap();
-
-    let mut push = Vec::with_capacity(COOP_PUSH_BYTES as usize);
-    // m, k, n, a_zp_xor, b_zp_xor
-    for v in [CM as u32, CK as u32, CN as u32, 0, 0] {
-        push.extend_from_slice(&v.to_le_bytes());
-    }
-    let pipeline = ctx
-        .create_pipeline(&variant.spirv(), COOP_BINDINGS, COOP_PUSH_BYTES)
-        .unwrap();
-    ctx.dispatch(
-        &pipeline,
-        &[&buf_a, &buf_b, &buf_azp, &buf_bzp, &buf_out],
-        &push,
-        [
-            (CN as u32).div_ceil(TILE_SIZE),
-            (CM as u32).div_ceil(TILE_SIZE),
-            1,
-        ],
-    )
-    .unwrap();
-
-    let bytes = ctx.download(&buf_out).unwrap();
-    let got: Vec<i32> = bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    for buffer in [buf_a, buf_b, buf_azp, buf_bzp, buf_out] {
-        ctx.destroy_buffer(buffer);
-    }
-    ctx.destroy_pipeline(pipeline);
-
-    assert_eq!(got, want, "percorso cooperative matrix");
 }
 
 /// The `int8` operand path, end to end: `PACK_B` flips the sign bit while it
@@ -257,7 +259,7 @@ fn signed_b_is_flipped_by_the_pack_and_matches_the_cpu_reference() {
     const SN: usize = 18;
 
     let ctx = VkContext::new().expect("contesto Vulkan");
-    let Some(variant) = coop_variant(&ctx.coop_u8, ctx.subgroup_size) else {
+    let Some(variant) = coop_variant(&ctx) else {
         eprintln!("SKIP: {} non ha cooperative matrix u8", ctx.device_name);
         return;
     };
@@ -326,11 +328,7 @@ fn signed_b_is_flipped_by_the_pack_and_matches_the_cpu_reference() {
         &pipeline,
         &[&buf_a, &buf_bpacked, &buf_azp, &buf_bzp, &buf_out],
         &push,
-        [
-            (SN as u32).div_ceil(TILE_SIZE),
-            (SM as u32).div_ceil(TILE_SIZE),
-            1,
-        ],
+        variant.grid(SM, SN),
     )
     .unwrap();
 

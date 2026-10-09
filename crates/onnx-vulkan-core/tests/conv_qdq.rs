@@ -756,3 +756,159 @@ fn qdq_conv_matches_float_conv_within_quantization_error() {
         );
     }
 }
+
+/// Runs one `Conv` with `tactic` forced through an exact-hit tuning cache and
+/// compares it with the untuned control. The runtime must execute the shader
+/// the tuner measured: a family-wide committed source with a tactic-specific
+/// dispatch grid covered only part of the output.
+fn assert_cached_conv_tactic_matches_control(
+    tactic: onnx_vulkan_core::shaders::conv::Tactic,
+    group: i64,
+    x_dims: [i64; 4],
+    w_dims: [i64; 4],
+) {
+    use onnx_vulkan_core::ElementType;
+    use onnx_vulkan_core::shaders::conv::implementation_fingerprint;
+    use onnx_vulkan_core::tuning::{
+        DeviceFingerprint, Measurement, TacticResolver, TensorSignature, TuningKey, TuningMode,
+        TuningRecord, TuningTable, WorkloadSignature, attributes_digest,
+    };
+
+    let context = VkContext::new().expect("Vulkan context");
+    let count = |dims: &[i64]| dims.iter().product::<i64>() as usize;
+    let c_out = w_dims[0];
+    let attrs = [
+        ("kernel_shape", AttrValue::Ints(vec![w_dims[2], w_dims[3]])),
+        ("pads", AttrValue::Ints(vec![1, 1, 1, 1])),
+        ("group", AttrValue::Int(group)),
+    ];
+    let mut initializers = HashMap::new();
+    initializers.insert(
+        "w".into(),
+        f32_init(w_dims.to_vec(), &pseudo(count(&w_dims), 211)),
+    );
+    initializers.insert(
+        "b".into(),
+        f32_init(vec![c_out], &pseudo(c_out as usize, 223)),
+    );
+    let ir = GraphIr {
+        nodes: conv_graph(&attrs, true),
+        initializers,
+        inputs: vec!["x".into()],
+        outputs: vec!["out".into()],
+        ..Default::default()
+    };
+    let out_dims = [
+        x_dims[0],
+        c_out,
+        x_dims[2] + 2 - w_dims[2] + 1,
+        x_dims[3] + 2 - w_dims[3] + 1,
+    ];
+    let input = HostTensor::from_f32(x_dims.to_vec(), &pseudo(count(&x_dims), 227));
+    let output = |executor: &Executor| {
+        executor
+            .run(vec![("x", Tensor::Host(input.clone()))])
+            .expect("conv run")
+            .host("out")
+            .expect("conv output")
+            .to_f32()
+            .expect("f32 output")
+    };
+    let signature = |dims: &[i64]| TensorSignature {
+        dtype: ElementType::Float32,
+        dimensions: dims.iter().map(|&d| d as u64).collect(),
+    };
+    let key = TuningKey {
+        device: DeviceFingerprint::from(context.device_fingerprint()),
+        workload: WorkloadSignature {
+            domain: String::new(),
+            op: "Conv".into(),
+            inputs: vec![signature(&x_dims), signature(&w_dims), signature(&[c_out])],
+            outputs: vec![signature(&out_dims)],
+            attributes_digest: attributes_digest(&ir.nodes[0]),
+        },
+        implementation: implementation_fingerprint(),
+    };
+    let (id, parameters) = tactic.persistent_parts();
+    let mut table = TuningTable::new();
+    table.insert_best(
+        key,
+        TuningRecord::new(
+            id,
+            parameters,
+            Measurement::new(20, 100, 90, 110).expect("valid measurement"),
+        ),
+    );
+    let resolver = Arc::new(TacticResolver::new(TuningMode::RequireCache, table));
+    // The tuned run goes first: a recycled buffer from the control run would
+    // otherwise already hold the expected values where the kernel never wrote.
+    let cached = Executor::with_tuning(&context, ir.clone(), resolver).expect("cached executor");
+    let tuned = output(&cached);
+    let control = output(&Executor::new(&context, ir).expect("control executor"));
+    assert_close(&tuned, &control, 1e-4, &format!("{tactic:?}"));
+}
+
+#[test]
+fn cached_direct_tactic_with_a_non_default_workgroup_covers_every_output() {
+    use onnx_vulkan_core::shaders::conv::Tactic;
+    // Depthwise 3×3 over 8×16×16: 2048 outputs, four 512-wide workgroups.
+    assert_cached_conv_tactic_matches_control(
+        Tactic::Direct {
+            workgroup_size: 512,
+        },
+        8,
+        [1, 8, 16, 16],
+        [8, 1, 3, 3],
+    );
+}
+
+#[test]
+fn cached_split_k_tactic_with_a_non_default_tile_covers_every_output() {
+    use onnx_vulkan_core::shaders::conv::Tactic;
+    // 256 pixels × 160 channels: the 128 tile leaves part of a 64-tile grid unvisited.
+    assert_cached_conv_tactic_matches_control(
+        Tactic::SplitK {
+            output_tile: 128,
+            k_step: 16,
+            micro_tile: 4,
+            split: 2,
+        },
+        1,
+        [1, 32, 16, 16],
+        [160, 32, 3, 3],
+    );
+}
+
+#[test]
+fn quantize_linear_rounds_the_exact_quotient_near_a_tie() {
+    // Inputs from a MobileNetV2 calibration sample: their exact quotients
+    // (-44.500004, -13.5) round to -45 and -14, while a quotient off by an
+    // ULP (x * rcp(scale)) rounds to -44 and -13. One flipped input value
+    // moved every logit of the model by up to 0.21.
+    let scale = 0.039_198_44f32;
+    let x = [-1.744_330_6f32, -0.529_178_9, 1.744_330_6, 0.529_178_9];
+    let mut initializers = HashMap::new();
+    initializers.insert("scale".to_string(), f32_init(vec![], &[scale]));
+    initializers.insert("zp".to_string(), byte_init(UINT8, vec![], vec![127]));
+    let ir = GraphIr {
+        nodes: vec![
+            node("QuantizeLinear", &["x", "scale", "zp"], &["q"], &[]),
+            node("DequantizeLinear", &["q", "scale", "zp"], &["out"], &[]),
+        ],
+        initializers,
+        inputs: vec!["x".to_string()],
+        outputs: vec!["out".to_string()],
+        ..Default::default()
+    };
+    let out = run(&ir, &[("x", HostTensor::from_f32(vec![4], &x))], "out");
+    let got = to_f32(&out);
+    for (i, &value) in x.iter().enumerate() {
+        let q = ((value / scale).round_ties_even() + 127.0).clamp(0.0, 255.0);
+        let want = (q - 127.0) * scale;
+        assert!(
+            (got[i] - want).abs() <= 1e-6,
+            "element {i} ({value}): {} vs expected {want}",
+            got[i]
+        );
+    }
+}

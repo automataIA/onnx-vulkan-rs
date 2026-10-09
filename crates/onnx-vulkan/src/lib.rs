@@ -31,7 +31,7 @@ use onnx_vulkan_core::{DeviceBuffer, DeviceTensor, Executor, Tensor};
 use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use vk_compute::{GpuBuffer, VkContext};
 
 pub use onnx_vulkan_core::graph::ElementType;
@@ -81,6 +81,36 @@ impl From<onnx_vulkan_core::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Options applied while constructing a [`Session`].
+///
+/// With no explicit resolver, loading keeps the existing environment policy
+/// (`ONNX_VULKAN_TUNING_MODE` and `ONNX_VULKAN_TUNING_ARTIFACT`). Passing a
+/// resolver makes the policy explicit for hosts that already loaded or built
+/// a tuning table.
+#[derive(Clone, Default)]
+pub struct SessionOptions {
+    tuning: Option<Arc<onnx_vulkan_core::tuning::TacticResolver>>,
+}
+
+impl SessionOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Uses an explicitly constructed tactic resolver for this session.
+    pub fn with_tuning(tuning: Arc<onnx_vulkan_core::tuning::TacticResolver>) -> Self {
+        Self {
+            tuning: Some(tuning),
+        }
+    }
+
+    /// Sets an explicit tactic resolver, preserving builder-style call sites.
+    pub fn tuning(mut self, tuning: Arc<onnx_vulkan_core::tuning::TacticResolver>) -> Self {
+        self.tuning = Some(tuning);
+        self
+    }
+}
 
 /// Name, element type and shape of a graph input or output.
 ///
@@ -132,6 +162,15 @@ fn context() -> Result<&'static VkContext> {
         .map_err(|e| Error::Device(e.clone()))
 }
 
+/// Creates the process-wide Vulkan device now, if not already created, and
+/// returns its name.
+///
+/// Useful to pick the device before other code in the process (for example a
+/// GUI toolkit) temporarily changes the Vulkan loader environment.
+pub fn device_name() -> Result<&'static str> {
+    context().map(|ctx| ctx.device_name.as_str())
+}
+
 /// A model loaded onto the GPU, ready to run any number of times.
 pub struct Session {
     executor: Executor<'static>,
@@ -145,19 +184,39 @@ impl Session {
     /// External weights are resolved relative to the model's own directory, as
     /// the ONNX specification prescribes.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_model(onnx_vulkan_frontend::load(path)?)
+        Self::load_with_options(path, SessionOptions::default())
+    }
+
+    /// Loads an `.onnx` file with explicit session options.
+    pub fn load_with_options(path: impl AsRef<Path>, options: SessionOptions) -> Result<Self> {
+        Self::from_model(onnx_vulkan_frontend::load(path)?, options)
     }
 
     /// Same as [`Session::load`], for a model already in memory. `base_dir` is
     /// where external weights are looked up; `None` rejects a model that uses
     /// them rather than guessing where they live.
     pub fn load_from_bytes(bytes: &[u8], base_dir: Option<&Path>) -> Result<Self> {
-        Self::from_model(onnx_vulkan_frontend::load_from_bytes(bytes, base_dir)?)
+        Self::load_from_bytes_with_options(bytes, base_dir, SessionOptions::default())
     }
 
-    fn from_model(model: onnx_vulkan_frontend::Model) -> Result<Self> {
-        let tuning = onnx_vulkan_tune::runtime_resolver_from_env()
-            .map_err(|error| Error::Device(format!("tuning configuration: {error}")))?;
+    /// Same as [`Self::load_from_bytes`], with explicit session options.
+    pub fn load_from_bytes_with_options(
+        bytes: &[u8],
+        base_dir: Option<&Path>,
+        options: SessionOptions,
+    ) -> Result<Self> {
+        Self::from_model(
+            onnx_vulkan_frontend::load_from_bytes(bytes, base_dir)?,
+            options,
+        )
+    }
+
+    fn from_model(model: onnx_vulkan_frontend::Model, options: SessionOptions) -> Result<Self> {
+        let tuning = match options.tuning {
+            Some(tuning) => tuning,
+            None => onnx_vulkan_tune::runtime_resolver_from_env()
+                .map_err(|error| Error::Device(format!("tuning configuration: {error}")))?,
+        };
         for conflict in &model.conflicts {
             log::warn!("shape inference: {conflict}");
         }
@@ -214,27 +273,56 @@ impl Session {
     where
         N: AsRef<str>,
     {
+        self.run_with_device(inputs, &[])
+    }
+
+    /// [`Self::run`] with some inputs already in VRAM, as [`Run::take`] left
+    /// them — typically another session's outputs, such as an image encoder's
+    /// features read by a decoder once per prompt.
+    ///
+    /// The values are borrowed, not consumed: the same features serve any
+    /// number of runs, and nothing about them crosses the bus.
+    pub fn run_with_device<'a, N>(
+        &'a self,
+        inputs: impl IntoIterator<Item = (N, HostTensor)>,
+        device: &[(&str, &'a DeviceValue)],
+    ) -> Result<Run<'a>>
+    where
+        N: AsRef<str>,
+    {
         let supplied: Vec<(String, HostTensor)> = inputs
             .into_iter()
             .map(|(name, tensor)| (name.as_ref().to_string(), tensor))
             .collect();
-        for (name, _) in &supplied {
-            if !self.inputs.iter().any(|i| &i.name == name) {
-                return Err(Error::NoSuchValue(name.clone()));
+        let names = supplied
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(device.iter().map(|(name, _)| *name));
+        for name in names {
+            if !self.inputs.iter().any(|i| i.name == name) {
+                return Err(Error::NoSuchValue(name.to_string()));
             }
         }
         for input in &self.inputs {
-            if !supplied.iter().any(|(name, _)| name == &input.name) {
+            let given = supplied.iter().any(|(name, _)| name == &input.name)
+                || device.iter().any(|(name, _)| *name == input.name);
+            if !given {
                 return Err(Error::NoSuchValue(format!(
                     "{} (a required input was not supplied)",
                     input.name
                 )));
             }
         }
-        let bound: Vec<(&str, Tensor<'a>)> = supplied
+        // moved, not cloned: the caller already handed them over
+        let (names, tensors): (Vec<String>, Vec<HostTensor>) = supplied.into_iter().unzip();
+        let mut bound: Vec<(&str, Tensor<'a>)> = names
             .iter()
-            .map(|(name, tensor)| (name.as_str(), Tensor::Host(tensor.clone())))
+            .map(String::as_str)
+            .zip(tensors.into_iter().map(Tensor::Host))
             .collect();
+        for (name, value) in device {
+            bound.push((name, Tensor::Device(value.borrow())));
+        }
         Ok(Run {
             outputs: self.executor.run(bound)?,
         })
@@ -722,6 +810,47 @@ impl KvCache {
     }
 }
 
+/// A tensor in VRAM that belongs to the caller, taken from a run with
+/// [`Run::take`]. Its memory goes back to the device's pool when dropped.
+pub struct DeviceValue {
+    dtype: i32,
+    shape: Vec<i64>,
+    elem_count: usize,
+    /// Always `Some` until `drop` hands it back.
+    buffer: Option<GpuBuffer>,
+    context: &'static VkContext,
+}
+
+impl DeviceValue {
+    /// The ONNX element type, `None` for one this crate does not name.
+    pub fn dtype(&self) -> Option<ElementType> {
+        ElementType::try_from(self.dtype).ok()
+    }
+
+    pub fn shape(&self) -> &[i64] {
+        &self.shape
+    }
+
+    fn borrow(&self) -> DeviceTensor<'_> {
+        DeviceTensor {
+            dtype: self.dtype,
+            shape: self.shape.clone(),
+            elem_count: self.elem_count,
+            buf: DeviceBuffer::Borrowed(self.buffer.as_ref().expect("taken only by drop")),
+        }
+    }
+}
+
+impl Drop for DeviceValue {
+    fn drop(&mut self) {
+        // recycling never fails, and it is safe with dispatches still reading
+        // the buffer: whatever is issued next is ordered after them
+        if let Some(buffer) = self.buffer.take() {
+            self.context.recycle_storage_buffer(buffer);
+        }
+    }
+}
+
 /// The values one run produced, readable until dropped.
 pub struct Run<'a> {
     outputs: onnx_vulkan_core::Outputs<'a>,
@@ -740,6 +869,36 @@ impl Run<'_> {
     /// outputs, such as decoders exposing one key/value cache per layer.
     pub fn get_many(&self, names: &[&str]) -> Result<Vec<HostTensor>> {
         Ok(self.outputs.host_many(names)?)
+    }
+
+    /// [`Self::get_many`] into tensors kept across runs: each one's dtype,
+    /// shape and bytes are overwritten, reusing its allocations. On error their
+    /// contents are unspecified.
+    ///
+    /// A fresh output buffer pays its page faults on every run, the reused one
+    /// once: start from empty tensors and pass the same ones to every run.
+    pub fn get_many_into(&self, names: &[&str], outputs: &mut [HostTensor]) -> Result<()> {
+        Ok(self.outputs.host_many_into(names, outputs)?)
+    }
+
+    /// Takes an output out of the run, leaving it in VRAM, to be bound to
+    /// another run with [`Session::run_with_device`].
+    ///
+    /// Nothing is downloaded and the GPU is not waited for. The output is no
+    /// longer readable from this run afterwards.
+    pub fn take(&mut self, name: &str) -> Result<DeviceValue> {
+        let context = context()?;
+        let tensor = self.outputs.take_device(name)?;
+        let DeviceBuffer::Owned(buffer) = tensor.buf else {
+            unreachable!("take_device returns owned storage");
+        };
+        Ok(DeviceValue {
+            dtype: tensor.dtype,
+            shape: tensor.shape,
+            elem_count: tensor.elem_count,
+            buffer: Some(buffer),
+            context,
+        })
     }
 
     /// Index of the largest element along the last axis of an output, computed

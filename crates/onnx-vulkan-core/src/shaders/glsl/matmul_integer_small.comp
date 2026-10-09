@@ -1,0 +1,99 @@
+// MatMulInteger with the dequantizing epilogue, for the products the
+// cooperative kernel cannot tile: fewer than 16 rows (a single token) or
+// columns (box and point heads), or a K that is not a multiple of its K tile.
+//
+// Bindings, push constants and epilogue are the cooperative epilogue build's
+// (glsl/matmul_integer_coop.comp): A is uint8 [M, K], B the packed [N, K]
+// already brought to uint8, out [M, N] f32 holds float(acc) * scale + bias
+// rounded as the three kernels it replaces, flag 1 Relu, flag 2 the range of
+// what it stores, flag 4 scale * product. Only a K that is a multiple of 4.
+//
+// One output per thread over a flattened [M, N] index, consecutive threads on
+// consecutive columns of one row: the row of A is one broadcast read, and the
+// few rows of B a small N needs stay in cache. Each 4-byte word is unpacked
+// and multiplied in int32, exact in any order, so the sum is the tiled
+// kernel's.
+
+#version 450 core
+
+#define GROUP 64
+layout(local_size_x = GROUP) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuf { uint a[]; };   // [M, K/4]
+layout(set = 0, binding = 1) readonly buffer BBuf { uint b[]; };   // [N, K/4] packed
+layout(set = 0, binding = 2) readonly buffer AZp  { uint azp[]; };
+layout(set = 0, binding = 3) readonly buffer BZp  { uint bzp[]; };
+layout(set = 0, binding = 4) writeonly buffer OBuf { float o[]; };  // [M, N]
+layout(set = 0, binding = 5) readonly buffer Scale { float scale[]; };
+layout(set = 0, binding = 6) readonly buffer Bias  { float bias[]; };
+layout(set = 0, binding = 7) buffer Range { uint range_bits[]; };  // bits of -min, max
+layout(set = 0, binding = 8) readonly buffer Product { float product[]; };
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint k;
+    uint n;
+    uint a_zp_xor;
+    uint b_zp_xor;
+    uint scale_step;
+    uint bias_step;
+    uint flags;
+    uint product_step;
+} pc;
+
+// the range of the workgroup's stored values, reduced through shared memory
+// (no subgroup operations, so no device feature beyond Vulkan 1.0)
+shared float tops[GROUP];
+shared float bottoms[GROUP];
+
+void main() {
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint idx = group * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    // what this thread stored, for the range; 0 as ONNX's range starts
+    float v = 0.0;
+    if (idx < pc.m * pc.n) {
+        uint row = idx / pc.n;
+        uint c = idx % pc.n;
+        uint k4 = pc.k / 4u;
+        int za = int((azp[0] & 0xffu) ^ pc.a_zp_xor);
+        int zb = int((bzp[0] & 0xffu) ^ pc.b_zp_xor);
+        int acc = 0;
+        for (uint w = 0u; w < k4; w++) {
+            uint aw = a[row * k4 + w];
+            uint bw = b[c * k4 + w];
+            for (int j = 0; j < 32; j += 8) {
+                acc += (int(bitfieldExtract(aw, j, 8)) - za) * (int(bitfieldExtract(bw, j, 8)) - zb);
+            }
+        }
+        precise float x = float(acc);
+        precise float s = scale[c * (pc.scale_step & 1u) + row * (pc.scale_step >> 1u)];
+        if ((pc.flags & 4u) != 0u) {
+            s = s * product[c * (pc.product_step & 1u) + row * (pc.product_step >> 1u)];
+        }
+        precise float y = x * s;
+        precise float z = y + bias[c * (pc.bias_step & 1u) + row * (pc.bias_step >> 1u)];
+        v = (pc.flags & 1u) != 0u ? max(z, 0.0) : z;
+        o[idx] = v;
+    }
+    // as the cooperative kernel's fold_range, one atomic per workgroup: both
+    // values are >= 0 so their bits order like them, the mask turns -0.0 into
+    // 0. The flag is a push constant, so the barriers are in uniform control
+    // flow.
+    if ((pc.flags & 2u) != 0u) {
+        uint t = gl_LocalInvocationID.x;
+        tops[t] = v;
+        bottoms[t] = -v;
+        barrier();
+        for (uint half_ = GROUP / 2u; half_ > 0u; half_ /= 2u) {
+            if (t < half_) {
+                tops[t] = max(tops[t], tops[t + half_]);
+                bottoms[t] = max(bottoms[t], bottoms[t + half_]);
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            atomicMax(range_bits[0], floatBitsToUint(bottoms[0]) & 0x7fffffffu);
+            atomicMax(range_bits[1], floatBitsToUint(tops[0]) & 0x7fffffffu);
+        }
+    }
+}

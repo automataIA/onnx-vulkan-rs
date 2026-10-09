@@ -7,8 +7,8 @@
 // the SPIR-V is checked in (see scripts/build-glsl.sh). Everything else in the
 // project stays WGSL.
 //
-// Compiled once per (K_TILE, SUBGROUP_SIZE, accumulator) triple, all -D
-// defines. The valid combinations are whatever
+// Compiled once per (K_TILE, SUBGROUP_SIZE, accumulator, TM x TN block), all
+// -D defines. The valid combinations are whatever
 // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR reports, and the
 // accumulator component type must match it exactly: today NVIDIA reports
 // 16x16x32 u8*u8 -> u32 on a 32-wide subgroup, AMD 16x16x16 u8*u8 -> i32 on a
@@ -24,7 +24,7 @@
 //
 //     sum (a - za)(b - zb) = sum ab - za*sum b - zb*sum a + K*za*zb
 //
-// sum a and sum b are obtained from two extra coopMatMulAdd against an all-ones
+// sum a and sum b are obtained from extra coopMatMulAdd against an all-ones
 // operand, so all three terms stay on the tensor cores. Accumulation happens in
 // whichever 32-bit integer type the driver advertises: the true result fits in
 // int32 and two's complement arithmetic is modular, so either way the bit
@@ -35,15 +35,35 @@
 // coopMatLoad is undefined). Overlapping tiles recompute identical values, so
 // the redundant stores are harmless. This requires M >= 16 and N >= 16; the
 // caller falls back to the WGSL kernel otherwise.
+//
+// EPILOGUE. Defined, the kernel also does the dequantization that follows
+// every linear layer of a dynamically quantized model, Cast -> Mul -> Add:
+// out is [M, N] f32 and holds float(acc) * scale + bias, with scale and bias
+// one value, one per column (a linear layer) or one per row (a convolution,
+// whose rows are the output channels). Each integer tile goes through shared
+// memory, because a cooperative matrix gives no element's coordinates, and
+// every thread then finishes its elements in exactly the order and rounding of
+// the three separate kernels: a conversion, a rounded multiply, a rounded add.
+// `precise` keeps the compiler from contracting the last two into an FMA, which
+// would round once instead of twice and change the bits. With flag 1 set the
+// Relu that follows is applied too, as the unary kernel's max(z, 0.0). With
+// flag 2 set the kernel also folds the range of what it stores into `range`,
+// for the DynamicQuantizeLinear that follows: atomicMax of the bits of -min
+// and max, as its own min/max pass does (see shaders/dynamic_quantize.rs).
+// With flag 4 set the scale is scale * product, rounded once as the Mul that
+// computed it ahead of the kernel did: the activation scale times the weight
+// scale, which then needs no dispatch of its own.
 
 #version 450 core
 
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
 
 #ifndef K_TILE
 #error "K_TILE must be defined (16 or 32)"
@@ -63,13 +83,38 @@
 #define ACC_ZERO 0u
 #endif
 
+// Blocking. The workgroup is one subgroup computing TM x TN output tiles of
+// 16x16: every A tile it loads feeds TN multiplies and every B tile TM, and the
+// row and column sums cost TM + TN multiplies per K step instead of two per
+// output tile. Both default to 1, one tile per workgroup.
+//
+// The loops over the block are unrolled on purpose. Left as loops, the
+// cooperative matrix arrays are indexed dynamically and a 4x4 block runs at
+// 0.4x the unrolled speed on an RTX 4070. Past about 24 accumulators (4x6,
+// 3x8) the registers run out and the kernel collapses regardless. Several
+// subgroups per workgroup measured no faster than one.
+#ifndef TM
+#define TM 1
+#endif
+#ifndef TN
+#define TN 1
+#endif
+
 layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer ABuf { uint8_t a[]; };   // [M, K]
 layout(set = 0, binding = 1) readonly buffer BBuf { uint8_t b[]; };   // [N, K] packed
 layout(set = 0, binding = 2) readonly buffer AZp  { uint8_t azp[]; };
 layout(set = 0, binding = 3) readonly buffer BZp  { uint8_t bzp[]; };
+#ifdef EPILOGUE
+layout(set = 0, binding = 4) writeonly buffer OBuf { float o[]; };   // [M, N]
+layout(set = 0, binding = 5) readonly buffer Scale { float scale[]; };
+layout(set = 0, binding = 6) readonly buffer Bias  { float bias[]; };
+layout(set = 0, binding = 7) buffer Range { uint range_bits[]; };  // bits of -min, max
+layout(set = 0, binding = 8) readonly buffer Product { float product[]; };
+#else
 layout(set = 0, binding = 4) writeonly buffer OBuf { ACC_T o[]; };   // [M, N]
+#endif
 
 layout(push_constant) uniform Push {
     uint m;
@@ -82,49 +127,142 @@ layout(push_constant) uniform Push {
     // here.
     uint a_zp_xor;
     uint b_zp_xor;
+#ifdef EPILOGUE
+    // How scale (bias) broadcasts: 0 one value, 1 one per column, 2 one per
+    // row. The index is col * (step & 1) + row * (step >> 1).
+    uint scale_step;
+    uint bias_step;
+    // bit 0: a Relu follows, max(z, 0.0) as the unary kernel computes it;
+    // bit 1: fold the range of the stored values into `range_bits`;
+    // bit 2: the scale is scale * product
+    uint flags;
+    // how product broadcasts, as scale_step
+    uint product_step;
+#endif
 } pc;
 
 #define TILE 16
 
+#ifdef EPILOGUE
+shared ACC_T staged[TILE * TILE];
+// the largest stored value and the largest negated one, from 0 as ONNX's
+// range starts
+float run_max = 0.0;
+float run_neg = 0.0;
+
+// float(acc) * scale + bias for one 16x16 tile at (row, col), row major.
+void finish_tile(uint row, uint col) {
+    for (uint e = gl_LocalInvocationID.x; e < TILE * TILE; e += SUBGROUP_SIZE) {
+        uint c = col + e % TILE;
+        uint r = row + e / TILE;
+        // int() keeps the bits of an unsigned accumulator: the value is the
+        // signed one either way (see the algebra above)
+        precise float x = float(int(staged[e]));
+        precise float s = scale[c * (pc.scale_step & 1u) + r * (pc.scale_step >> 1u)];
+        if ((pc.flags & 4u) != 0u) {
+            s = s * product[c * (pc.product_step & 1u) + r * (pc.product_step >> 1u)];
+        }
+        precise float y = x * s;
+        precise float z = y + bias[c * (pc.bias_step & 1u) + r * (pc.bias_step >> 1u)];
+        float v = (pc.flags & 1u) != 0u ? max(z, 0.0) : z;
+        o[r * pc.n + c] = v;
+        run_max = max(run_max, v);
+        run_neg = max(run_neg, -v);
+    }
+}
+
+// One atomic per subgroup; both values are >= 0, so their bits order like
+// them, and the mask turns a -0.0 into 0.
+void fold_range() {
+    if ((pc.flags & 2u) != 0u) {
+        float top = subgroupMax(run_max);
+        float bottom = subgroupMax(run_neg);
+        if (subgroupElect()) {
+            atomicMax(range_bits[0], floatBitsToUint(bottom) & 0x7fffffffu);
+            atomicMax(range_bits[1], floatBitsToUint(top) & 0x7fffffffu);
+        }
+    }
+}
+#endif
+
+#define ACC_MAT coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define A_MAT coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA>
+#define B_MAT coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB>
+
 void main() {
+    uint row_base = gl_WorkGroupID.y * (TM * TILE);
+    uint col_base = gl_WorkGroupID.x * (TN * TILE);
     // Clamp so every tile is fully in range; the last row/column band overlaps
     // the previous one and recomputes the same values.
-    uint row0 = min(gl_WorkGroupID.y * TILE, pc.m - TILE);
-    uint col0 = min(gl_WorkGroupID.x * TILE, pc.n - TILE);
+    uint rows[TM];
+    uint cols[TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        rows[i] = min(row_base + i * TILE, pc.m - TILE);
+    }
+    [[unroll]] for (uint j = 0u; j < TN; j++) {
+        cols[j] = min(col_base + j * TILE, pc.n - TILE);
+    }
 
-    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
-        coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(ACC_ZERO);
-    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> sa = acc;
-    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> sb = acc;
+    ACC_MAT acc[TM * TN];
+    ACC_MAT sa[TM];
+    ACC_MAT sb[TN];
+    [[unroll]] for (uint t = 0u; t < TM * TN; t++) {
+        acc[t] = ACC_MAT(ACC_ZERO);
+    }
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        sa[i] = ACC_MAT(ACC_ZERO);
+    }
+    [[unroll]] for (uint j = 0u; j < TN; j++) {
+        sb[j] = ACC_MAT(ACC_ZERO);
+    }
 
     // All-ones operands: multiplying by them turns a matrix product into the
     // row sums of A (ones on the B side) and the column sums of B (ones on the
     // A side), replicated across the tile.
-    coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA> ones_a =
-        coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA>(uint8_t(1u));
-    coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB> ones_b =
-        coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB>(uint8_t(1u));
+    A_MAT ones_a = A_MAT(uint8_t(1u));
+    B_MAT ones_b = B_MAT(uint8_t(1u));
 
     for (uint kt = 0u; kt < pc.k; kt += uint(K_TILE)) {
-        coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA> ma;
-        coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB> mb;
+        A_MAT ma[TM];
+        B_MAT mb[TN];
         // A is [M, K] row major; B is stored transposed as [N, K], which is
         // exactly column major for the [K, N] operand the multiply wants.
-        coopMatLoad(ma, a, row0 * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(mb, b, col0 * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutColumnMajor);
-
-        acc = coopMatMulAdd(ma, mb, acc);
-        sa = coopMatMulAdd(ma, ones_b, sa);
-        sb = coopMatMulAdd(ones_a, mb, sb);
+        [[unroll]] for (uint i = 0u; i < TM; i++) {
+            coopMatLoad(ma[i], a, rows[i] * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            coopMatLoad(mb[j], b, cols[j] * pc.k + kt, pc.k, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        [[unroll]] for (uint i = 0u; i < TM; i++) {
+            [[unroll]] for (uint j = 0u; j < TN; j++) {
+                acc[i * TN + j] = coopMatMulAdd(ma[i], mb[j], acc[i * TN + j]);
+            }
+            sa[i] = coopMatMulAdd(ma[i], ones_b, sa[i]);
+        }
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            sb[j] = coopMatMulAdd(ones_a, mb[j], sb[j]);
+        }
     }
 
     ACC_T za = ACC_T(uint(azp[0]) ^ pc.a_zp_xor);
     ACC_T zb = ACC_T(uint(bzp[0]) ^ pc.b_zp_xor);
-    ACC_T corr = ACC_T(pc.k) * za * zb;
+    ACC_MAT corr = ACC_MAT(ACC_T(pc.k) * za * zb);
 
-    coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> res =
-        acc - sb * za - sa * zb
-        + coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(corr);
-
-    coopMatStore(res, o, row0 * pc.n + col0, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            ACC_MAT res = acc[i * TN + j] - sb[j] * za - sa[i] * zb + corr;
+#ifdef EPILOGUE
+            coopMatStore(res, staged, 0, TILE, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            finish_tile(rows[i], cols[j]);
+            // the next tile overwrites what this one is still reading
+            barrier();
+#else
+            coopMatStore(res, o, rows[i] * pc.n + cols[j], pc.n, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+    }
+#ifdef EPILOGUE
+    fold_range();
+#endif
 }

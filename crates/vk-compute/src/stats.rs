@@ -153,6 +153,39 @@ pub fn record_recording(ns: u64) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Host time per named phase of a run, and how many times it ran: uploads,
+/// readbacks, the retirement after a fence, the interpreter loop. What is left
+/// of a wall clock once GPU compute is taken out has to be found somewhere,
+/// and these say where. They nest: `execute nodes` contains the uploads,
+/// recording and any flush its nodes issue, and a caller's span (the
+/// runner's `facade run`) contains everything its call did.
+static SPANS: Mutex<Option<HashMap<&'static str, (u64, u64)>>> = Mutex::new(None);
+
+pub fn record_span(name: &'static str, ns: u64) {
+    let mut s = SPANS.lock().unwrap();
+    let e = s
+        .get_or_insert_with(HashMap::new)
+        .entry(name)
+        .or_insert((0, 0));
+    e.0 += ns;
+    e.1 += 1;
+}
+
+/// A phase timed until dropped; free when profiling is off.
+pub struct Span(Option<(&'static str, std::time::Instant)>);
+
+pub fn span(name: &'static str) -> Span {
+    Span(enabled().then(|| (name, std::time::Instant::now())))
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if let Some((name, start)) = self.0 {
+            record_span(name, start.elapsed().as_nanos() as u64);
+        }
+    }
+}
+
 pub fn record_flush(wall_ns: u64) {
     FLUSH_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
     FLUSHES.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +222,14 @@ pub fn dump_and_reset() {
     let pool_hits = POOL_HITS.swap(0, Ordering::Relaxed);
     let record_ns = RECORD_NS.swap(0, Ordering::Relaxed);
     let recorded = RECORDED.swap(0, Ordering::Relaxed);
+    let mut spans: Vec<_> = SPANS
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    spans.sort_unstable();
 
     let gpu_total: u64 = map.values().map(|(ns, _)| *ns).sum();
     if gpu_total == 0 && flush_wall == 0 {
@@ -233,6 +274,13 @@ pub fn dump_and_reset() {
             record_ns as f64 / 1e6
         );
     }
+    for (name, (ns, count)) in &spans {
+        log::info!(
+            "  {:<22} {:>8.3} ms         ({count}x, host span)",
+            name,
+            *ns as f64 / 1e6
+        );
+    }
     log::info!(
         "  sync/overhead ~{:.3} ms across {} flushes; transfer up {:.1} MB / down {:.1} MB",
         sync_ns as f64 / 1e6,
@@ -266,6 +314,12 @@ pub fn dump_and_reset() {
 /// Storage-buffer allocations so far (probe hook, see interp's ALLOC_PROBE).
 pub fn allocs() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
+}
+
+/// Storage-buffer requests the pool served so far: with `allocs`, every
+/// buffer a run asked for, whether or not it was recycled.
+pub fn pool_hits() -> u64 {
+    POOL_HITS.load(Ordering::Relaxed)
 }
 
 /// Dispatches recorded into the stream so far (probe hook, see the interpreter's

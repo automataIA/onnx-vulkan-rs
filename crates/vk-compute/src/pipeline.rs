@@ -89,6 +89,21 @@ impl VkContext {
         }
     }
 
+    /// Descriptor for `b`: from its offset to the end of the buffer, capped at
+    /// `maxStorageBufferRange`. `VK_WHOLE_SIZE` would be the same range
+    /// uncapped, and the spec leaves a larger effective range undefined: the
+    /// block ORT's memory pattern allocates for a whole run passes 4 GiB on
+    /// SAM 3's vision encoder (4.7 GB), and the RTX 4070 keeps the range
+    /// modulo 2^32, reading zeros past it.
+    pub(crate) fn binding_info(&self, b: &BufferSlice<'_>) -> vk::DescriptorBufferInfo {
+        let range =
+            (b.buf.size - b.offset).min(self.compute_limits().max_storage_buffer_bytes & !3);
+        vk::DescriptorBufferInfo::default()
+            .buffer(b.buf.buffer)
+            .offset(b.offset)
+            .range(range)
+    }
+
     /// Records a dispatch in the given command buffer. Descriptor set is
     /// allocated from the persistent arena (reset on flush).
     pub(crate) fn record_dispatch(
@@ -118,15 +133,8 @@ impl VkContext {
         let set = self.acquire_descriptor_set(pipeline.set_layout)?;
         let device = &self.device;
         unsafe {
-            let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
-                .iter()
-                .map(|b| {
-                    [vk::DescriptorBufferInfo::default()
-                        .buffer(b.buf.buffer)
-                        .offset(b.offset)
-                        .range(vk::WHOLE_SIZE)]
-                })
-                .collect();
+            let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> =
+                buffers.iter().map(|b| [self.binding_info(b)]).collect();
             let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
                 .iter()
                 .enumerate()

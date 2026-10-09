@@ -87,6 +87,126 @@ fn runs_a_graph_and_reads_both_device_and_host_outputs() {
     outputs.finish();
 }
 
+/// The caller-owned readback: a second run overwrites the same tensors in
+/// place, keeping the output buffer's allocation, whatever they held before.
+#[test]
+fn reads_outputs_into_tensors_kept_across_runs() {
+    let context = VkContext::new().expect("Vulkan context");
+    let executor = Executor::new(&context, graph()).expect("supported graph");
+    // stale contents of another dtype and shape
+    let mut kept = vec![HostTensor::from_f32(vec![3], &[9.0; 3]); 2];
+
+    let outputs = executor.run(vec![("x", input())]).expect("first execution");
+    outputs
+        .host_many_into(&["out", "x_shape"], &mut kept)
+        .expect("readback into kept tensors");
+    assert_eq!(kept[0], outputs.host("out").expect("owned readback"));
+    assert_eq!(kept[0].to_f32().expect("f32"), WANT.to_vec());
+    assert_eq!(
+        (kept[1].dtype, kept[1].to_i64().expect("i64")),
+        (INT64, vec![2, 4])
+    );
+    let wrong = outputs.host_many_into(&["out"], &mut kept);
+    assert!(wrong.is_err(), "one destination per name");
+    outputs.finish();
+
+    let buffer = kept[0].data.as_ptr();
+    let negated: Vec<f32> = X.iter().map(|v| -v).collect();
+    let outputs = executor
+        .run(vec![(
+            "x",
+            Tensor::Host(HostTensor::from_f32(vec![2, 4], &negated)),
+        )])
+        .expect("second execution");
+    outputs
+        .host_many_into(&["out", "x_shape"], &mut kept)
+        .expect("second readback");
+    assert_eq!(
+        kept[0].to_f32().expect("f32"),
+        [0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]
+    );
+    assert_eq!(kept[0].data.as_ptr(), buffer, "allocation reused");
+    outputs.finish();
+}
+
+/// A one-shot run leaves its buffers pooled within the context's budget, and
+/// the next run of the same graph is served them: nothing allocated, nothing
+/// freed.
+#[test]
+fn a_second_run_is_served_the_buffers_the_first_one_pooled() {
+    let context = VkContext::new().expect("Vulkan context");
+    let executor = Executor::new(&context, graph()).expect("supported graph");
+    let pooled_ids = || {
+        let pooled = context.take_storage_pool();
+        let mut ids: Vec<u64> = pooled.iter().map(|buffer| buffer.id()).collect();
+        for buffer in pooled {
+            context.recycle_storage_buffer(buffer);
+        }
+        ids.sort_unstable();
+        ids
+    };
+
+    executor
+        .run(vec![("x", input())])
+        .expect("first execution")
+        .finish();
+    let first = pooled_ids();
+    assert!(
+        !first.is_empty(),
+        "the run keeps its buffers for the next one"
+    );
+
+    let outputs = executor
+        .run(vec![("x", input())])
+        .expect("second execution");
+    assert_eq!(outputs.host("out").expect("out").to_f32().unwrap(), WANT);
+    outputs.finish();
+    assert_eq!(pooled_ids(), first, "the same buffers, none new");
+}
+
+/// `Reshape` takes its input's buffer when it is the input's last reader, and
+/// copies it when the graph still needs the input: same output, one buffer
+/// fewer in the first case.
+#[test]
+fn a_reshape_takes_the_buffer_of_an_input_that_dies_there() {
+    let context = VkContext::new().expect("Vulkan context");
+    let mut ir = graph();
+    ir.nodes = vec![
+        node("Mul", &["x", "w"], &["prod"]),
+        node("Relu", &["prod"], &["act"]),
+        node("Reshape", &["act", "flat"], &["out"]),
+    ];
+    ir.outputs = vec!["out".to_string()];
+    ir.initializers.insert(
+        "flat".to_string(),
+        InitializerIr {
+            dtype: INT64,
+            shape: vec![1],
+            data: 8i64.to_le_bytes().to_vec(),
+        },
+    );
+    // storage buffers the run asked for, allocated or recycled
+    let buffers_requested = |ir: GraphIr| {
+        let executor = Executor::new(&context, ir).expect("supported graph");
+        let before = vk_compute::stats::allocs() + vk_compute::stats::pool_hits();
+        let outputs = executor.run(vec![("x", input())]).expect("execution");
+        assert!(outputs.on_device("out"));
+        assert_eq!(outputs.shape_of("out").expect("shape"), vec![8]);
+        assert_eq!(outputs.host("out").expect("out").to_f32().unwrap(), WANT);
+        outputs.finish();
+        vk_compute::stats::allocs() + vk_compute::stats::pool_hits() - before
+    };
+
+    let moved = buffers_requested(ir.clone());
+    ir.outputs.push("act".to_string());
+    let copied = buffers_requested(ir);
+    assert_eq!(
+        copied,
+        moved + 1,
+        "the live input is copied, the dead one is not"
+    );
+}
+
 /// The reason the executor owns the cache: the second run does not
 /// recompile pipelines. This is the property on which weight residency rests.
 #[test]

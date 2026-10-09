@@ -167,10 +167,8 @@ unsafe fn copy_tensors(
             }
             (D::OrtMemoryInfoDeviceType_GPU, D::OrtMemoryInfoDeviceType_CPU) => {
                 let src = unsafe { region_from_ptr(src_ptr)? };
-                let data = ctx.stream_download_at(src.buffer(), src.offset, bytes)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst_ptr.cast::<u8>(), bytes)
-                };
+                let out = unsafe { std::slice::from_raw_parts_mut(dst_ptr.cast::<u8>(), bytes) };
+                ctx.stream_download_into(src.buffer(), src.offset, out)?;
             }
             (D::OrtMemoryInfoDeviceType_GPU, D::OrtMemoryInfoDeviceType_GPU) => {
                 let s = unsafe { region_from_ptr(src_ptr)? };

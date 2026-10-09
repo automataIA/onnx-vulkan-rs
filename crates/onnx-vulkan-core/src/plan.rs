@@ -166,8 +166,18 @@ impl StepPlan {
     /// size would be given one, and the next replayed step would write its
     /// attention scores into it. Holding them is what makes the pool an arena
     /// for as long as the plan lives.
+    ///
+    /// Only the buffers the ops name: the pool also keeps what earlier runs of
+    /// other graphs left in it, and holding those would pin them for the life
+    /// of the plan with nothing reading them.
     pub fn hold_pool(&mut self, context: &vk_compute::VkContext) {
-        self.held.extend(context.take_storage_pool());
+        for buffer in context.take_storage_pool() {
+            if self.ops.iter().any(|op| op.uses(&buffer)) {
+                self.held.push(buffer);
+            } else {
+                context.recycle_storage_buffer(buffer);
+            }
+        }
     }
 
     /// Returns the held buffers to the pool. Consuming, and not `Drop`, for the

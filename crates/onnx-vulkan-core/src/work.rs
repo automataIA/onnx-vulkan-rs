@@ -109,14 +109,25 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         // are already the packed ones, so the generic traffic model counts
         // `K·N·bits/8` and not the dequantized weight. Counting the fp32 the
         // kernel materializes would put a 4-bit LLM above the card's bandwidth.
-        "MatMul" | "MatMulInteger" | "Gemm" | "MatMulNBits" => matmul_flops(node, meta)?,
-        "Conv" | "ConvInteger" | "ConvTranspose" => conv_flops(node, meta)?,
+        // the fused epilogue adds two flops per output element: noise next to K
+        "MatMul" | "MatMulInteger" | "MatMulIntegerScaleBias" | "Gemm" | "MatMulNBits" => {
+            matmul_flops(node, meta)?
+        }
+        "Conv" | "ConvInteger" | "ConvIntegerScaleBias" | "ConvTranspose" => {
+            conv_flops(node, meta)?
+        }
         // two matmuls of `total` contracted elements each -- `q·kᵀ` and
         // `probs·v` -- over every element of the output. `total` is the time
         // extent of `present_key`, i.e. past plus the new step.
         "GroupQueryAttention" => {
             let present = meta.shape(node.outputs.get(1)?)?;
             4 * out_elems()? * (*present.get(2)?).max(0) as u64
+        }
+        // the two matmuls it replaces, `2·m·n·d` and `2·m·n·dv` per batch; the
+        // softmax between them is noise next to those
+        "FlashAttention" => {
+            let keys = (*meta.shape(node.inputs.get(1)?)?.last()?).max(0) as u64;
+            2 * keys * (in_elems()? + out_elems()?)
         }
         // per-element counts, approximate by construction (see the module doc):
         // an `exp` is not one flop and a `Div` is not one either, but the
@@ -127,11 +138,12 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         | "BatchNormalization"
         | "SkipLayerNormalization"
         | "SimplifiedLayerNormalization" => 5 * out_elems()?,
-        // the skip form adds one flop per element to the same five
-        "SkipSimplifiedLayerNormalization" => 6 * out_elems()?,
+        // the skip forms add one flop per element to the same five
+        "SkipSimplifiedLayerNormalization" | "AddLayerNormalization" => 6 * out_elems()?,
         // two multiplies and one add per rotated channel, and the channels past
         // `rotary_embedding_dim` are a copy
-        "RotaryEmbedding" => 3 * out_elems()?,
+        "RotaryEmbedding" | "InterleavedRope" => 3 * out_elems()?,
+        "MulAddRelu" => 3 * out_elems()?,
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceL2" | "ArgMax"
         | "ArgMin" | "GlobalAveragePool" | "MaxPool" | "AveragePool" => in_elems()?,
         "Add"
@@ -150,18 +162,22 @@ pub fn node_work(node: &NodeIr, meta: &impl TensorMeta) -> Option<Work> {
         | "Clip"
         | "Tanh"
         | "Gelu"
+        | "DecomposedGelu"
         | "Neg"
         | "Abs"
+        | "Sign"
         | "Min"
         | "Max"
         | "Where"
         | "Equal"
         | "Greater"
+        | "GreaterOrEqual"
         | "Less"
         | "LessOrEqual"
         | "QuantizeLinear"
         | "DequantizeLinear"
-        | "DynamicQuantizeLinear" => out_elems()?,
+        | "DynamicQuantizeLinear"
+        | "DecomposedGeluQuantize" => out_elems()?,
         // pure movement: no arithmetic, but the traffic is real
         "Reshape" | "Squeeze" | "Unsqueeze" | "Transpose" | "Concat" | "Slice" | "Gather"
         | "GatherND" | "Cast" | "Identity" | "Pad" | "Expand" | "Split" | "Resize" | "Tile" => 0,

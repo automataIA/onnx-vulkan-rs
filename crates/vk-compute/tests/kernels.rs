@@ -1,6 +1,6 @@
 //! End-to-end test on GPU (or lavapipe): upload → dispatch → readback → CPU comparison.
 
-use vk_compute::{VkContext, compile_wgsl};
+use vk_compute::{BufferSlice, VkContext, compile_wgsl};
 
 fn as_bytes<T: Copy>(data: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(data)) }
@@ -348,4 +348,69 @@ fn enumerate_devices() {
     for (name, vendor, ty) in &devices {
         eprintln!("device: {name} (vendor 0x{vendor:04x}, {ty:?})");
     }
+}
+
+const DOUBLE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+
+struct Push { n: u32 }
+var<immediate> pc: Push;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < pc.n) {
+        out[gid.x] = a[gid.x] * 2.0;
+    }
+}
+"#;
+
+/// A tensor bound from an offset that leaves more than `maxStorageBufferRange`
+/// bytes to the end of its buffer, as in the single block ORT's memory pattern
+/// allocates for SAM 3's vision encoder (4.7 GB): bound with `VK_WHOLE_SIZE`,
+/// the RTX 4070 read zeros past the first few bytes.
+#[test]
+fn binding_with_more_than_max_range_after_its_offset() {
+    let ctx = VkContext::new().expect("Vulkan context");
+    let n = 4096usize;
+    let bytes = (n * 4) as u64;
+    // the input's effective range would exceed the limit by 16 bytes, the
+    // output's stays within it
+    let range = ctx
+        .compute_limits()
+        .max_storage_buffer_bytes
+        .next_multiple_of(16)
+        + 16;
+    let (a_at, out_at) = (1 << 20, (1 << 20) + bytes);
+    let buf = ctx.create_storage_buffer(a_at + range).unwrap();
+
+    let a: Vec<f32> = (0..n).map(|i| i as f32 - 1000.0).collect();
+    let expected: Vec<f32> = a.iter().map(|x| x * 2.0).collect();
+    let pipeline = ctx
+        .create_pipeline(&compile_wgsl(DOUBLE_WGSL).unwrap(), 2, 4)
+        .unwrap();
+    ctx.stream_upload_at(&buf, a_at, as_bytes(&a), None)
+        .unwrap();
+    ctx.stream_dispatch_slices(
+        &pipeline,
+        &[
+            BufferSlice {
+                buf: &buf,
+                offset: a_at,
+            },
+            BufferSlice {
+                buf: &buf,
+                offset: out_at,
+            },
+        ],
+        &(n as u32).to_le_bytes(),
+        [(n as u32).div_ceil(256), 1, 1],
+    )
+    .unwrap();
+    let mut out = vec![0u8; bytes as usize];
+    ctx.stream_download_into(&buf, out_at, &mut out).unwrap();
+    assert_eq!(from_bytes::<f32>(&out), expected);
+
+    ctx.destroy_buffer(buf);
+    ctx.destroy_pipeline(pipeline);
 }

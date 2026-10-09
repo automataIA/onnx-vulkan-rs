@@ -1,0 +1,64 @@
+// MatMulInteger for any K with the dequantizing epilogue of a dynamically
+// quantized linear layer, Cast -> Mul -> Add: out is [M, N] f32 and holds
+// float(acc) * scale + bias, scale and bias one value or one per column.
+//
+// The product is the WGSL ANY_K kernel's: one output per thread, the bytes
+// read one by one from u32 words, int8 operands sign-extended with their zero
+// points, the sum exact in int32 for any K <= 33025. SAM 3's detector runs it
+// on its K = 2 box-coordinate projections, which the packed kernels cannot
+// read.
+//
+// Why GLSL and not WGSL: the epilogue must round exactly as the three kernels
+// it replaces, a conversion, a rounded multiply and a rounded add. `precise`
+// keeps the driver from contracting the last two into an FMA (SPIR-V
+// NoContraction), which naga's WGSL backend cannot emit.
+
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A { uint a[]; };
+layout(std430, binding = 1) readonly buffer B { uint b[]; };
+layout(std430, binding = 2) readonly buffer AZp { uint a_zp[]; };
+layout(std430, binding = 3) readonly buffer BZp { uint b_zp[]; };
+layout(std430, binding = 4) writeonly buffer O { float o[]; };
+layout(std430, binding = 5) readonly buffer Scale { float scale[]; };
+layout(std430, binding = 6) readonly buffer Bias { float bias[]; };
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint k;
+    uint n;
+    uint a_signed;
+    uint b_signed;
+    // 1 when scale (bias) holds one value per column, 0 when it is one value
+    uint scale_step;
+    uint bias_step;
+    // nonzero: a Relu follows, max(z, 0.0) as the unary kernel computes it
+    uint relu;
+} pc;
+
+int code(uint word, uint index, uint is_signed) {
+    int v = int((word >> ((index & 3u) * 8u)) & 0xffu);
+    return (is_signed != 0u && v > 127) ? v - 256 : v;
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (col >= pc.n || row >= pc.m) {
+        return;
+    }
+    int za = code(a_zp[0], 0u, pc.a_signed);
+    int zb = code(b_zp[0], 0u, pc.b_signed);
+    int acc = 0;
+    for (uint i = 0u; i < pc.k; i++) {
+        uint ia = row * pc.k + i;
+        uint ib = i * pc.n + col;
+        acc += (code(a[ia >> 2u], ia, pc.a_signed) - za) * (code(b[ib >> 2u], ib, pc.b_signed) - zb);
+    }
+    precise float x = float(acc);
+    precise float y = x * scale[col * pc.scale_step];
+    precise float z = y + bias[col * pc.bias_step];
+    o[row * pc.n + col] = pc.relu != 0u ? max(z, 0.0) : z;
+}

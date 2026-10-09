@@ -82,7 +82,7 @@ fn model_inventory_is_gpu_free_exact_and_reports_fallbacks() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("inventory JSON");
     assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["workloads"].as_array().expect("workloads").len(), 1);
+    assert_eq!(value["workloads"].as_array().expect("workloads").len(), 2);
     assert_eq!(value["workloads"][0]["workload"]["op"], "Conv");
     assert_eq!(value["workloads"][0]["runner"]["family"], "conv-f32");
     assert_eq!(value["workloads"][0]["runner"]["h_in"], 32);
@@ -103,6 +103,81 @@ fn model_inventory_is_gpu_free_exact_and_reports_fallbacks() {
     ]);
     assert_eq!(malformed.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("positive integer"));
+}
+
+#[test]
+fn model_check_reports_execution_and_tuning_coverage() {
+    let model = frontend_model("shapes.onnx");
+    let output = run(&[
+        "model-check",
+        "--model",
+        model.to_str().expect("UTF-8 model path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("model-check JSON");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["compatible"], true);
+    assert_eq!(value["execution"]["total_nodes"], 23);
+    assert_eq!(value["execution"]["supported_nodes"], 23);
+    assert_eq!(value["execution"]["unsupported_nodes"], 0);
+    assert_eq!(value["tuning"]["inventory_workloads"], 23);
+    assert_eq!(value["tuning"]["tunable_workloads"], 2);
+    assert_eq!(value["tuning"]["untunable_nodes"], 21);
+    assert!(
+        !value["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|item| item["kind"] == "shape")
+    );
+}
+
+#[test]
+fn model_check_marks_runtime_shapes_as_non_blocking() {
+    let model = fixture("symbolic.onnx");
+    let output = run(&["model-check", "--model", model.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("model-check JSON");
+    assert_eq!(value["compatible"], true);
+    let issues = value["issues"].as_array().expect("issues");
+    assert!(!issues.is_empty());
+    assert!(
+        issues
+            .iter()
+            .all(|item| item["kind"] == "shape" && item["blocking"] == false)
+    );
+}
+
+#[test]
+fn matrix_inventory_preserves_transpose_scalars_and_reports_unsupported_routes() {
+    let model = fixture("matrix.onnx");
+    let result = run(&["model-inventory", "--model", model.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let workloads = value["workloads"].as_array().unwrap();
+    assert_eq!(workloads.len(), 2);
+    let gemm = workloads
+        .iter()
+        .find(|row| row["workload"]["op"] == "Gemm")
+        .unwrap();
+    assert_eq!(gemm["runner"]["family"], "matrix-f32");
+    assert_eq!(gemm["runner"]["trans_b"], true);
+    assert_eq!(gemm["runner"]["alpha_bits"], 0.5_f32.to_bits());
+    assert_eq!(gemm["runner"]["beta_bits"], 0.25_f32.to_bits());
+    assert_eq!(gemm["runner"]["c_cols"], 7);
+    assert_eq!(value["skipped"].as_array().unwrap().len(), 2);
 }
 
 #[test]

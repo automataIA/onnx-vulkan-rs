@@ -69,11 +69,22 @@ pub struct CopyOp {
     pub(crate) bytes: u64,
 }
 
+/// A device buffer region set to a repeated word. Nothing in it varies with
+/// the step.
+#[derive(Clone)]
+pub struct FillOp {
+    pub(crate) dst: vk::Buffer,
+    pub(crate) dst_offset: u64,
+    pub(crate) bytes: u64,
+    pub(crate) value: u32,
+}
+
 #[derive(Clone)]
 pub enum StreamOp {
     Dispatch(DispatchOp),
     Upload(UploadOp),
     Copy(CopyOp),
+    Fill(FillOp),
 }
 
 impl StreamOp {
@@ -104,7 +115,23 @@ impl StreamOp {
                     && a.dst_offset == b.dst_offset
                     && a.bytes == b.bytes
             }
+            (StreamOp::Fill(a), StreamOp::Fill(b)) => {
+                a.dst == b.dst
+                    && a.dst_offset == b.dst_offset
+                    && a.bytes == b.bytes
+                    && a.value == b.value
+            }
             _ => false,
+        }
+    }
+
+    /// Whether the op binds, writes or reads `buffer`.
+    pub fn uses(&self, buffer: &crate::GpuBuffer) -> bool {
+        match self {
+            StreamOp::Dispatch(op) => op.bindings.iter().any(|b| b.buffer == buffer.buffer),
+            StreamOp::Upload(op) => op.dst == buffer.buffer,
+            StreamOp::Copy(op) => op.src == buffer.buffer || op.dst == buffer.buffer,
+            StreamOp::Fill(op) => op.dst == buffer.buffer,
         }
     }
 
@@ -123,6 +150,7 @@ impl StreamOp {
                 op.label.as_deref().unwrap_or("unnamed")
             ),
             StreamOp::Copy(op) => format!("copy of {} bytes {:?}->{:?}", op.bytes, op.src, op.dst),
+            StreamOp::Fill(op) => format!("fill of {} bytes of {:?}", op.bytes, op.dst),
         }
     }
 }

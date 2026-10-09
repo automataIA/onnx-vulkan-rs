@@ -43,6 +43,143 @@ struct Shape {
     count: usize,
 }
 
+/// Shape supplied by the model inventory. Unlike the historical census above,
+/// this keeps every axis needed by rectangular grouped/depthwise Conv.
+#[derive(Clone, Copy)]
+struct TunedShape {
+    c_in: usize,
+    c_out: usize,
+    group: usize,
+    kh: usize,
+    kw: usize,
+    h_in: usize,
+    w_in: usize,
+    h_out: usize,
+    w_out: usize,
+    sh: usize,
+    sw: usize,
+    phb: usize,
+    phe: usize,
+    pwb: usize,
+    pwe: usize,
+    dh: usize,
+    dw: usize,
+}
+
+trait ConvShape {
+    fn c_in(&self) -> usize;
+    fn c_out(&self) -> usize;
+    fn group(&self) -> usize;
+    fn kh(&self) -> usize;
+    fn kw(&self) -> usize;
+    fn h_in(&self) -> usize;
+    fn w_in(&self) -> usize;
+    fn h_out(&self) -> usize;
+    fn w_out(&self) -> usize;
+    fn sh(&self) -> usize;
+    fn sw(&self) -> usize;
+    fn phb(&self) -> usize;
+    fn pwb(&self) -> usize;
+    fn dh(&self) -> usize;
+    fn dw(&self) -> usize;
+}
+
+impl ConvShape for Shape {
+    fn c_in(&self) -> usize {
+        self.c_in
+    }
+    fn c_out(&self) -> usize {
+        self.c_out
+    }
+    fn group(&self) -> usize {
+        1
+    }
+    fn kh(&self) -> usize {
+        self.k
+    }
+    fn kw(&self) -> usize {
+        self.k
+    }
+    fn h_in(&self) -> usize {
+        self.h_in
+    }
+    fn w_in(&self) -> usize {
+        self.h_in
+    }
+    fn h_out(&self) -> usize {
+        self.h_out
+    }
+    fn w_out(&self) -> usize {
+        self.h_out
+    }
+    fn sh(&self) -> usize {
+        self.stride
+    }
+    fn sw(&self) -> usize {
+        self.stride
+    }
+    fn phb(&self) -> usize {
+        self.pad
+    }
+    fn pwb(&self) -> usize {
+        self.pad
+    }
+    fn dh(&self) -> usize {
+        1
+    }
+    fn dw(&self) -> usize {
+        1
+    }
+}
+
+impl ConvShape for TunedShape {
+    fn c_in(&self) -> usize {
+        self.c_in
+    }
+    fn c_out(&self) -> usize {
+        self.c_out
+    }
+    fn group(&self) -> usize {
+        self.group
+    }
+    fn kh(&self) -> usize {
+        self.kh
+    }
+    fn kw(&self) -> usize {
+        self.kw
+    }
+    fn h_in(&self) -> usize {
+        self.h_in
+    }
+    fn w_in(&self) -> usize {
+        self.w_in
+    }
+    fn h_out(&self) -> usize {
+        self.h_out
+    }
+    fn w_out(&self) -> usize {
+        self.w_out
+    }
+    fn sh(&self) -> usize {
+        self.sh
+    }
+    fn sw(&self) -> usize {
+        self.sw
+    }
+    fn phb(&self) -> usize {
+        self.phb
+    }
+    fn pwb(&self) -> usize {
+        self.pwb
+    }
+    fn dh(&self) -> usize {
+        self.dh
+    }
+    fn dw(&self) -> usize {
+        self.dw
+    }
+}
+
 /// Every distinct `Conv` geometry in `resnet50-v1-12-qdq`, extracted from the
 /// graph rather than hand-written. All of them are square, so one `k` and one
 /// spatial extent per side is enough.
@@ -431,7 +568,7 @@ struct CandidateMeasurement {
     max_rel: f32,
 }
 
-fn tune_shape_arguments() -> Result<Vec<Shape>, Err> {
+fn tune_shape_arguments() -> Result<Vec<TunedShape>, Err> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let mut shapes = Vec::new();
     let mut index = 0;
@@ -442,26 +579,151 @@ fn tune_shape_arguments() -> Result<Vec<Shape>, Err> {
         }
         let spec = arguments
             .get(index + 1)
-            .ok_or("--tune-shape requires C_IN,C_OUT,K,H_IN,H_OUT,STRIDE,PAD")?;
+            .ok_or("--tune-shape requires the Conv geometry fields")?;
         let values = spec
             .split(',')
             .map(|value| value.parse::<usize>())
             .collect::<Result<Vec<_>, _>>()?;
-        if values.len() != 7 || values[..6].contains(&0) {
-            return Err(
-                "--tune-shape requires seven integers; all except PAD must be positive".into(),
-            );
+        let shape = match values.as_slice() {
+            // Legacy square group-one contract.
+            [c_in, c_out, k, h_in, h_out, stride, pad]
+                if *c_in > 0 && *c_out > 0 && *k > 0 && *h_in > 0 && *h_out > 0 && *stride > 0 =>
+            {
+                TunedShape {
+                    c_in: *c_in,
+                    c_out: *c_out,
+                    group: 1,
+                    kh: *k,
+                    kw: *k,
+                    h_in: *h_in,
+                    w_in: *h_in,
+                    h_out: *h_out,
+                    w_out: *h_out,
+                    sh: *stride,
+                    sw: *stride,
+                    phb: *pad,
+                    phe: *pad,
+                    pwb: *pad,
+                    pwe: *pad,
+                    dh: 1,
+                    dw: 1,
+                }
+            }
+            // Rectangular/grouped contract emitted by model inventory:
+            // C_IN,C_OUT,GROUP,KH,KW,H_IN,W_IN,H_OUT,W_OUT,SH,SW,
+            // PAD_TOP,PAD_BOTTOM,PAD_LEFT,PAD_RIGHT,DH,DW.
+            [
+                c_in,
+                c_out,
+                group,
+                kh,
+                kw,
+                h_in,
+                w_in,
+                h_out,
+                w_out,
+                sh,
+                sw,
+                phb,
+                phe,
+                pwb,
+                pwe,
+                dh,
+                dw,
+            ] if *c_in > 0
+                && *c_out > 0
+                && *group > 0
+                && *kh > 0
+                && *kw > 0
+                && *h_in > 0
+                && *w_in > 0
+                && *h_out > 0
+                && *w_out > 0
+                && *sh > 0
+                && *sw > 0
+                && *dh > 0
+                && *dw > 0 =>
+            {
+                TunedShape {
+                    c_in: *c_in,
+                    c_out: *c_out,
+                    group: *group,
+                    kh: *kh,
+                    kw: *kw,
+                    h_in: *h_in,
+                    w_in: *w_in,
+                    h_out: *h_out,
+                    w_out: *w_out,
+                    sh: *sh,
+                    sw: *sw,
+                    phb: *phb,
+                    phe: *phe,
+                    pwb: *pwb,
+                    pwe: *pwe,
+                    dh: *dh,
+                    dw: *dw,
+                }
+            }
+            _ => return Err("invalid --tune-shape geometry".into()),
+        };
+        if shape.c_in % shape.group != 0 || shape.c_out % shape.group != 0 {
+            return Err("group must divide both C_IN and C_OUT".into());
         }
-        shapes.push(Shape {
-            c_in: values[0],
-            c_out: values[1],
-            k: values[2],
-            h_in: values[3],
-            h_out: values[4],
-            stride: values[5],
-            pad: values[6],
-            count: 1,
-        });
+        if shape.phb != shape.phe || shape.pwb != shape.pwe {
+            return Err("Conv runner currently requires symmetric padding".into());
+        }
+        let output_dim = |input: usize,
+                          pad_before: usize,
+                          pad_after: usize,
+                          kernel: usize,
+                          stride: usize,
+                          dilation: usize|
+         -> Option<usize> {
+            let effective_kernel = dilation
+                .checked_mul(kernel.checked_sub(1)?)?
+                .checked_add(1)?;
+            let numerator = input
+                .checked_add(pad_before)?
+                .checked_add(pad_after)?
+                .checked_sub(effective_kernel)?;
+            numerator.checked_div(stride)?.checked_add(1)
+        };
+        let expected_h = output_dim(
+            shape.h_in, shape.phb, shape.phe, shape.kh, shape.sh, shape.dh,
+        )
+        .ok_or("invalid Conv height geometry")?;
+        let expected_w = output_dim(
+            shape.w_in, shape.pwb, shape.pwe, shape.kw, shape.sw, shape.dw,
+        )
+        .ok_or("invalid Conv width geometry")?;
+        if expected_h != shape.h_out || expected_w != shape.w_out {
+            return Err(format!(
+                "Conv output geometry does not match input/kernel geometry (expected {expected_h}x{expected_w}, got {}x{})",
+                shape.h_out, shape.w_out
+            )
+            .into());
+        }
+        let pixels = shape
+            .h_out
+            .checked_mul(shape.w_out)
+            .ok_or("Conv output dimensions overflow")?;
+        let kdepth = shape
+            .c_in
+            .checked_div(shape.group)
+            .and_then(|value| value.checked_mul(shape.kh))
+            .and_then(|value| value.checked_mul(shape.kw))
+            .ok_or("Conv kernel dimensions overflow")?;
+        let total = pixels
+            .checked_mul(shape.c_out)
+            .ok_or("Conv output element count overflows")?;
+        if pixels > u32::MAX as usize
+            || kdepth > u32::MAX as usize
+            || total > u32::MAX as usize
+            || shape.phb.max(shape.pwb).max(shape.dh).max(shape.dw) > i32::MAX as usize
+        {
+            return Err("Conv geometry exceeds runner integer bounds".into());
+        }
+        shapes.push(shape);
         index += 2;
     }
     Ok(shapes)
@@ -471,7 +733,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
+fn tune_model_shapes(ctx: &VkContext, shapes: &[TunedShape]) -> Result<(), Err> {
     let limits = conv::TacticLimits::from_vulkan(
         ctx.compute_limits(),
         ctx.compute_limits().max_storage_buffer_bytes,
@@ -480,15 +742,25 @@ fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
         .iter()
         .map(|shape| conv::TacticGeometry {
             batch: 1,
-            group: 1,
-            pixels: (shape.h_out * shape.h_out) as u32,
+            group: shape.group as u32,
+            pixels: (shape.h_out * shape.w_out) as u32,
             c_out: shape.c_out as u32,
-            kdepth: (shape.c_in * shape.k * shape.k) as u32,
-            total: (shape.h_out * shape.h_out * shape.c_out) as u64,
+            kdepth: (shape.c_in / shape.group * shape.kh * shape.kw) as u32,
+            total: (shape.h_out * shape.w_out * shape.c_out) as u64,
         })
         .collect::<Vec<_>>();
     let mut pipeline_tactics = BTreeSet::new();
-    for tactic in conv::focused_search_space() {
+    let candidates = geometries
+        .iter()
+        .flat_map(|geometry| {
+            if geometry.group != 1 {
+                conv::candidate_space(geometry.group)
+            } else {
+                conv::focused_search_space()
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    for tactic in candidates {
         if geometries
             .iter()
             .any(|geometry| tactic.is_viable(*geometry, limits))
@@ -498,7 +770,7 @@ fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
     }
     for geometry in &geometries {
         pipeline_tactics.insert(normalized_pipeline_tactic(conv::control_tactic(
-            1,
+            geometry.group as usize,
             geometry.pixels as usize,
             geometry.c_out as usize,
             geometry.kdepth as usize,
@@ -523,17 +795,21 @@ fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
         let prepared = PreparedShape::new(ctx, shape)?;
         let geometry = prepared.geometry;
         let control = conv::control_tactic(
-            1,
+            geometry.group as usize,
             geometry.pixels as usize,
             geometry.c_out as usize,
             geometry.kdepth as usize,
         );
         prepared.execute(ctx, tactic_pipeline(&pipelines, control)?, &reduce, control)?;
         let reference = prepared.output(ctx)?;
-        let mut candidates = conv::focused_search_space()
-            .into_iter()
-            .filter(|tactic| tactic.is_viable(geometry, limits))
-            .collect::<Vec<_>>();
+        let mut candidates = if geometry.group != 1 {
+            conv::candidate_space(geometry.group)
+        } else {
+            conv::focused_search_space()
+        }
+        .into_iter()
+        .filter(|tactic| tactic.is_viable(geometry, limits))
+        .collect::<Vec<_>>();
         if !candidates.contains(&control) {
             candidates.push(control);
         }
@@ -585,9 +861,14 @@ fn tune_model_shapes(ctx: &VkContext, shapes: &[Shape]) -> Result<(), Err> {
                 "schema_version": 1,
                 "family": "conv-f32",
                 "geometry": {
-                    "c_in": shape.c_in, "c_out": shape.c_out, "kernel": shape.k,
-                    "h_in": shape.h_in, "h_out": shape.h_out,
-                    "stride": shape.stride, "pad": shape.pad,
+                    "c_in": shape.c_in, "c_out": shape.c_out, "group": shape.group,
+                    "kernel_h": shape.kh, "kernel_w": shape.kw,
+                    "h_in": shape.h_in, "w_in": shape.w_in,
+                    "h_out": shape.h_out, "w_out": shape.w_out,
+                    "stride_h": shape.sh, "stride_w": shape.sw,
+                    "pad_top": shape.phb, "pad_bottom": shape.phe,
+                    "pad_left": shape.pwb, "pad_right": shape.pwe,
+                    "dilation_h": shape.dh, "dilation_w": shape.dw,
                 },
                 "device": {
                     "name": device.name(), "vendor_id": device.vendor_id(),
@@ -634,13 +915,13 @@ struct PreparedShape {
 }
 
 impl PreparedShape {
-    fn new(ctx: &VkContext, shape: &Shape) -> Result<Self, Err> {
-        let pixels = shape.h_out * shape.h_out;
-        let kdepth = shape.c_in * shape.k * shape.k;
-        let total = shape.c_out * pixels;
-        let x = pseudo(shape.c_in * shape.h_in * shape.h_in, 3);
-        let w = pseudo(shape.c_out * kdepth, 5);
-        let b = pseudo(shape.c_out, 7);
+    fn new<S: ConvShape>(ctx: &VkContext, shape: &S) -> Result<Self, Err> {
+        let pixels = shape.h_out() * shape.w_out();
+        let kdepth = shape.c_in() / shape.group() * shape.kh() * shape.kw();
+        let total = shape.c_out() * pixels;
+        let x = pseudo(shape.c_in() * shape.h_in() * shape.w_in(), 3);
+        let w = pseudo(shape.c_out() * kdepth, 5);
+        let b = pseudo(shape.c_out(), 7);
         let x_buf = ctx.create_storage_buffer((4 * x.len()) as u64)?;
         let w_buf = ctx.create_storage_buffer((4 * w.len()) as u64)?;
         let b_buf = ctx.create_storage_buffer((4 * b.len()) as u64)?;
@@ -654,22 +935,22 @@ impl PreparedShape {
         let mut push = Vec::with_capacity(conv::PUSH_BYTES as usize);
         for value in [
             total as u32,
-            shape.c_in as u32,
-            shape.c_out as u32,
-            1,
-            shape.h_in as u32,
-            shape.h_in as u32,
-            shape.h_out as u32,
-            shape.h_out as u32,
-            shape.k as u32,
-            shape.k as u32,
-            shape.stride as u32,
-            shape.stride as u32,
-            shape.pad as u32,
-            shape.pad as u32,
-            1,
-            1,
-            shape.c_in as u32,
+            shape.c_in() as u32,
+            shape.c_out() as u32,
+            shape.group() as u32,
+            shape.h_in() as u32,
+            shape.w_in() as u32,
+            shape.h_out() as u32,
+            shape.w_out() as u32,
+            shape.kh() as u32,
+            shape.kw() as u32,
+            shape.sh() as u32,
+            shape.sw() as u32,
+            shape.phb() as u32,
+            shape.pwb() as u32,
+            shape.dh() as u32,
+            shape.dw() as u32,
+            (shape.c_in() / shape.group()) as u32,
             1,
             1,
         ] {
@@ -684,9 +965,9 @@ impl PreparedShape {
             push,
             geometry: conv::TacticGeometry {
                 batch: 1,
-                group: 1,
+                group: shape.group() as u32,
                 pixels: pixels as u32,
-                c_out: shape.c_out as u32,
+                c_out: shape.c_out() as u32,
                 kdepth: kdepth as u32,
                 total: total as u64,
             },

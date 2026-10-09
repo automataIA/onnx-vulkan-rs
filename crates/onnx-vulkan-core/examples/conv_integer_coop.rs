@@ -42,6 +42,7 @@
 //! on a device that reports a `u8×u8` cooperative combination. lavapipe reports
 //! none and the bench says so instead of measuring nothing.
 
+use onnx_vulkan_core::shaders::matmul_integer::CoopVariant;
 use onnx_vulkan_core::shaders::{conv, conv_integer, matmul_integer};
 use std::time::Instant;
 use vk_compute::{ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
@@ -365,17 +366,17 @@ impl Geom {
 
     /// A is the flipped weight `[C_out, K]`, B the im2col `[P, K]`, out
     /// `[C_out, P]` — which is already the NCHW the conv has to produce.
-    fn enqueue_coop(&self, ctx: &VkContext, pipe: &ComputePipeline) -> Result<(), Err> {
-        let tile = matmul_integer::COOP_TILE;
+    fn enqueue_coop(
+        &self,
+        ctx: &VkContext,
+        variant: &CoopVariant,
+        pipe: &ComputePipeline,
+    ) -> Result<(), Err> {
         ctx.stream_dispatch(
             pipe,
             &[&self.w_flip, &self.col, &self.wzp, &self.azp, &self.out],
             &self.coop_push,
-            [
-                (self.pixels as u32).div_ceil(tile),
-                (self.c_out as u32).div_ceil(tile),
-                1,
-            ],
+            variant.grid(self.c_out, self.pixels),
         )?;
         Ok(())
     }
@@ -433,12 +434,13 @@ struct Kernels {
     tiled: ComputePipeline,
     /// Absent on any device that advertises no `u8×u8` combination — lavapipe,
     /// where the arithmetic can still be checked but the milliseconds cannot.
-    coop: Option<ComputePipeline>,
+    coop: Vec<(&'static CoopVariant, ComputePipeline)>,
 }
 
 fn main() -> Result<(), Err> {
     let ctx = VkContext::new()?;
-    let variant = matmul_integer::coop_variant(&ctx.coop_u8, ctx.subgroup_size);
+    let variants = matmul_integer::coop_variants(&ctx);
+    let variant = variants.first().copied();
 
     let pb = conv_integer::PUSH_BYTES;
     let b = conv_integer::BINDINGS;
@@ -457,15 +459,17 @@ fn main() -> Result<(), Err> {
             matmul_integer::MATMUL_BINDINGS,
             matmul_integer::MATMUL_PUSH_BYTES,
         )?,
-        coop: variant
-            .map(|v| {
-                ctx.create_pipeline(
+        coop: variants
+            .iter()
+            .map(|&v| {
+                let pipeline = ctx.create_pipeline(
                     &v.spirv(),
                     matmul_integer::COOP_BINDINGS,
                     matmul_integer::COOP_PUSH_BYTES,
-                )
+                )?;
+                Ok::<_, Err>((v, pipeline))
             })
-            .transpose()?,
+            .collect::<Result<_, _>>()?,
     };
 
     let reps = if std::env::args().any(|a| a == "--check") {
@@ -481,7 +485,16 @@ fn main() -> Result<(), Err> {
          kernel (`wgsl`) and on the tensor cores (`coop`).\n\
          cooperative matrix: {}",
         match variant {
-            Some(v) => format!("{} (K tile {}, subgroup {})", v.key, v.k_tile, v.workgroup),
+            Some(v) => format!(
+                "{} (K tile {}, subgroup {})",
+                variants
+                    .iter()
+                    .map(|v| v.key)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                v.k_tile,
+                v.subgroup
+            ),
             None => format!(
                 "none advertised (subgroup {}) — the coop columns are blank and \
                  only the bit-exactness of the im2col GEMM is being checked",
@@ -558,7 +571,12 @@ fn main() -> Result<(), Err> {
         col_mb += (s.pixels() * kdepth * s.count) as f64 / 1e6;
         tiled_total += tiled * s.count as f64;
 
-        let Some(coop_pipe) = k.coop.as_ref() else {
+        let picked = matmul_integer::coop_variant_for(&ctx, s.c_out, s.pixels());
+        let Some((coop_variant, coop_pipe)) = k
+            .coop
+            .iter()
+            .find(|(v, _)| picked.is_some_and(|p| std::ptr::eq(*v, p)))
+        else {
             println!(
                 " {:>9.3} {:>9.3} {:>9} {:>9} {:>7.2}×",
                 im2col * 1e3,
@@ -570,10 +588,10 @@ fn main() -> Result<(), Err> {
             coop_total += tiled * s.count as f64;
             continue;
         };
-        let coop = g.best(&ctx, || g.enqueue_coop(&ctx, coop_pipe))?;
+        let coop = g.best(&ctx, || g.enqueue_coop(&ctx, coop_variant, coop_pipe))?;
         let both = g.best(&ctx, || {
             g.enqueue_im2col(&ctx, &k.im2col)?;
-            g.enqueue_coop(&ctx, coop_pipe)
+            g.enqueue_coop(&ctx, coop_variant, coop_pipe)
         })?;
         mismatches += disagree(&want, &g.read_out(&ctx)?);
         println!(

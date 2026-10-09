@@ -68,9 +68,16 @@ pub const REQUANTIZE_PUSH_BYTES: u32 = 24;
 
 /// `com.microsoft::QLinearAdd`: two quantized tensors summed on a third scale.
 ///
-/// `C = saturate(round(ra·(A − a_zp) + rb·(B − b_zp)) + c_zp)`, with
-/// `ra = A_scale / C_scale` and `rb = B_scale / C_scale` precomputed on the
-/// host. Written as one pass rather than as dequantize-dequantize-add-quantize:
+/// `C = saturate(round(fma(A, ra, fma(B, rb, fixed))))`, with
+/// `ra = A_scale / C_scale`, `rb = B_scale / C_scale` and
+/// `fixed = c_zp − fma(ra, a_zp, rb·b_zp)` precomputed on the host in f32.
+/// This is MLAS's AVX2 kernel operation for operation, which is what the CPU
+/// reference runs: the algebraically equal `round(ra·(A − a_zp) + rb·(B − b_zp))
+/// + c_zp` rounds differently and lands one code off on near-ties (3 of the
+/// 65536 input pairs of one mobilenetv2 node, cascading to a changed argmax).
+/// The host also exchanges A and B where ORT does (`qlinear_add`).
+///
+/// Written as one pass rather than as dequantize-dequantize-add-quantize:
 /// the decomposition is four passes over the largest tensors in the model
 /// (resnet50 adds at 256×56×56) and produces the same numbers.
 ///
@@ -87,8 +94,7 @@ struct Push {
     os0: vec4<u32>, os1: vec4<u32>,
     as0: vec4<u32>, as1: vec4<u32>,
     bs0: vec4<u32>, bs1: vec4<u32>,
-    ra: f32, rb: f32,
-    a_zp: i32, b_zp: i32, c_zp: i32, signed: u32,
+    ra: f32, rb: f32, fixed: f32, signed: u32,
 }
 var<immediate> pc: Push;
 
@@ -123,12 +129,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let av = as_signed(i32((a[off_a >> 2u] >> ((off_a & 3u) * 8u)) & 0xffu), pc.signed);
         let bv = as_signed(i32((b[off_b >> 2u] >> ((off_b & 3u) * 8u)) & 0xffu), pc.signed);
-        let sum = pc.ra * f32(av - pc.a_zp) + pc.rb * f32(bv - pc.b_zp);
-        var q = i32(round(sum)) + pc.c_zp;
+        let y = round(fma(f32(av), pc.ra, fma(f32(bv), pc.rb, pc.fixed)));
+        var q: i32;
         if (pc.signed != 0u) {
-            q = clamp(q, -128, 127);
+            q = i32(clamp(y, -128.0, 127.0));
         } else {
-            q = clamp(q, 0, 255);
+            q = i32(clamp(y, 0.0, 255.0));
         }
         packed = packed | ((u32(q) & 0xffu) << (j * 8u));
     }
@@ -137,8 +143,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 pub const QLINEAR_ADD_BINDINGS: u32 = 3;
-/// The 112 bytes of the broadcast layout plus six scalars of quantization.
-pub const QLINEAR_ADD_PUSH_BYTES: u32 = 136;
+/// The 112 bytes of the broadcast layout plus four scalars of quantization.
+pub const QLINEAR_ADD_PUSH_BYTES: u32 = 128;
 
 /// `MaxPool` on a quantized tensor, in the quantized domain.
 ///

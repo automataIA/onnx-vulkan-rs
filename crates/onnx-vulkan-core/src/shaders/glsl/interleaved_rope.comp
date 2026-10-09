@@ -1,0 +1,107 @@
+// Interleaved rotary position embedding, as exporters write it out without a
+// RotaryEmbedding operator (SAM 3's vision encoder, both precisions):
+//
+//     rot[2i] = -x[2i+1],  rot[2i+1] = x[2i]
+//     y       = x * cos + rot * sin            then optionally  y * scale
+//
+// x is [B, H, S, D] (or [B, S, H, D] when FLAG_BSHD: the Transpose that
+// produced it is folded here), cos and sin are [S, D], and the output is
+// [B, H, S, D] (or [B, H, D, S] when FLAG_TRANSPOSE: the K^T of attention).
+//
+// Why GLSL and not WGSL: the result must be bit for bit that of the separate
+// Mul, Neg, Mul, Add and Mul kernels the rewrite replaced, each of which
+// rounds on its own. `x * cos + rot * sin` is exactly the shape a driver
+// contracts into one FMA, which rounds once instead of twice. `precise` forbids
+// that contraction (SPIR-V NoContraction); naga's WGSL backend has no way to
+// emit it. The negation is exact, so where it happens does not matter.
+//
+// The transposed output goes through a TILE x TILE tile in shared memory, one
+// workgroup per tile of (s, d) and per bh slice: x and the tables are read
+// along d and the output written along s, both coalesced. Thread-per-element
+// with s fastest read x 4 bytes out of every 32-byte sector (rows H*D apart)
+// and ran at a fifth of the plain layout's bandwidth. Each value is computed
+// by the same `rope` either way.
+
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Cos { float cos_table[]; };
+layout(std430, binding = 2) readonly buffer Sin { float sin_table[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+const uint FLAG_BSHD = 1u;
+const uint FLAG_TRANSPOSE = 2u;
+const uint FLAG_SCALE = 4u;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint heads;
+    uint seq;
+    uint dim;
+    uint flags;
+    float scale;
+} pc;
+
+const uint TILE = 32u;
+const uint ROWS = 256u / TILE;
+// padded by one so the column reads of the store hit distinct banks
+shared float tile[TILE][TILE + 1u];
+
+// The rotary embedding of x's element (bh, s, d) in [B, H, S, D] order.
+float rope(uint bh, uint s, uint d) {
+    uint row;
+    if ((pc.flags & FLAG_BSHD) != 0u) {
+        uint b = bh / pc.heads;
+        uint h = bh % pc.heads;
+        row = ((b * pc.seq + s) * pc.heads + h) * pc.dim;
+    } else {
+        row = (bh * pc.seq + s) * pc.dim;
+    }
+    uint sd = s * pc.dim + d;
+    float partner = x[row + (d ^ 1u)];
+    float rot = (d & 1u) == 0u ? -partner : partner;
+    precise float direct = x[row + d] * cos_table[sd];
+    precise float rotated = rot * sin_table[sd];
+    precise float v = direct + rotated;
+    if ((pc.flags & FLAG_SCALE) != 0u) {
+        v = v * pc.scale;
+    }
+    return v;
+}
+
+void main() {
+    if ((pc.flags & FLAG_TRANSPOSE) != 0u) {
+        // workgroup (s tile, d tile, bh); the branch is uniform (push constant)
+        uint s0 = gl_WorkGroupID.x * TILE;
+        uint d0 = gl_WorkGroupID.y * TILE;
+        uint bh = gl_WorkGroupID.z;
+        uint lane = gl_LocalInvocationIndex % TILE;
+        uint group = gl_LocalInvocationIndex / TILE;
+        for (uint r = group; r < TILE; r += ROWS) {
+            uint s = s0 + r;
+            uint d = d0 + lane;
+            if (s < pc.seq && d < pc.dim) {
+                tile[r][lane] = rope(bh, s, d);
+            }
+        }
+        barrier();
+        for (uint c = group; c < TILE; c += ROWS) {
+            uint s = s0 + lane;
+            uint d = d0 + c;
+            if (s < pc.seq && d < pc.dim) {
+                y[(bh * pc.dim + d) * pc.seq + s] = tile[lane][c];
+            }
+        }
+        return;
+    }
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    uint d = i % pc.dim;
+    uint s = (i / pc.dim) % pc.seq;
+    uint bh = i / (pc.dim * pc.seq);
+    y[i] = rope(bh, s, d);
+}

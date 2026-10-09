@@ -14,7 +14,8 @@ use crate::vk;
 use anyhow::{Result, ensure};
 use onnx_vulkan_core::shaders::matmul_integer::{
     COOP_BINDINGS, COOP_PUSH_BYTES, CoopVariant, MATMUL_BINDINGS, MATMUL_PUSH_BYTES, PACK_B,
-    PACK_BINDINGS, PACK_PUSH_BYTES, TILE_SIZE, coop_applies, coop_variant, matmul,
+    PACK_BINDINGS, PACK_PUSH_BYTES, TILE_SIZE, coop_applies, coop_variant_for, coop_variants,
+    matmul,
 };
 use ort_ep_sys as sys;
 use vk_compute::{ComputePipeline, GpuBuffer, compile_wgsl};
@@ -30,9 +31,10 @@ struct MatMulIntegerKernel {
     base: sys::OrtKernelImpl,
     pack_pipeline: ComputePipeline,
     matmul_pipeline: ComputePipeline,
-    /// Cooperative matrix variant, if the device exposes it. It does not cover
-    /// every shape, so `matmul_pipeline` remains the reference.
-    coop: Option<(&'static CoopVariant, ComputePipeline)>,
+    /// Cooperative matrix variants the device can run, one per block size; empty
+    /// without support. They do not cover every shape, so `matmul_pipeline`
+    /// remains the reference.
+    coop: Vec<(&'static CoopVariant, ComputePipeline)>,
     packed_b: Option<PackedB>,
 }
 
@@ -59,13 +61,14 @@ pub unsafe extern "C" fn create_kernel(
                 MATMUL_BINDINGS,
                 MATMUL_PUSH_BYTES,
             )?,
-            coop: match coop_variant(&ctx.coop_u8, ctx.subgroup_size) {
-                Some(v) => Some((
-                    v,
-                    ctx.create_pipeline(&v.spirv(), COOP_BINDINGS, COOP_PUSH_BYTES)?,
-                )),
-                None => None,
-            },
+            coop: coop_variants(ctx)
+                .into_iter()
+                .map(|v| {
+                    let pipeline =
+                        ctx.create_pipeline(&v.spirv(), COOP_BINDINGS, COOP_PUSH_BYTES)?;
+                    Ok((v, pipeline))
+                })
+                .collect::<Result<_>>()?,
             packed_b: None,
         });
         unsafe { *kernel_out = Box::into_raw(kernel).cast::<sys::OrtKernelImpl>() };
@@ -167,14 +170,15 @@ unsafe fn compute_impl(
 
     // the registry constrains this kernel to `uint8` (see `registry.rs`), so
     // no operand is signed: the int8 path lives in the core interpreter
-    if let Some((v, pipeline)) = &kernel.coop
+    if let Some(v) = coop_variant_for(ctx, m, n)
         && coop_applies(v, m, k, n, false)
+        && let Some((_, pipeline)) = kernel.coop.iter().find(|(c, _)| std::ptr::eq(*c, v))
     {
         let mut push = Vec::with_capacity(COOP_PUSH_BYTES as usize);
         for value in [m as u32, k as u32, n as u32, 0, 0] {
             push.extend_from_slice(&value.to_le_bytes());
         }
-        return ctx.stream_dispatch_slices(pipeline, &buffers, &push, grid);
+        return ctx.stream_dispatch_slices(pipeline, &buffers, &push, v.grid(m, n));
     }
 
     let mut push = Vec::with_capacity(MATMUL_PUSH_BYTES as usize);
@@ -197,7 +201,7 @@ unsafe extern "C" fn release(this_ptr: *mut sys::OrtKernelImpl) {
         }
         ctx.destroy_pipeline(kernel.pack_pipeline);
         ctx.destroy_pipeline(kernel.matmul_pipeline);
-        if let Some((_, pipeline)) = kernel.coop {
+        for (_, pipeline) in kernel.coop {
             ctx.destroy_pipeline(pipeline);
         }
     }

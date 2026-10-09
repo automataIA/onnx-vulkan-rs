@@ -115,8 +115,8 @@ unsafe fn compute_impl(kernel: &MemcpyKernel, ctx_ptr: *mut sys::OrtKernelContex
             Direction::ToHost => {
                 // input: device region; output: CPU data → flush
                 let src = region_from_ptr(view.data.cast())?;
-                let data = ctx.stream_download_at(src.buffer(), src.offset, bytes)?;
-                std::ptr::copy_nonoverlapping(data.as_ptr(), out_data.cast::<u8>(), bytes);
+                let out = std::slice::from_raw_parts_mut(out_data.cast::<u8>(), bytes);
+                ctx.stream_download_into(src.buffer(), src.offset, out)?;
             }
         }
         Ok(())

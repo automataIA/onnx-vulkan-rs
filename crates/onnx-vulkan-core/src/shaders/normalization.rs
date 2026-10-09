@@ -1,6 +1,6 @@
 //! Shared shaders and dispatch layouts for row normalizations
 //! (`Softmax`, `LayerNormalization`, `SimplifiedLayerNormalization`,
-//! `SkipSimplifiedLayerNormalization`).
+//! `SkipSimplifiedLayerNormalization`, `InstanceNormalization`).
 
 pub const SOFTMAX_BINDINGS: u32 = 2;
 pub const SOFTMAX_PUSH_BYTES: u32 = 20;
@@ -180,11 +180,124 @@ fn main(
 }
 "#;
 
+pub const INSTANCENORM_BINDINGS: u32 = 5;
+pub const INSTANCENORM_PUSH_BYTES: u32 = 24;
+/// Elements of a row each `INSTANCENORM` workgroup covers.
+pub const INSTANCENORM_CHUNK: u32 = 8192;
+
+/// f32 `InstanceNormalization` over `(n, c)` rows of `len` spatial elements,
+/// scale and bias per channel (`row % channels`), in three dispatches of one
+/// pipeline picked by `mode`:
+///
+/// 0. each workgroup sums one chunk of a row into `part[row * chunks + chunk]`;
+/// 1. each workgroup re-reduces its row's partial sums into the mean, then sums
+///    `(x - mean)²` over its chunk into the second half of `part`;
+/// 2. each workgroup derives mean and variance from the partials and
+///    normalizes its chunk.
+///
+/// The variance is a second pass over `x - mean`, not `E[x²] - mean²` as in
+/// `LAYERNORM`: these rows are long (SAM 3's GroupNorm, decomposed by the
+/// exporter, normalizes 2.65 M elements per row) and the one-pass form loses
+/// the variance to cancellation when the mean is large against the spread.
+/// Chunking is what spreads those rows over the GPU: one workgroup per row ran
+/// 8 workgroups for 85 MB (11 ms on an RTX 4070).
+pub const INSTANCENORM: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read_write> part: array<f32>;
+
+struct Push { len: u32, channels: u32, eps: f32, chunks: u32, rows: u32, mode: u32 }
+var<immediate> pc: Push;
+
+const CHUNK: u32 = 8192u;
+
+var<workgroup> sred: array<f32, 256>;
+
+fn reduce(lid: u32, v: f32) -> f32 {
+    sred[lid] = v;
+    workgroupBarrier();
+    var s = 128u;
+    while (s > 0u) {
+        if (lid < s) {
+            sred[lid] = sred[lid] + sred[lid + s];
+        }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    let total = sred[0];
+    workgroupBarrier();
+    return total;
+}
+
+/// Sum of one row's partials, starting at `offset` in `part`.
+fn row_total(lid: u32, row: u32, offset: u32) -> f32 {
+    var s = 0.0;
+    var j = lid;
+    while (j < pc.chunks) {
+        s = s + part[offset + row * pc.chunks + j];
+        j = j + 256u;
+    }
+    return reduce(lid, s);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let row = wid.y;
+    let chunk = wid.x;
+    let base = row * pc.len;
+    let start = chunk * CHUNK;
+    let end = min(start + CHUNK, pc.len);
+    if (pc.mode == 0u) {
+        var sum = 0.0;
+        var i = start + lid.x;
+        while (i < end) {
+            sum = sum + x[base + i];
+            i = i + 256u;
+        }
+        let total = reduce(lid.x, sum);
+        if (lid.x == 0u) {
+            part[row * pc.chunks + chunk] = total;
+        }
+        return;
+    }
+    let mean = row_total(lid.x, row, 0u) / f32(pc.len);
+    let second = pc.rows * pc.chunks;
+    if (pc.mode == 1u) {
+        var sq = 0.0;
+        var i = start + lid.x;
+        while (i < end) {
+            let d = x[base + i] - mean;
+            sq = sq + d * d;
+            i = i + 256u;
+        }
+        let total = reduce(lid.x, sq);
+        if (lid.x == 0u) {
+            part[second + row * pc.chunks + chunk] = total;
+        }
+        return;
+    }
+    let inv_std = inverseSqrt(row_total(lid.x, row, second) / f32(pc.len) + pc.eps);
+    let c = row % pc.channels;
+    let a = inv_std * scale[c];
+    let b = bias[c] - mean * a;
+    var i = start + lid.x;
+    while (i < end) {
+        out[base + i] = x[base + i] * a + b;
+        i = i + 256u;
+    }
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn sources_compile() {
-        for source in [super::SOFTMAX, super::LAYERNORM] {
+        for source in [super::SOFTMAX, super::LAYERNORM, super::INSTANCENORM] {
             vk_compute::compile_wgsl(source).expect("valid normalization shader");
         }
     }

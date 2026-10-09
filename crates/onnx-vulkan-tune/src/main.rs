@@ -1,9 +1,9 @@
 use onnx_vulkan_tune::{
     ArtifactError, CreatedBy, ExecutionPlanDraft, OUTPUT_SCHEMA_VERSION, bisect_reports,
     build_execution_plan, diff, execution_plan_identity, inspect, inventory_model, merge_artifacts,
-    prepare_replay, read_artifact, read_execution_plan, reduce_diagnostic, resume_artifact,
-    sha256_file, validate_artifact, validate_execution_plan, validate_execution_plan_for,
-    write_artifact, write_execution_plan, write_reduced_fixture,
+    model_check, prepare_replay, read_artifact, read_execution_plan, reduce_diagnostic,
+    resume_artifact, sha256_file, validate_artifact, validate_execution_plan,
+    validate_execution_plan_for, write_artifact, write_execution_plan, write_reduced_fixture,
 };
 use serde::Serialize;
 use std::env;
@@ -22,6 +22,7 @@ usage:
   onnx-vulkan-tune reduce ARTIFACT --diagnostic INDEX --output FIXTURE
   onnx-vulkan-tune merge --output ARTIFACT INPUT...
   onnx-vulkan-tune model-inventory --model MODEL [--dim SYMBOL=N]...
+  onnx-vulkan-tune model-check --model MODEL [--dim SYMBOL=N]...
   onnx-vulkan-tune plan-build --tuning ARTIFACT --model MODEL --inventory JSON --output PLAN
   onnx-vulkan-tune plan-inspect PLAN
   onnx-vulkan-tune plan-validate PLAN --tuning ARTIFACT --model MODEL
@@ -72,6 +73,7 @@ fn run(args: Vec<String>) -> Result<(), AppError> {
         "reduce" => reduce_command(&args),
         "merge" => merge_command(&args),
         "model-inventory" => model_inventory_command(&args),
+        "model-check" => model_check_command(&args),
         "plan-build" => plan_build_command(&args),
         "plan-inspect" => plan_inspect_command(&args),
         "plan-validate" => plan_validate_command(&args),
@@ -121,6 +123,46 @@ fn model_inventory_command(args: &[String]) -> Result<(), AppError> {
     }
     let model = required_path(model, "model-inventory requires --model")?;
     json_stdout(&inventory_model(&model, symbols)?)
+}
+
+fn model_check_command(args: &[String]) -> Result<(), AppError> {
+    let mut model = None;
+    let mut symbols = std::collections::BTreeMap::new();
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" => model = Some(option_path(args, &mut index, "--model")?),
+            "--dim" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| AppError::Usage("--dim requires SYMBOL=N".into()))?;
+                let (name, value) = raw
+                    .split_once('=')
+                    .ok_or_else(|| AppError::Usage("--dim requires SYMBOL=N".into()))?;
+                if name.is_empty() {
+                    return Err(AppError::Usage("--dim symbol is empty".into()));
+                }
+                let value = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        AppError::Usage(format!("--dim {name} requires a positive integer"))
+                    })?;
+                if symbols.insert(name.to_owned(), value).is_some() {
+                    return Err(AppError::Usage(format!("duplicate --dim {name}")));
+                }
+                index += 2;
+            }
+            other => {
+                return Err(AppError::Usage(format!(
+                    "unknown model-check option `{other}`"
+                )));
+            }
+        }
+    }
+    let model = required_path(model, "model-check requires --model")?;
+    json_stdout(&model_check(&model, symbols)?)
 }
 
 fn plan_build_command(args: &[String]) -> Result<(), AppError> {

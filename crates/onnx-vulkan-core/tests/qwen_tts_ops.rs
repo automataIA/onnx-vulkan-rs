@@ -122,3 +122,47 @@ fn unsupported_gather_nd_batching_and_last_tie_break_are_refused() {
     );
     assert!(!is_implemented_node(&last));
 }
+
+#[test]
+fn greater_or_equal_includes_ties() {
+    let left = HostTensor::from_i64(vec![4], &[-1, 0, 1, 2]);
+    let right = HostTensor::from_i64(vec![1], &[0]);
+    let compared = host_ops::compare(&left, &right, CmpOp::GreaterOrEqual).expect("GreaterOrEqual");
+    assert_eq!(compared.data, vec![0, 1, 1, 1]);
+}
+
+#[test]
+fn one_hot_places_depth_at_axis_and_wraps_negative_indices() {
+    let indices = HostTensor::from_i64(vec![2, 2], &[0, 2, -1, 5]);
+    let depth = HostTensor::from_i64(vec![], &[3]);
+    let values = HostTensor::from_f32(vec![2], &[-1.0, 7.0]);
+
+    let last = host_ops::one_hot(&indices, &depth, &values, -1).expect("OneHot axis -1");
+    assert_eq!(last.shape, vec![2, 2, 3]);
+    assert_eq!(
+        last.to_f32().expect("f32 output"),
+        // 0, 2, -1 → 2, and 5 out of range → all off
+        vec![
+            7.0, -1.0, -1.0, -1.0, -1.0, 7.0, -1.0, -1.0, 7.0, -1.0, -1.0, -1.0
+        ]
+    );
+
+    let first = host_ops::one_hot(&indices, &depth, &values, 0).expect("OneHot axis 0");
+    assert_eq!(first.shape, vec![3, 2, 2]);
+    assert_eq!(
+        first.to_f32().expect("f32 output"),
+        vec![
+            7.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 7.0, 7.0, -1.0
+        ]
+    );
+}
+
+#[test]
+fn greater_or_equal_and_one_hot_are_implemented_nodes() {
+    assert!(is_implemented_node(&node(
+        "GreaterOrEqual",
+        &["a", "b"],
+        &[]
+    )));
+    assert!(is_implemented_node(&node("OneHot", &["i", "d", "v"], &[])));
+}

@@ -38,6 +38,10 @@ pub struct ComparisonReport {
     pub mismatches: usize,
     pub max_abs: f64,
     pub max_relative: f64,
+    /// Largest `|Δ| / (atol + rtol·|ref|)`: at most 1 passes. Unlike
+    /// `max_relative`, it stays finite where the reference is zero; exact
+    /// comparisons report infinity on any mismatch.
+    pub max_tolerance_ratio: f64,
     pub matching_nan: usize,
     pub nan_mismatches: usize,
     pub matching_infinity: usize,
@@ -110,34 +114,49 @@ fn compare_float<T>(
         } else {
             difference / scale
         };
+        let allowed = tolerance.absolute + tolerance.relative * scale;
+        let ratio = if allowed > 0.0 {
+            difference / allowed
+        } else if difference == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
         report.max_abs = report.max_abs.max(difference);
         report.max_relative = report.max_relative.max(relative);
-        if difference > tolerance.absolute + tolerance.relative * scale {
+        report.max_tolerance_ratio = report.max_tolerance_ratio.max(ratio);
+        if difference > allowed {
             report.mismatches += 1;
         }
     }
     report
 }
 
+// `max_abs` reports the largest integer distance for diagnostics only; the
+// verdict stays exact equality, which `f64` could not represent for `i64`
 macro_rules! exact_comparator {
-    ($name:ident, $ty:ty, $label:literal) => {
+    ($name:ident, $ty:ty, $label:literal, $widen:expr) => {
         pub fn $name(reference: &[$ty], candidate: &[$ty]) -> ComparisonReport {
+            let widen: fn(&$ty) -> i128 = $widen;
             let mut report = empty_report($label, reference.len(), candidate.len());
-            report.mismatches = reference
-                .iter()
-                .zip(candidate)
-                .filter(|(expected, actual)| expected != actual)
-                .count();
+            for (expected, actual) in reference.iter().zip(candidate) {
+                if expected != actual {
+                    report.mismatches += 1;
+                    report.max_tolerance_ratio = f64::INFINITY;
+                    let distance = widen(expected).abs_diff(widen(actual)) as f64;
+                    report.max_abs = report.max_abs.max(distance);
+                }
+            }
             report
         }
     };
 }
 
-exact_comparator!(compare_i64, i64, "int64");
-exact_comparator!(compare_i32, i32, "int32");
-exact_comparator!(compare_i8, i8, "int8");
-exact_comparator!(compare_u8, u8, "uint8");
-exact_comparator!(compare_bool, bool, "bool");
+exact_comparator!(compare_i64, i64, "int64", |v| i128::from(*v));
+exact_comparator!(compare_i32, i32, "int32", |v| i128::from(*v));
+exact_comparator!(compare_i8, i8, "int8", |v| i128::from(*v));
+exact_comparator!(compare_u8, u8, "uint8", |v| i128::from(*v));
+exact_comparator!(compare_bool, bool, "bool", |v| i128::from(*v));
 
 fn empty_report(
     dtype: &'static str,
@@ -151,6 +170,7 @@ fn empty_report(
         mismatches: reference_len.abs_diff(candidate_len),
         max_abs: 0.0,
         max_relative: 0.0,
+        max_tolerance_ratio: 0.0,
         matching_nan: 0,
         nan_mismatches: 0,
         matching_infinity: 0,
@@ -172,6 +192,16 @@ mod tests {
     }
 
     #[test]
+    fn integer_mismatches_report_their_distance() {
+        let report = compare_u8(&[31, 7, 200], &[28, 7, 201]);
+        assert_eq!(report.mismatches, 2);
+        assert_eq!(report.max_abs, 3.0);
+        let report = compare_i64(&[i64::MIN], &[i64::MAX]);
+        assert_eq!(report.max_abs, u64::MAX as f64);
+        assert_eq!(compare_i8(&[-3], &[-3]).max_abs, 0.0);
+    }
+
+    #[test]
     fn float_tolerance_and_lengths_are_counted() {
         let report = compare_f32(
             &[0.0, 100.0, 3.0],
@@ -179,6 +209,10 @@ mod tests {
             FloatTolerance::new(1e-4, 1e-3),
         );
         assert_eq!(report.mismatches, 2);
+        // 0.2 against 1e-4 + 1e-3·100: twice the allowance; the 1e-5 at a
+        // zero reference is an infinite relative error but a tenth of atol.
+        assert!((report.max_tolerance_ratio - 0.2 / 0.1001).abs() < 1e-4);
+        assert!(report.max_relative.is_infinite());
         assert_eq!(report.reference_len, 3);
         assert_eq!(report.candidate_len, 2);
     }

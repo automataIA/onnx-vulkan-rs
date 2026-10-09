@@ -1,0 +1,353 @@
+// MatMulInteger (u8 x u8 -> i32) on cooperative matrices, staged through
+// shared memory.
+//
+// Same bindings, push constants, algebra and results as
+// matmul_integer_coop.comp, which loads every tile straight from global memory
+// in a one-subgroup workgroup and spends a third of its multiplies on row and
+// column sums against an all-ones operand. Here:
+//
+// - The workgroup is WM x WN subgroups, each computing TM x TN output tiles of
+//   16x16, so a BM x BN block (BM = WM*TM*16, BN = WN*TN*16) shares every A and
+//   B chunk it loads.
+// - Each BK-wide chunk of K is copied global -> registers -> shared memory in
+//   16-byte words, double buffered: the next chunk's global loads are in flight
+//   while the cooperative multiplies read the current one, with one barrier per
+//   chunk.
+// - The row sums of A and the column sums of B, needed for the zero points,
+//   are added up by the threads that copy the bytes, on the ordinary integer
+//   units, and applied per element when the tiles are stored. The tensor cores
+//   only run the product itself.
+// - Rows and columns past M or N are clamped on load and never stored, and the
+//   words of the last chunk past K are zero, which adds nothing to a product or
+//   a sum. Any M, N >= 1 works; K must be a multiple of 16.
+//
+// Integer arithmetic is exact modulo 2^32 whatever the order, so the stored
+// bits equal those of matmul_integer_coop.comp. The epilogue repeats its
+// `precise` conversion, multiply and add, so the f32 bits match as well.
+
+#version 450 core
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef K_TILE
+#error "K_TILE must be defined (16 or 32)"
+#endif
+#ifndef SUBGROUP_SIZE
+#error "SUBGROUP_SIZE must be defined"
+#endif
+
+#ifdef ACC_SIGNED
+#define ACC_T int32_t
+#define ACC_ZERO 0
+#else
+#define ACC_T uint32_t
+#define ACC_ZERO 0u
+#endif
+
+#ifndef WM
+#define WM 2
+#endif
+#ifndef WN
+#define WN 2
+#endif
+#ifndef TM
+#define TM 4
+#endif
+#ifndef TN
+#define TN 4
+#endif
+// Bytes of K per shared-memory stage: a multiple of K_TILE.
+#ifndef BK
+#define BK K_TILE
+#endif
+
+#define TILE 16
+#define BM (WM * TM * TILE)
+#define BN (WN * TN * TILE)
+#define THREADS (SUBGROUP_SIZE * WM * WN)
+// One staged row is BK bytes plus 16 bytes of padding, so that the 16-byte
+// row segments a cooperative load reads from consecutive rows fall in
+// different banks.
+#define ROW_WORDS (BK / 4)
+#define STRIDE (ROW_WORDS + 4)
+#define VECS_PER_ROW (BK / 16)
+#define A_LOADS (BM * VECS_PER_ROW / THREADS)
+#define B_LOADS (BN * VECS_PER_ROW / THREADS)
+
+#if (BM * VECS_PER_ROW) % THREADS != 0 || (BN * VECS_PER_ROW) % THREADS != 0
+#error "every thread must copy the same number of 16-byte words"
+#endif
+#if BK % K_TILE != 0
+#error "BK must be a multiple of K_TILE"
+#endif
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuf { uvec4 a[]; };     // [M, K] u8
+layout(set = 0, binding = 1) readonly buffer BBuf { uvec4 b[]; };     // [N, K] u8 packed
+layout(set = 0, binding = 2) readonly buffer AZp  { uint8_t azp[]; };
+layout(set = 0, binding = 3) readonly buffer BZp  { uint8_t bzp[]; };
+#ifdef EPILOGUE
+layout(set = 0, binding = 4) writeonly buffer OBuf { float o[]; };   // [M, N]
+layout(set = 0, binding = 5) readonly buffer Scale { float scale[]; };
+layout(set = 0, binding = 6) readonly buffer Bias  { float bias[]; };
+layout(set = 0, binding = 7) buffer Range { uint range_bits[]; };  // bits of -min, max
+layout(set = 0, binding = 8) readonly buffer Product { float product[]; };
+#else
+layout(set = 0, binding = 4) writeonly buffer OBuf { ACC_T o[]; };   // [M, N]
+#endif
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint k;
+    uint n;
+    // see matmul_integer_coop.comp
+    uint a_zp_xor;
+    uint b_zp_xor;
+#ifdef EPILOGUE
+    // 0 one value, 1 one per column, 2 one per row (see matmul_integer_coop.comp)
+    uint scale_step;
+    uint bias_step;
+    // bit 0: a Relu follows; bit 1: fold the range; bit 2: the scale is
+    // scale * product (see matmul_integer_coop.comp)
+    uint flags;
+    uint product_step;
+#endif
+} pc;
+
+shared uint stage_a[2 * BM * STRIDE];
+shared uint stage_b[2 * BN * STRIDE];
+shared uint row_sum[BM];
+shared uint col_sum[BN];
+// The finished tiles go through stage_a, unread once the last chunk is done:
+// a separate array would push the 128x128, BK = 64 block past the 48 KiB
+// many devices allow.
+#if WM * WN * TILE * TILE > 2 * BM * STRIDE
+#error "stage_a too small to stage one tile per subgroup"
+#endif
+
+#define ACC_MAT coopmat<ACC_T, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define A_MAT coopmat<uint8_t, gl_ScopeSubgroup, TILE, K_TILE, gl_MatrixUseA>
+#define B_MAT coopmat<uint8_t, gl_ScopeSubgroup, K_TILE, TILE, gl_MatrixUseB>
+
+// Sum of the four bytes of every component: pairs of bytes first, in two
+// 16-bit lanes that cannot overflow (4 x 510).
+uint byte_sum(uvec4 v) {
+    uvec4 pairs = (v & 0x00FF00FFu) + ((v >> 8) & 0x00FF00FFu);
+    uint s = pairs.x + pairs.y + pairs.z + pairs.w;
+    return (s & 0xFFFFu) + (s >> 16);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint sg_row = (sg / WN) * (TM * TILE);
+    uint sg_col = (sg % WN) * (TN * TILE);
+    uint row0 = gl_WorkGroupID.y * BM;
+    uint col0 = gl_WorkGroupID.x * BN;
+    uint k_vecs = pc.k / 16u;
+
+    // Thread t copies the consecutive 16-byte words t*LOADS .. t*LOADS+LOADS-1
+    // of the chunk, so it always covers the same rows (columns of B) and its
+    // byte sums belong to them. Word v of chunk c is word c*VECS_PER_ROW + v of
+    // the row.
+    uint a_src[A_LOADS];
+    uint a_word[A_LOADS];
+    uint a_dst[A_LOADS];
+    uint a_row[A_LOADS];
+    [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+        uint idx = t * A_LOADS + i;
+        a_row[i] = idx / VECS_PER_ROW;
+        a_word[i] = idx % VECS_PER_ROW;
+        a_src[i] = min(row0 + a_row[i], pc.m - 1u) * k_vecs;
+        a_dst[i] = a_row[i] * STRIDE + a_word[i] * 4u;
+    }
+    uint b_src[B_LOADS];
+    uint b_word[B_LOADS];
+    uint b_dst[B_LOADS];
+    uint b_col[B_LOADS];
+    [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+        uint idx = t * B_LOADS + i;
+        b_col[i] = idx / VECS_PER_ROW;
+        b_word[i] = idx % VECS_PER_ROW;
+        b_src[i] = min(col0 + b_col[i], pc.n - 1u) * k_vecs;
+        b_dst[i] = b_col[i] * STRIDE + b_word[i] * 4u;
+    }
+
+    for (uint e = t; e < BM; e += THREADS) {
+        row_sum[e] = 0u;
+    }
+    for (uint e = t; e < BN; e += THREADS) {
+        col_sum[e] = 0u;
+    }
+
+    uvec4 ra[A_LOADS];
+    uvec4 rb[B_LOADS];
+    uint a_sum[A_LOADS];
+    uint b_sum[B_LOADS];
+    [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+        a_sum[i] = 0u;
+    }
+    [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+        b_sum[i] = 0u;
+    }
+
+    // chunk 0 into buffer 0
+    [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+        ra[i] = a_word[i] < k_vecs ? a[a_src[i] + a_word[i]] : uvec4(0u);
+    }
+    [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+        rb[i] = b_word[i] < k_vecs ? b[b_src[i] + b_word[i]] : uvec4(0u);
+    }
+    [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+        a_sum[i] += byte_sum(ra[i]);
+        stage_a[a_dst[i] + 0u] = ra[i].x;
+        stage_a[a_dst[i] + 1u] = ra[i].y;
+        stage_a[a_dst[i] + 2u] = ra[i].z;
+        stage_a[a_dst[i] + 3u] = ra[i].w;
+    }
+    [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+        b_sum[i] += byte_sum(rb[i]);
+        stage_b[b_dst[i] + 0u] = rb[i].x;
+        stage_b[b_dst[i] + 1u] = rb[i].y;
+        stage_b[b_dst[i] + 2u] = rb[i].z;
+        stage_b[b_dst[i] + 3u] = rb[i].w;
+    }
+    barrier();
+
+    ACC_MAT acc[TM * TN];
+    [[unroll]] for (uint q = 0u; q < TM * TN; q++) {
+        acc[q] = ACC_MAT(ACC_ZERO);
+    }
+
+    uint chunks = (pc.k + uint(BK) - 1u) / uint(BK);
+    for (uint c = 0u; c < chunks; c++) {
+        uint cur = c & 1u;
+        bool more = c + 1u < chunks;
+        if (more) {
+            uint step = (c + 1u) * uint(VECS_PER_ROW);
+            [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+                uint w = step + a_word[i];
+                ra[i] = w < k_vecs ? a[a_src[i] + w] : uvec4(0u);
+            }
+            [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+                uint w = step + b_word[i];
+                rb[i] = w < k_vecs ? b[b_src[i] + w] : uvec4(0u);
+            }
+        }
+
+        uint a_base = cur * (BM * STRIDE) + sg_row * STRIDE;
+        uint b_base = cur * (BN * STRIDE) + sg_col * STRIDE;
+        [[unroll]] for (uint kk = 0u; kk < uint(BK / K_TILE); kk++) {
+            A_MAT ma[TM];
+            B_MAT mb[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                coopMatLoad(ma[i], stage_a, a_base + i * (TILE * STRIDE) + kk * (K_TILE / 4), STRIDE,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < TN; j++) {
+                coopMatLoad(mb[j], stage_b, b_base + j * (TILE * STRIDE) + kk * (K_TILE / 4), STRIDE,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                [[unroll]] for (uint j = 0u; j < TN; j++) {
+                    acc[i * TN + j] = coopMatMulAdd(ma[i], mb[j], acc[i * TN + j]);
+                }
+            }
+        }
+
+        if (more) {
+            // the other buffer was last read before the previous barrier
+            uint next_a = (cur ^ 1u) * (BM * STRIDE);
+            uint next_b = (cur ^ 1u) * (BN * STRIDE);
+            [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+                a_sum[i] += byte_sum(ra[i]);
+                stage_a[next_a + a_dst[i] + 0u] = ra[i].x;
+                stage_a[next_a + a_dst[i] + 1u] = ra[i].y;
+                stage_a[next_a + a_dst[i] + 2u] = ra[i].z;
+                stage_a[next_a + a_dst[i] + 3u] = ra[i].w;
+            }
+            [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+                b_sum[i] += byte_sum(rb[i]);
+                stage_b[next_b + b_dst[i] + 0u] = rb[i].x;
+                stage_b[next_b + b_dst[i] + 1u] = rb[i].y;
+                stage_b[next_b + b_dst[i] + 2u] = rb[i].z;
+                stage_b[next_b + b_dst[i] + 3u] = rb[i].w;
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < A_LOADS; i++) {
+        atomicAdd(row_sum[a_row[i]], a_sum[i]);
+    }
+    [[unroll]] for (uint i = 0u; i < B_LOADS; i++) {
+        atomicAdd(col_sum[b_col[i]], b_sum[i]);
+    }
+    barrier();
+
+    // sum (a - za)(b - zb) = sum ab - za*sum b - zb*sum a + K*za*zb
+    ACC_T za = ACC_T(uint(azp[0]) ^ pc.a_zp_xor);
+    ACC_T zb = ACC_T(uint(bzp[0]) ^ pc.b_zp_xor);
+    ACC_T corr = ACC_T(pc.k) * za * zb;
+    uint lane = gl_SubgroupInvocationID;
+    uint own = sg * (TILE * TILE);
+#ifdef EPILOGUE
+    // the range of the stored values, from 0 (see matmul_integer_coop.comp)
+    float run_max = 0.0;
+    float run_neg = 0.0;
+#endif
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            coopMatStore(acc[i * TN + j], stage_a, own, TILE, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint e = lane; e < TILE * TILE; e += SUBGROUP_SIZE) {
+                uint r = sg_row + i * TILE + e / TILE;
+                uint col = sg_col + j * TILE + e % TILE;
+                uint grow = row0 + r;
+                uint gcol = col0 + col;
+                ACC_T res = ACC_T(stage_a[own + e]) - za * ACC_T(col_sum[col]) - zb * ACC_T(row_sum[r]) + corr;
+                if (grow < pc.m && gcol < pc.n) {
+#ifdef EPILOGUE
+                    // int() keeps the bits of an unsigned accumulator
+                    precise float x = float(int(res));
+                    precise float s = scale[gcol * (pc.scale_step & 1u) + grow * (pc.scale_step >> 1u)];
+                    if ((pc.flags & 4u) != 0u) {
+                        s = s * product[gcol * (pc.product_step & 1u) + grow * (pc.product_step >> 1u)];
+                    }
+                    precise float y = x * s;
+                    precise float z = y + bias[gcol * (pc.bias_step & 1u) + grow * (pc.bias_step >> 1u)];
+                    float v = (pc.flags & 1u) != 0u ? max(z, 0.0) : z;
+                    o[grow * pc.n + gcol] = v;
+                    run_max = max(run_max, v);
+                    run_neg = max(run_neg, -v);
+#else
+                    o[grow * pc.n + gcol] = res;
+#endif
+                }
+            }
+            // the next tile overwrites what this one is still reading
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+#ifdef EPILOGUE
+    if ((pc.flags & 2u) != 0u) {
+        float top = subgroupMax(run_max);
+        float bottom = subgroupMax(run_neg);
+        if (subgroupElect()) {
+            atomicMax(range_bits[0], floatBitsToUint(bottom) & 0x7fffffffu);
+            atomicMax(range_bits[1], floatBitsToUint(top) & 0x7fffffffu);
+        }
+    }
+#endif
+}

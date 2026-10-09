@@ -32,7 +32,21 @@ pub struct ExecutionEnv<'context, 'values> {
     released: HashMap<String, (i32, Vec<i64>)>,
     /// Hand this run's buffers back to the pool instead of freeing them.
     retain: bool,
+    /// The node being executed is the last reader of its first input, see
+    /// `set_first_input_dies`.
+    first_input_dies: bool,
+    /// Zeroed slots for `DynamicQuantizeLinear` ranges, see `range_slot`.
+    ranges: Vec<vk_compute::GpuBuffer>,
+    /// Bytes of the last of `ranges` already handed out.
+    range_used: u64,
+    /// Values whose range a producer folded into a slot while writing them,
+    /// see `set_range`.
+    computed_ranges: HashMap<String, (usize, u64)>,
 }
+
+/// Slots per buffer of `ExecutionEnv::ranges`: SAM 3's detector quantizes
+/// 181 tensors per run.
+const RANGE_SLOTS: u64 = 256;
 
 impl<'context, 'values> ExecutionEnv<'context, 'values> {
     /// Cache must belong to the same `VkContext`: pipelines and buffers are not
@@ -51,7 +65,52 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             row_padded: HashMap::new(),
             released: HashMap::new(),
             retain: false,
+            first_input_dies: false,
+            ranges: Vec::new(),
+            range_used: 0,
+            computed_ranges: HashMap::new(),
         }
+    }
+
+    /// A fresh 8-byte slot of zeros, as the buffer index in `ranges` and the
+    /// offset in it, for the range `DynamicQuantizeLinear` accumulates with
+    /// atomics. The slots come from buffers of [`RANGE_SLOTS`], each cleared
+    /// by one fill when it is created: a fill per quantization costs about
+    /// what the reduction pass it replaced did.
+    pub fn range_slot(&mut self) -> Result<(usize, u64)> {
+        let stride = self.context.storage_offset_alignment.max(8);
+        if self.ranges.is_empty() || self.range_used + stride > RANGE_SLOTS * stride {
+            let bytes = RANGE_SLOTS * stride;
+            let buffer = self
+                .context
+                .create_storage_buffer(bytes)
+                .map_err(backend_error)?;
+            self.context
+                .stream_fill(&buffer, 0, bytes, 0)
+                .map_err(backend_error)?;
+            self.ranges.push(buffer);
+            self.range_used = 0;
+        }
+        let offset = self.range_used;
+        self.range_used += stride;
+        Ok((self.ranges.len() - 1, offset))
+    }
+
+    /// The buffer of a slot `range_slot` handed out.
+    pub fn range_buffer(&self, index: usize) -> &vk_compute::GpuBuffer {
+        &self.ranges[index]
+    }
+
+    /// Records that the kernel producing `name` also folded its range into
+    /// `slot`, from `range_slot`, so a `DynamicQuantizeLinear` of `name` can
+    /// skip its own min/max pass. Valid until the end of the run.
+    pub fn set_range(&mut self, name: &str, slot: (usize, u64)) {
+        self.computed_ranges.insert(name.to_owned(), slot);
+    }
+
+    /// The slot `set_range` recorded for `name`, if any.
+    pub fn computed_range(&self, name: &str) -> Option<(usize, u64)> {
+        self.computed_ranges.get(name).copied()
     }
 
     /// Records that `name` sits in its buffer with a row stride of `stride`
@@ -217,16 +276,33 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     /// remaining device values are copied to staging buffers together and the
     /// stream is flushed once, irrespective of the number of outputs.
     pub fn host_many(&self, names: &[&str]) -> Result<Vec<HostTensor>> {
-        let mut outputs: Vec<Option<HostTensor>> = vec![None; names.len()];
-        let mut pending = Vec::new();
+        let mut outputs = vec![HostTensor::new(0, Vec::new(), Vec::new()); names.len()];
+        self.host_many_into(names, &mut outputs)?;
+        Ok(outputs)
+    }
 
-        for (index, &name) in names.iter().enumerate() {
+    /// [`Self::host_many`] into tensors the caller keeps across runs: each
+    /// one's dtype, shape and bytes are overwritten, reusing its allocations.
+    /// On error their contents are unspecified.
+    pub fn host_many_into(&self, names: &[&str], outputs: &mut [HostTensor]) -> Result<()> {
+        if outputs.len() != names.len() {
+            return Err(Error::InvalidTensor(format!(
+                "{} destinations for {} values",
+                outputs.len(),
+                names.len()
+            )));
+        }
+        // the device values still to download, by destination
+        let mut device = vec![None; names.len()];
+
+        for ((&name, out), device) in names.iter().zip(outputs.iter_mut()).zip(&mut device) {
             if let Some(initializer) = self.initializers.get(name) {
-                outputs[index] = Some(HostTensor::new(
+                copy_into(
+                    out,
                     initializer.dtype,
-                    initializer.shape.clone(),
-                    initializer.data.clone(),
-                ));
+                    &initializer.shape,
+                    &initializer.data,
+                );
                 continue;
             }
             if let Some(stride) = self.row_padding(name) {
@@ -237,10 +313,12 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 )));
             }
             match self.values.get(name) {
-                Some(Tensor::Host(tensor)) => outputs[index] = Some(tensor.clone()),
+                Some(Tensor::Host(tensor)) => {
+                    copy_into(out, tensor.dtype, &tensor.shape, &tensor.data);
+                }
                 Some(Tensor::Device(tensor)) => {
                     if let Some(host) = self.host_cache.borrow().get(name) {
-                        outputs[index] = Some(host.clone());
+                        copy_into(out, host.dtype, &host.shape, &host.data);
                         continue;
                     }
                     let byte_len =
@@ -250,14 +328,11 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                                 tensor.dtype
                             ))
                         })?;
-                    if byte_len == 0 {
-                        outputs[index] = Some(HostTensor::new(
-                            tensor.dtype,
-                            tensor.shape.clone(),
-                            Vec::new(),
-                        ));
-                    } else {
-                        pending.push((index, name, tensor, byte_len));
+                    out.dtype = tensor.dtype;
+                    out.shape.clone_from(&tensor.shape);
+                    resize_for_overwrite(&mut out.data, byte_len);
+                    if byte_len > 0 {
+                        *device = Some(tensor);
                     }
                 }
                 None => {
@@ -268,36 +343,22 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
             }
         }
 
-        let sources: Vec<_> = pending
-            .iter()
-            .map(|(_, _, tensor, bytes)| (tensor.buffer(), *bytes))
+        let mut sources: Vec<_> = outputs
+            .iter_mut()
+            .zip(&device)
+            .filter_map(|(out, tensor)| tensor.map(|t| (t.buffer(), out.data.as_mut_slice())))
             .collect();
-        let downloads = self
-            .context
-            .stream_download_many(&sources)
+        self.context
+            .stream_download_many_into(&mut sources)
             .map_err(backend_error)?;
-        for ((index, name, tensor, byte_len), data) in pending.into_iter().zip(downloads) {
-            let host = HostTensor::new(tensor.dtype, tensor.shape.clone(), data);
-            if byte_len <= HOST_MEMO_MAX_BYTES {
+        for ((&name, out), tensor) in names.iter().zip(outputs.iter()).zip(&device) {
+            if tensor.is_some() && out.data.len() <= HOST_MEMO_MAX_BYTES {
                 self.host_cache
                     .borrow_mut()
-                    .insert(name.to_owned(), host.clone());
+                    .insert(name.to_owned(), out.clone());
             }
-            outputs[index] = Some(host);
         }
-
-        outputs
-            .into_iter()
-            .enumerate()
-            .map(|(index, tensor)| {
-                tensor.ok_or_else(|| {
-                    Error::Backend(format!(
-                        "batched download left output {} ('{}') unresolved",
-                        index, names[index]
-                    ))
-                })
-            })
-            .collect()
+        Ok(())
     }
 
     pub fn dtype_of(&self, name: &str) -> Result<i32> {
@@ -426,7 +487,16 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
                 return Ok(());
             }
         }
-        let host = self.host(name)?;
+        // a host value is uploaded from where it is: `host()` would clone it
+        // first (21 MB of SAM 3 image embeddings per run)
+        let owned;
+        let host = match self.values.get(name) {
+            Some(Tensor::Host(tensor)) => tensor,
+            _ => {
+                owned = self.host(name)?;
+                &owned
+            }
+        };
         host.validate()?;
         if host.dtype != FLOAT {
             return Err(Error::InvalidTensor(format!(
@@ -541,14 +611,97 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         }
     }
 
+    /// Removes `name` from the environment as a device tensor the caller owns,
+    /// uploading it first if it is on the host.
+    ///
+    /// This is how a value leaves a run without crossing the bus: the caller
+    /// binds it to the next run, of this graph or another on the same context,
+    /// and returns the buffer with `VkContext::recycle_storage_buffer` when done.
+    /// Storage the environment only borrows (an initializer, a caller's buffer)
+    /// and row-padded values are refused rather than copied.
+    pub fn take_owned_device(&mut self, name: &str) -> Result<DeviceTensor<'static>> {
+        if self.row_padded.contains_key(name) {
+            return Err(Error::InvalidTensor(format!(
+                "'{name}' is row-padded in its buffer, it cannot leave the run"
+            )));
+        }
+        self.ensure_device_dtype(name)?;
+        let Some(Tensor::Device(DeviceTensor {
+            buf: DeviceBuffer::Owned(_),
+            ..
+        })) = self.values.get(name)
+        else {
+            return Err(Error::InvalidTensor(format!(
+                "'{name}' lives in borrowed storage, it cannot leave the run"
+            )));
+        };
+        let Some(Tensor::Device(DeviceTensor {
+            dtype,
+            shape,
+            elem_count,
+            buf: DeviceBuffer::Owned(buffer),
+        })) = self.values.remove(name)
+        else {
+            unreachable!("checked above");
+        };
+        self.host_cache.borrow_mut().remove(name);
+        self.released
+            .insert(name.to_owned(), (dtype, shape.clone()));
+        Ok(DeviceTensor {
+            dtype,
+            shape,
+            elem_count,
+            buf: DeviceBuffer::Owned(buffer),
+        })
+    }
+
+    /// Tells the node about to run whether it is the last reader of its first
+    /// input, which only the walk over the whole graph knows.
+    ///
+    /// A shape-only op (`Reshape`, `Squeeze`, …) uses it to take the input's
+    /// buffer instead of copying it: the bytes are the same, and once the
+    /// input is dead nobody else can see them change owner.
+    pub fn set_first_input_dies(&mut self, dies: bool) {
+        self.first_input_dies = dies;
+    }
+
+    /// Takes `name`'s buffer out of the environment, as `release` would, when
+    /// the current node is its last reader and the runtime owns it.
+    ///
+    /// `None` leaves the value where it is: borrowed storage belongs to the
+    /// host, a row-padded buffer does not hold the tensor as its shape says,
+    /// and a value read later must keep its own buffer.
+    pub fn take_dying_device(&mut self, name: &str) -> Option<DeviceTensor<'values>> {
+        if !self.first_input_dies || self.row_padded.contains_key(name) {
+            return None;
+        }
+        if !matches!(
+            self.values.get(name),
+            Some(Tensor::Device(DeviceTensor {
+                buf: DeviceBuffer::Owned(_),
+                ..
+            }))
+        ) {
+            return None;
+        }
+        let Some(Tensor::Device(tensor)) = self.values.remove(name) else {
+            return None;
+        };
+        self.host_cache.borrow_mut().remove(name);
+        self.released
+            .insert(name.to_owned(), (tensor.dtype, tensor.shape.clone()));
+        Some(tensor)
+    }
+
     /// Keeps this run's buffers pooled for the next one instead of freeing them.
     ///
     /// A decode step allocates the same sizes in the same order as the step
     /// before it, so a pool that survives the run hands the **same** buffers back
     /// in the same order — which is what makes a recorded descriptor set still
-    /// valid a token later. The cost is that the working set stays resident
-    /// between steps, which for a generation loop is the point and for a
-    /// one-shot run would be a leak; hence opt-in, set by the cached path.
+    /// valid a token later. The cost is that the whole working set stays
+    /// resident between steps, which for a generation loop is the point and for
+    /// a one-shot run would hold memory without bound; hence opt-in, set by the
+    /// cached path. A one-shot run keeps only what fits the context's budget.
     pub fn retain_buffers(&mut self) {
         self.retain = true;
     }
@@ -560,41 +713,34 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     }
 
     fn release_owned(&mut self) {
-        if self.retain {
-            // By buffer identity, not in `HashMap` order: iteration order is
-            // seeded per instance, so draining directly would return the
-            // buffers differently on every step. Which order in particular does
-            // not matter — `reset_pool_order` canonicalizes the pool at the
-            // start of the next step — only that it is the same one every time.
-            let mut owned: Vec<vk_compute::GpuBuffer> = self
-                .values
-                .drain()
-                .filter_map(|(_, tensor)| match tensor {
-                    Tensor::Device(DeviceTensor {
-                        buf: DeviceBuffer::Owned(buffer),
-                        ..
-                    }) => Some(buffer),
-                    _ => None,
-                })
-                .collect();
-            owned.sort_by_key(|buffer| buffer.id());
-            for buffer in owned {
-                self.context.recycle_storage_buffer(buffer);
-            }
-            return;
+        // By buffer identity, not in `HashMap` order: iteration order is
+        // seeded per instance, so draining directly would return the
+        // buffers differently on every step. Which order in particular does
+        // not matter — `reset_pool_order` canonicalizes the pool at the
+        // start of the next step — only that it is the same one every time.
+        let mut owned: Vec<vk_compute::GpuBuffer> = self
+            .values
+            .drain()
+            .filter_map(|(_, tensor)| match tensor {
+                Tensor::Device(DeviceTensor {
+                    buf: DeviceBuffer::Owned(buffer),
+                    ..
+                }) => Some(buffer),
+                _ => None,
+            })
+            .collect();
+        owned.append(&mut self.ranges);
+        self.range_used = 0;
+        self.computed_ranges.clear();
+        owned.sort_by_key(|buffer| buffer.id());
+        for buffer in owned {
+            self.context.recycle_storage_buffer(buffer);
         }
-        for (_, tensor) in self.values.drain() {
-            if let Tensor::Device(DeviceTensor {
-                buf: DeviceBuffer::Owned(buffer),
-                ..
-            }) = tensor
-            {
-                self.context.defer_destroy(buffer);
-            }
+        if !self.retain {
+            // the next run of the same graph asks for the same sizes: what
+            // the budget allows stays pooled for it, the rest is freed
+            self.context.trim_storage_pool();
         }
-        // buffers recycled by `release` belong to this execution: keeping them
-        // pooled would hold the whole live set of the block until the context dies
-        self.context.drain_storage_pool();
     }
 }
 
@@ -642,6 +788,26 @@ fn upload_float(
 
 fn backend_error(error: impl std::fmt::Display) -> Error {
     Error::Backend(error.to_string())
+}
+
+/// Overwrites `out` with a host value, reusing its allocations.
+fn copy_into(out: &mut HostTensor, dtype: i32, shape: &[i64], data: &[u8]) {
+    out.dtype = dtype;
+    out.shape.clear();
+    out.shape.extend_from_slice(shape);
+    out.data.clear();
+    out.data.extend_from_slice(data);
+}
+
+/// Makes `data` exactly `len` bytes, to be overwritten by a download. Its
+/// allocation is reused when large enough; a new one comes zeroed from the
+/// allocator, so the download is its first touch, as with an owned `Vec`.
+fn resize_for_overwrite(data: &mut Vec<u8>, len: usize) {
+    if data.capacity() < len {
+        *data = vec![0; len];
+    } else {
+        data.resize(len, 0);
+    }
 }
 
 #[cfg(test)]

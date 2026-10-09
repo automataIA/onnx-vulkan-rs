@@ -6,9 +6,12 @@
 //! case `axis_len = 1`. Quantized data is packed in VRAM, 4 bytes per
 //! `u32`, as `DynamicQuantizeLinear` already does.
 
+use super::dynamic_quantize::div_rn;
+
 pub const BINDINGS: u32 = 4;
-/// 5 u32 fields in the push constant struct.
-pub const PUSH_BYTES: u32 = 20;
+/// 6 u32 fields in the push constant struct; `DequantizeLinear` reads the
+/// first 5.
+pub const PUSH_BYTES: u32 = 24;
 
 /// `DequantizeLinear` on **int32** input, without unpacking.
 ///
@@ -70,13 +73,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// `QuantizeLinear`: `y = saturate(round_ties_even(x / scale) + zero_point)`.
 /// One thread produces a full `u32` (4 elements) for packed writing,
 /// so no atomics are needed.
-pub const QUANTIZE: &str = r#"
+///
+/// The quotient comes from `div_rn` (see [`super::dynamic_quantize`]):
+/// `OpFDiv` may be 2.5 ULP off, and an RTX 4070 quotient one ULP from a tie
+/// such as `-13.5` rounds to a different integer than ORT's exact one. The
+/// push-constant `zero` is always 0.
+pub const QUANTIZE: &str = concat!(
+    div_rn!(),
+    r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
 @group(0) @binding(2) var<storage, read> zp: array<u32>;     // u8/i8 packed
 @group(0) @binding(3) var<storage, read_write> out: array<u32>;
 
-struct Push { n: u32, inner: u32, axis_len: u32, signed: u32, has_zp: u32 }
+struct Push { n: u32, inner: u32, axis_len: u32, signed: u32, has_zp: u32, zero: u32 }
 var<immediate> pc: Push;
 
 @compute @workgroup_size(256)
@@ -95,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (pc.signed != 0u && raw > 127) { zero = raw - 256; } else { zero = raw; }
         }
         // round() in WGSL is ties-to-even, as required by the ONNX spec
-        var q = i32(round(x[i] / scale[c])) + zero;
+        var q = i32(round(div_rn(x[i], scale[c], pc.zero))) + zero;
         if (pc.signed != 0u) {
             q = clamp(q, -128, 127);
             packed = packed | ((u32(q) & 0xffu) << (j * 8u));
@@ -106,7 +116,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     out[word] = packed;
 }
-"#;
+"#
+);
 
 #[cfg(test)]
 mod tests {

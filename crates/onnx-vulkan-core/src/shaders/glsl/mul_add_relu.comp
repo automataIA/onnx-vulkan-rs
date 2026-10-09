@@ -1,0 +1,43 @@
+// y = max(x * scale + bias, 0): the Mul -> Add -> Relu a convolutional network
+// applies after a normalization whose own affine is the identity. SAM 3's
+// pixel decoder writes GroupNorm as InstanceNormalization over [1, groups, -1]
+// and then scales and shifts each of the 256 channels of a 144x144 and a
+// 288x288 map: three passes over up to 85 MB where one is enough.
+//
+// x is f32 [N, C, spatial...], read as `plane` elements per channel; scale and
+// bias are one value (step 0) or one per channel (step 1).
+//
+// Why GLSL and not WGSL: the result must be bit for bit that of the separate
+// Mul and Add kernels the rewrite replaced, each of which rounds on its own.
+// `x * scale + bias` is exactly the shape a driver contracts into one FMA,
+// which rounds once instead of twice. `precise` forbids that contraction
+// (SPIR-V NoContraction); naga's WGSL backend has no way to emit it. The Relu
+// is the `max(v, 0.0)` of the unary kernel.
+
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Scale { float scale[]; };
+layout(std430, binding = 2) readonly buffer Bias { float bias[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint plane;
+    uint channels;
+    uint scale_step;
+    uint bias_step;
+} pc;
+
+void main() {
+    // grid-stride: the host caps the workgroup count at the device limit
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        uint c = (i / pc.plane) % pc.channels;
+        precise float scaled = x[i] * scale[c * pc.scale_step];
+        precise float shifted = scaled + bias[c * pc.bias_step];
+        y[i] = max(shifted, 0.0);
+    }
+}

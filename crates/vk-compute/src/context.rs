@@ -19,6 +19,151 @@ pub struct CoopMatU8 {
     pub acc_signed: bool,
 }
 
+/// `VkPhysicalDeviceCooperativeMatrix2FeaturesNV` (`VK_NV_cooperative_matrix2`),
+/// which ash 0.38 does not define. Layout copied from `vulkan_core.h`.
+#[repr(C)]
+struct CooperativeMatrix2FeaturesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope: vk::Bool32,
+    flexible_dimensions: vk::Bool32,
+    reductions: vk::Bool32,
+    conversions: vk::Bool32,
+    per_element_operations: vk::Bool32,
+    tensor_addressing: vk::Bool32,
+    block_loads: vk::Bool32,
+}
+
+impl Default for CooperativeMatrix2FeaturesNv {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_593_000),
+            p_next: std::ptr::null_mut(),
+            workgroup_scope: vk::FALSE,
+            flexible_dimensions: vk::FALSE,
+            reductions: vk::FALSE,
+            conversions: vk::FALSE,
+            per_element_operations: vk::FALSE,
+            tensor_addressing: vk::FALSE,
+            block_loads: vk::FALSE,
+        }
+    }
+}
+
+// SAFETY: the struct starts with `sType` and `pNext` like every Vulkan
+// structure, and both entry points accept it in their chains.
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for CooperativeMatrix2FeaturesNv {}
+unsafe impl vk::ExtendsDeviceCreateInfo for CooperativeMatrix2FeaturesNv {}
+
+/// `VkPhysicalDeviceCooperativeMatrix2PropertiesNV`.
+#[repr(C)]
+struct CooperativeMatrix2PropertiesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope_max_workgroup_size: u32,
+    flexible_dimensions_max_dimension: u32,
+    workgroup_scope_reserved_shared_memory: u32,
+}
+
+impl Default for CooperativeMatrix2PropertiesNv {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_593_002),
+            p_next: std::ptr::null_mut(),
+            workgroup_scope_max_workgroup_size: 0,
+            flexible_dimensions_max_dimension: 0,
+            workgroup_scope_reserved_shared_memory: 0,
+        }
+    }
+}
+
+// SAFETY: as for the features structure.
+unsafe impl vk::ExtendsPhysicalDeviceProperties2 for CooperativeMatrix2PropertiesNv {}
+
+/// `VkCooperativeMatrixFlexibleDimensionsPropertiesNV`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlexibleDimensionsNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    m_granularity: u32,
+    n_granularity: u32,
+    k_granularity: u32,
+    a_type: vk::ComponentTypeKHR,
+    b_type: vk::ComponentTypeKHR,
+    c_type: vk::ComponentTypeKHR,
+    result_type: vk::ComponentTypeKHR,
+    saturating_accumulation: vk::Bool32,
+    scope: vk::ScopeKHR,
+    workgroup_invocations: u32,
+}
+
+impl Default for FlexibleDimensionsNv {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_593_001),
+            p_next: std::ptr::null_mut(),
+            m_granularity: 0,
+            n_granularity: 0,
+            k_granularity: 0,
+            a_type: vk::ComponentTypeKHR::default(),
+            b_type: vk::ComponentTypeKHR::default(),
+            c_type: vk::ComponentTypeKHR::default(),
+            result_type: vk::ComponentTypeKHR::default(),
+            saturating_accumulation: vk::FALSE,
+            scope: vk::ScopeKHR::default(),
+            workgroup_invocations: 0,
+        }
+    }
+}
+
+type FlexibleDimensionsFn = unsafe extern "system" fn(
+    vk::PhysicalDevice,
+    *mut u32,
+    *mut FlexibleDimensionsNv,
+) -> vk::Result;
+
+/// Invocations of a workgroup-scope `VK_NV_cooperative_matrix2` kernel
+/// ([`VkContext::coop_f16_wg`]).
+pub const COOP_WG_INVOCATIONS: u32 = 128;
+/// Every tile side of that kernel is a multiple of this.
+const COOP_WG_GRANULE: u32 = 32;
+
+/// Whether the device runs a workgroup-scope `f16 × f16 → f32` multiply with
+/// [`COOP_WG_INVOCATIONS`] invocations whose tile sides are multiples of
+/// [`COOP_WG_GRANULE`]. The flexible-dimension query is not in ash 0.38, so
+/// its entry point is loaded by name.
+fn coop_wg_f16_shape(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<bool> {
+    let name = c"vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV";
+    let Some(raw) = (unsafe { entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) })
+    else {
+        return Ok(false);
+    };
+    // SAFETY: the loader returned the entry point of exactly this name, whose
+    // C signature `FlexibleDimensionsFn` mirrors.
+    let query: FlexibleDimensionsFn = unsafe { std::mem::transmute(raw) };
+    let mut count = 0u32;
+    unsafe { query(physical_device, &mut count, std::ptr::null_mut()) }.result()?;
+    let mut list = vec![FlexibleDimensionsNv::default(); count as usize];
+    unsafe { query(physical_device, &mut count, list.as_mut_ptr()) }.result()?;
+    list.truncate(count as usize);
+    Ok(list.iter().any(|c| {
+        c.scope == vk::ScopeKHR::WORKGROUP
+            && c.workgroup_invocations == COOP_WG_INVOCATIONS
+            && c.a_type == vk::ComponentTypeKHR::FLOAT16
+            && c.b_type == vk::ComponentTypeKHR::FLOAT16
+            && c.c_type == vk::ComponentTypeKHR::FLOAT32
+            && c.result_type == vk::ComponentTypeKHR::FLOAT32
+            && [c.m_granularity, c.n_granularity, c.k_granularity]
+                .iter()
+                .all(|&g| COOP_WG_GRANULE.is_multiple_of(g))
+    }))
+}
+
 /// Vulkan compute limits that constrain generated kernel tactics.
 ///
 /// The values are copied verbatim from `VkPhysicalDeviceLimits`; policy such
@@ -123,6 +268,15 @@ pub struct VkContext {
     /// if `VK_KHR_cooperative_matrix` (or one of the features the kernel needs)
     /// is missing.
     pub coop_u8: Vec<CoopMatU8>,
+    /// A 16×16×16 `f16 × f16 → f32` subgroup cooperative matrix, with
+    /// `shaderFloat16` and subgroup shuffles, is enabled on the device.
+    pub coop_f16: bool,
+    /// `VK_NV_cooperative_matrix2` is enabled with workgroup scope, flexible
+    /// dimensions, reductions, conversions, per-element operations and tensor
+    /// addressing, for an `f16 × f16 → f32` multiply on workgroups of
+    /// [`COOP_WG_INVOCATIONS`]. Implies `coop_f16` and a Vulkan 1.3 device
+    /// (SPIR-V 1.6).
+    pub coop_f16_wg: bool,
     /// Subgroup width, which is also the workgroup size of the cooperative
     /// matrix shaders (one subgroup computes one 16×16 tile).
     pub subgroup_size: u32,
@@ -157,6 +311,9 @@ pub struct VkContext {
     /// Device-local storage buffers freed by their owner and reusable by the
     /// next allocation of the same size (see `buffer.rs`).
     pub(crate) storage_pool: Mutex<crate::buffer::StoragePool>,
+    /// Bytes of free storage buffers kept for the next run, see
+    /// `trim_storage_pool`.
+    pub(crate) storage_pool_budget: u64,
     /// Commands recorded into the stream while a capture is open (see
     /// `capture.rs`). `None` when nothing is being captured, which is the
     /// steady state: the check is one uncontended lock per command.
@@ -167,6 +324,32 @@ pub struct VkContext {
 
 /// Timestamp slot in profiling query pool.
 pub(crate) const TS_CAPACITY: u32 = 16384;
+
+/// Free storage bytes a run leaves pooled for the next one:
+/// `VULKAN_POOL_BUDGET_MB` when set (0 frees everything, as before the budget
+/// existed), else an eighth of the largest device-local heap.
+///
+/// A fraction of the heap and not a fixed size so that a small card keeps
+/// little: what stays pooled is VRAM another model or process does not get,
+/// and an allocation that fails for it releases the whole pool first (see
+/// `create_storage_buffer`).
+fn storage_pool_budget(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> u64 {
+    if let Ok(value) = std::env::var("VULKAN_POOL_BUDGET_MB") {
+        match value.parse::<u64>() {
+            Ok(megabytes) => return megabytes << 20,
+            Err(_) => log::warn!("VULKAN_POOL_BUDGET_MB={value:?} is not a number, ignored"),
+        }
+    }
+    let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    memory
+        .memory_heaps_as_slice()
+        .iter()
+        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|heap| heap.size)
+        .max()
+        .unwrap_or(0)
+        / 8
+}
 
 // Vulkan handles can be used from multiple threads; the non-thread-safe
 // sections (command pool, queue) are serialized by `submit_lock`, the allocator by a Mutex.
@@ -179,7 +362,7 @@ impl VkContext {
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"onnx-vulkan-rs")
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(vk::API_VERSION_1_3);
         let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         let instance =
             unsafe { entry.create_instance(&create_info, None) }.context("creazione VkInstance")?;
@@ -217,6 +400,8 @@ impl VkContext {
         // 8-bit storage / int8 / memory-model features the SPIR-V declares, and
         // a (M, N, K, types, scope) combination we have a shader for. The
         // combinations are driver-dependent, so they are queried, never assumed.
+        // The f16 configuration is detected separately and kept out of the
+        // device fingerprint: no tuned tactic depends on it.
         let mut coop_features = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default();
         let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
@@ -225,21 +410,39 @@ impl VkContext {
         let subgroup_size = subgroup_props.subgroup_size;
 
         let mut coop_u8 = Vec::new();
+        let mut coop_f16 = false;
         if has_ext(vk::KHR_COOPERATIVE_MATRIX_NAME) {
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut coop_features)
                 .push_next(&mut vk12_features);
             unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
             let usable = coop_features.cooperative_matrix == vk::TRUE
-                && vk12_features.vulkan_memory_model == vk::TRUE
-                && vk12_features.storage_buffer8_bit_access == vk::TRUE
+                && vk12_features.vulkan_memory_model == vk::TRUE;
+            let int8 = vk12_features.storage_buffer8_bit_access == vk::TRUE
                 && vk12_features.shader_int8 == vk::TRUE;
-            if usable {
+            let float16 = vk12_features.shader_float16 == vk::TRUE
+                && subgroup_props
+                    .supported_operations
+                    .contains(vk::SubgroupFeatureFlags::SHUFFLE);
+            if usable && (int8 || float16) {
                 let coop = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
                 let combos = unsafe {
                     coop.get_physical_device_cooperative_matrix_properties(physical_device)
                 }?;
                 for c in combos {
+                    if float16
+                        && c.scope == vk::ScopeKHR::SUBGROUP
+                        && (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
+                        && c.a_type == vk::ComponentTypeKHR::FLOAT16
+                        && c.b_type == vk::ComponentTypeKHR::FLOAT16
+                        && c.c_type == vk::ComponentTypeKHR::FLOAT32
+                        && c.result_type == vk::ComponentTypeKHR::FLOAT32
+                    {
+                        coop_f16 = true;
+                    }
+                    if !int8 {
+                        continue;
+                    }
                     let acc_signed = match (c.c_type, c.result_type) {
                         (vk::ComponentTypeKHR::UINT32, vk::ComponentTypeKHR::UINT32) => false,
                         (vk::ComponentTypeKHR::SINT32, vk::ComponentTypeKHR::SINT32) => true,
@@ -259,13 +462,59 @@ impl VkContext {
                     }
                 }
             }
-            if !coop_u8.is_empty() {
+            if !coop_u8.is_empty() || coop_f16 {
                 enabled_exts.push(vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr());
-                // Only the features the kernel's SPIR-V declares.
+                // Only the features the kernels' SPIR-V declares.
+                let int8 = !coop_u8.is_empty();
                 vk12_features = vk::PhysicalDeviceVulkan12Features::default()
                     .vulkan_memory_model(true)
-                    .storage_buffer8_bit_access(true)
-                    .shader_int8(true);
+                    .storage_buffer8_bit_access(int8)
+                    .shader_int8(int8)
+                    .shader_float16(coop_f16);
+            }
+        }
+
+        // Workgroup-scope cooperative matrices (`VK_NV_cooperative_matrix2`)
+        // for the f16 kernels that need them. Its SPIR-V is 1.6, so a 1.3
+        // device; the instance asks for 1.3, which a 1.2 device clamps to.
+        let cm2_ext = c"VK_NV_cooperative_matrix2";
+        let mut cm2_features = CooperativeMatrix2FeaturesNv::default();
+        let mut coop_f16_wg = false;
+        if coop_f16
+            && vk::api_version_major(props.api_version) == 1
+            && vk::api_version_minor(props.api_version) >= 3
+            && has_ext(cm2_ext)
+        {
+            let mut cm2_props = CooperativeMatrix2PropertiesNv::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut cm2_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut cm2_features);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+            let f = &cm2_features;
+            coop_f16_wg = [
+                f.workgroup_scope,
+                f.flexible_dimensions,
+                f.reductions,
+                f.conversions,
+                f.per_element_operations,
+                f.tensor_addressing,
+            ]
+            .iter()
+            .all(|&b| b == vk::TRUE)
+                && cm2_props.workgroup_scope_max_workgroup_size >= COOP_WG_INVOCATIONS
+                && coop_wg_f16_shape(&entry, &instance, physical_device)?;
+            if coop_f16_wg {
+                enabled_exts.push(cm2_ext.as_ptr());
+                // Only the features the kernels' SPIR-V declares.
+                cm2_features = CooperativeMatrix2FeaturesNv {
+                    workgroup_scope: vk::TRUE,
+                    flexible_dimensions: vk::TRUE,
+                    reductions: vk::TRUE,
+                    conversions: vk::TRUE,
+                    per_element_operations: vk::TRUE,
+                    tensor_addressing: vk::TRUE,
+                    ..Default::default()
+                };
             }
         }
 
@@ -280,10 +529,13 @@ impl VkContext {
         if has_integer_dot_product {
             device_info = device_info.push_next(&mut dot_features);
         }
-        if !coop_u8.is_empty() {
+        if !coop_u8.is_empty() || coop_f16 {
             device_info = device_info
                 .push_next(&mut coop_features)
                 .push_next(&mut vk12_features);
+        }
+        if coop_f16_wg {
+            device_info = device_info.push_next(&mut cm2_features);
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("creazione VkDevice")?;
@@ -311,10 +563,12 @@ impl VkContext {
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let timestamp_valid_bits = queue_families[queue_family_index as usize].timestamp_valid_bits;
 
+        let storage_pool_budget = storage_pool_budget(&instance, physical_device);
         log::info!(
             "Vulkan device: {device_name} (vendor 0x{:04x}), integer_dot_product={has_integer_dot_product}, \
-             subgroup={subgroup_size}, coop_u8={coop_u8:?}",
-            props.vendor_id
+             subgroup={subgroup_size}, coop_u8={coop_u8:?}, coop_f16={coop_f16}, coop_f16_wg={coop_f16_wg}, pool budget {} MB",
+            props.vendor_id,
+            storage_pool_budget >> 20
         );
 
         let flush_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
@@ -363,6 +617,8 @@ impl VkContext {
             command_pool,
             has_integer_dot_product,
             coop_u8,
+            coop_f16,
+            coop_f16_wg,
             subgroup_size,
             device_name,
             vendor_id: props.vendor_id,
@@ -385,6 +641,7 @@ impl VkContext {
             query_pool: Mutex::new(None),
             staging_pool: Mutex::new(Default::default()),
             storage_pool: Mutex::new(Default::default()),
+            storage_pool_budget,
             storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment.max(1),
         })
     }
@@ -497,6 +754,7 @@ impl Drop for VkContext {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.flush_fence, None);
+            self.destroy_stream_fences();
             if let Some(pool) = self.query_pool.lock().unwrap().take() {
                 self.device.destroy_query_pool(pool, None);
             }

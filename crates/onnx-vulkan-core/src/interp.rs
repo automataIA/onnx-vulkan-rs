@@ -11,7 +11,7 @@
 //! transcription is verifiable as coverage grows. As coverage grows,
 //! fused blocks merge and boundaries drop toward ~1.
 
-use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
+use crate::host_ops::{self, BOOL, BinOp, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
 use crate::shaders::attention::{
     OUT as ATTN_OUT, OUT_BINDINGS as ATTN_OUT_BINDINGS, OUT_PUSH_BYTES as ATTN_OUT_PUSH_BYTES,
     PACK as ATTN_PACK, PACK_BINDINGS as ATTN_PACK_BINDINGS,
@@ -26,20 +26,22 @@ use crate::shaders::conv::{
     BINDINGS as CONV_F32_BINDINGS, PUSH_BYTES as CONV_F32_PUSH_BYTES,
     SPLIT_REDUCE as CONV_SPLIT_REDUCE, SPLIT_REDUCE_BINDINGS as CONV_SPLIT_REDUCE_BINDINGS,
     Tactic as ConvTactic, TacticGeometry as ConvTacticGeometry, TacticLimits as ConvTacticLimits,
-    blocked as conv_blocked_source, blocked_splitk as conv_blocked_splitk_source,
-    direct as conv_direct_source, generated_source as conv_generated_source,
-    implementation_fingerprint as conv_fingerprint, implicit_gemm as conv_gemm_source,
+    generated_source as conv_generated_source, implementation_fingerprint as conv_fingerprint,
     prefer_blocked as conv_prefer_blocked, split_k as conv_split_k,
     tuned_tactic as conv_tuned_tactic,
 };
 use crate::shaders::conv_integer::{
     BINDINGS as CONV_INTEGER_BINDINGS, BLOCKED_TILE_SIZE as CONV_I_BLOCKED_TILE_SIZE,
     IM2COL as CONV_I_IM2COL, IM2COL_BINDINGS as CONV_I_IM2COL_BINDINGS,
+    IM2COL_HWC as CONV_I_IM2COL_HWC, IM2COL_HWC_BINDINGS as CONV_I_IM2COL_HWC_BINDINGS,
+    IM2COL_HWC_KEY as CONV_I_IM2COL_HWC_KEY, IM2COL_HWC_PUSH_BYTES as CONV_I_IM2COL_HWC_PUSH_BYTES,
     IM2COL_PUSH_BYTES as CONV_I_IM2COL_PUSH_BYTES, PUSH_BYTES as CONV_INTEGER_PUSH_BYTES,
     SPLIT_REDUCE as CONV_I_SPLIT_REDUCE, SPLIT_REDUCE_BINDINGS as CONV_I_SPLIT_REDUCE_BINDINGS,
-    TILE_SIZE as CONV_I_TILE_SIZE, blocked as conv_i_blocked_source,
-    blocked_splitk as conv_i_blocked_splitk_source, direct as conv_i_direct_source,
-    implicit_gemm as conv_i_gemm_source,
+    TILE_SIZE as CONV_I_TILE_SIZE, TO_HWC as CONV_I_TO_HWC,
+    TO_HWC_BINDINGS as CONV_I_TO_HWC_BINDINGS, TO_HWC_KEY as CONV_I_TO_HWC_KEY,
+    TO_HWC_PUSH_BYTES as CONV_I_TO_HWC_PUSH_BYTES, TO_HWC_TILE as CONV_I_TO_HWC_TILE,
+    blocked as conv_i_blocked_source, blocked_splitk as conv_i_blocked_splitk_source,
+    direct as conv_i_direct_source, implicit_gemm as conv_i_gemm_source,
 };
 use crate::shaders::conv_transpose::{
     BINDINGS as CONV_T_BINDINGS, FILL as CONV_T_FILL, FILL_BINDINGS as CONV_T_FILL_BINDINGS,
@@ -50,9 +52,15 @@ use crate::shaders::conv_transpose::{
     PUSH_BYTES as CONV_T_PUSH_BYTES, PhaseGeom, direct as conv_t_source, phase_gemm_applies,
 };
 use crate::shaders::elementwise::{
+    ADD_TRANSPOSE_PAD, ADD_TRANSPOSE_PAD_BINDINGS, ADD_TRANSPOSE_PAD_PUSH_BYTES,
     BINARY as BINARY_TEMPLATE, CAST_DEV, CAST_DEV_BINDINGS, CAST_DEV_PUSH_BYTES, CLIP,
-    CLIP_BINDINGS, CLIP_PUSH_BYTES, MAX_RANK, POW_EXPR, UNARY as UNARY_TEMPLATE, UNARY_HELPERS_ERF,
-    WHERE, WHERE_BINDINGS, WHERE_PUSH_BYTES,
+    CLIP_BINDINGS, CLIP_PUSH_BYTES, DECOMPOSED_GELU, DECOMPOSED_GELU_BINDINGS, DECOMPOSED_GELU_FN,
+    DECOMPOSED_GELU_PUSH_BYTES, INTERLEAVED_ROPE_BINDINGS, INTERLEAVED_ROPE_BSHD,
+    INTERLEAVED_ROPE_PUSH_BYTES, INTERLEAVED_ROPE_SCALE, INTERLEAVED_ROPE_TRANSPOSE, IS_NAN,
+    IS_NAN_BINDINGS, IS_NAN_PUSH_BYTES, MAX_RANK, MUL_ADD_RELU_BINDINGS, MUL_ADD_RELU_PUSH_BYTES,
+    PACK_POSITIVE_BITS, PACK_POSITIVE_BITS_BINDINGS, PACK_POSITIVE_BITS_PUSH_BYTES, POW_EXPR,
+    UNARY as UNARY_TEMPLATE, UNARY_HELPERS_ERF, WHERE, WHERE_BINDINGS, WHERE_PUSH_BYTES,
+    interleaved_rope_groups, interleaved_rope_spirv, mul_add_relu_spirv,
 };
 use crate::shaders::gather_block_quantized::{
     BINDINGS as GBQ_BINDINGS, GATHER_BLOCK_QUANTIZED as GBQ_GATHER, PUSH_BYTES as GBQ_PUSH_BYTES,
@@ -72,14 +80,23 @@ use crate::shaders::matmul_fp32::{
     prefer_blocked as mm_prefer_blocked,
 };
 use crate::shaders::matmul_integer::{
-    COOP_BINDINGS as MMI_COOP_BINDINGS, COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES,
-    COOP_TILE as MMI_COOP_TILE, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
+    ANY_K as MMI_ANY_K, ANY_K_BINDINGS as MMI_ANY_K_BINDINGS,
+    ANY_K_EPILOGUE_BINDINGS as MMI_ANY_K_EPILOGUE_BINDINGS,
+    ANY_K_EPILOGUE_KEY as MMI_ANY_K_EPILOGUE_KEY,
+    ANY_K_EPILOGUE_PUSH_BYTES as MMI_ANY_K_EPILOGUE_PUSH_BYTES, ANY_K_KEY as MMI_ANY_K_KEY,
+    ANY_K_PUSH_BYTES as MMI_ANY_K_PUSH_BYTES, COOP_BINDINGS as MMI_COOP_BINDINGS,
+    COOP_EPILOGUE_BINDINGS as MMI_COOP_EPILOGUE_BINDINGS,
+    COOP_EPILOGUE_PUSH_BYTES as MMI_COOP_EPILOGUE_PUSH_BYTES,
+    COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
     FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY, FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES,
     MATMUL_BINDINGS as MMI_BINDINGS, MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B,
     PACK_BINDINGS as MMI_PACK_BINDINGS, PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES,
     PACKED_KEY as MMI_PACKED_KEY, SIGN_FLIP_BYTE as MMI_SIGN_FLIP_BYTE,
-    SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD, TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY,
-    coop_applies as mmi_coop_applies, coop_variant as mmi_coop_variant, matmul as mmi_matmul,
+    SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD, SMALL_EPILOGUE_KEY as MMI_SMALL_EPILOGUE_KEY,
+    TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY,
+    any_k_epilogue_spirv as mmi_any_k_epilogue_spirv, coop_applies as mmi_coop_applies,
+    coop_variant_for as mmi_coop_variant, matmul as mmi_matmul, small_applies as mmi_small_applies,
+    small_epilogue_spirv as mmi_small_epilogue_spirv, small_grid as mmi_small_grid,
 };
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
@@ -88,11 +105,12 @@ use crate::shaders::matmul_nbits::{
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
     PAD_BINDINGS, PAD_PUSH_BYTES, SLICE, SLICE_BINDINGS, SLICE_PUSH_BYTES,
-    TRANSPOSE as WGSL_TRANSPOSE, TRANSPOSE_BINDINGS, TRANSPOSE_PUSH_BYTES,
+    TRANSPOSE as WGSL_TRANSPOSE, TRANSPOSE_BINDINGS, TRANSPOSE_BYTES, TRANSPOSE_PUSH_BYTES,
+    TRANSPOSE_ROWS, TRANSPOSE_TILED,
 };
 use crate::shaders::normalization::{
-    LAYERNORM, LAYERNORM_BINDINGS, LAYERNORM_PUSH_BYTES, SOFTMAX, SOFTMAX_BINDINGS,
-    SOFTMAX_PUSH_BYTES,
+    INSTANCENORM, INSTANCENORM_BINDINGS, INSTANCENORM_CHUNK, INSTANCENORM_PUSH_BYTES, LAYERNORM,
+    LAYERNORM_BINDINGS, LAYERNORM_PUSH_BYTES, SOFTMAX, SOFTMAX_BINDINGS, SOFTMAX_PUSH_BYTES,
 };
 use crate::shaders::pooling::{
     AVG_ACC as POOL_AVG_ACC, AVG_FIN as POOL_AVG_FIN, AVG_INIT as POOL_AVG_INIT,
@@ -122,13 +140,13 @@ use crate::shaders::resize::{
     NEAREST_ROUND_PREFER_CEIL, NEAREST_ROUND_PREFER_FLOOR, PUSH_BYTES as RESIZE_PUSH_BYTES, RESIZE,
 };
 use crate::{
-    AttrValue, DeviceBuffer as BufRef, DeviceTensor as DevTensor, ExecutionEnv, GraphIr, NodeIr,
-    Tensor, broadcast, device_storage_bytes, elem_size,
+    AttrValue, Broadcast, DeviceBuffer as BufRef, DeviceTensor as DevTensor, ExecutionEnv, GraphIr,
+    NodeIr, Tensor, broadcast, device_storage_bytes, elem_size,
 };
 use crate::{KernelCache, PipelineKey};
 use anyhow::{Context as _, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
-use vk_compute::{ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
+use vk_compute::{BufferSlice, ComputePipeline, GpuBuffer, VkContext, compile_wgsl};
 
 type Env<'context, 'values> = ExecutionEnv<'context, 'values>;
 
@@ -152,6 +170,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "Div"
             | "Shape"
             | "Reshape"
+            | "Identity"
             | "Unsqueeze"
             | "Squeeze"
             | "Transpose"
@@ -184,6 +203,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "Less"
             | "LessOrEqual"
             | "Greater"
+            | "GreaterOrEqual"
             | "Gelu"
             | "GatherElements"
             | "ScatterND"
@@ -206,6 +226,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "LeakyRelu"
             | "Elu"
             | "IsNaN"
+            | "OneHot"
             | "CumSum"
             | "GridSample"
             | "Gemm"
@@ -224,6 +245,19 @@ pub fn is_implemented(op: &str) -> bool {
             | "Pow"
             | "Min"
             | "Max"
+            | "Sign"
+            | "InstanceNormalization"
+            | "Einsum"
+            | "FlashAttention"
+            | "MatMulIntegerScaleBias"
+            | "ConvIntegerScaleBias"
+            | "DecomposedGelu"
+            | "DecomposedGeluQuantize"
+            | "InterleavedRope"
+            | "PackPositiveBits"
+            | "AddTransposePad"
+            | "MulAddRelu"
+            | "AddLayerNormalization"
     )
 }
 
@@ -445,9 +479,35 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 )
         }
         "Gelu" => matches!(string_attr("approximate", "none").as_str(), "none" | "tanh"),
+        // only the equations that are a batched MatMul once reshaped; see
+        // `einsum_as_matmul`
+        "Einsum" => {
+            node.inputs.len() == 2
+                && node
+                    .attrs
+                    .get("equation")
+                    .and_then(AttrValue::as_str)
+                    .and_then(einsum_as_matmul)
+                    .is_some()
+        }
+        "InstanceNormalization" => {
+            node.inputs.len() == 3
+                && node.inputs.iter().all(|n| !n.is_empty())
+                && node.outputs.len() == 1
+        }
         // `add`/`mul`/`min`/`max` accumulate instead of overwriting
         "ScatterND" => string_attr("reduction", "none") == "none",
-        "Conv" | "ConvInteger" => matches!(
+        // `ConvIntegerScaleBias` is produced by
+        // `rewrite::fuse_conv_integer_epilogue` and by nothing else: the same
+        // name in a custom domain is somebody else's operator
+        "ConvIntegerScaleBias"
+            if node.domain != crate::rewrite::REWRITE_DOMAIN
+                || !matches!(node.inputs.len(), 6 | 7)
+                || node.outputs.len() != 1 =>
+        {
+            false
+        }
+        "Conv" | "ConvInteger" | "ConvIntegerScaleBias" => matches!(
             string_attr("auto_pad", "NOTSET").as_str(),
             "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
         ),
@@ -495,6 +555,65 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 "NOTSET" | "VALID"
             ) && !node.attrs.contains_key("output_shape")
         }
+        // produced by `rewrite::fuse_attention` and by nothing else: the same
+        // name in a custom domain is somebody else's operator
+        "FlashAttention" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && matches!(node.inputs.len(), 3 | 4)
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_matmul_integer_epilogue`, same reasoning
+        "MatMulIntegerScaleBias" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && matches!(node.inputs.len(), 6 | 7)
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_decomposed_gelu`, same reasoning
+        "DecomposedGelu" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && node.inputs.len() == 4
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_gelu_quantize`, same reasoning; the
+        // outputs are those of `DynamicQuantizeLinear`
+        "DecomposedGeluQuantize" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && node.inputs.len() == 4
+                && (1..=3).contains(&node.outputs.len())
+        }
+        // produced by `rewrite::fuse_interleaved_rope`, same reasoning; the
+        // fourth input, the scale, is optional
+        "InterleavedRope" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && (3..=4).contains(&node.inputs.len())
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_pack_positive_bits`, same reasoning
+        "PackPositiveBits" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && node.inputs.len() == 2
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_mul_add_relu`, same reasoning
+        "MulAddRelu" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && node.inputs.len() == 3
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_add_transpose_pad`, same reasoning; the
+        // fifth input, the pad value, is optional
+        "AddTransposePad" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && (4..=5).contains(&node.inputs.len())
+                && node.outputs.len() == 1
+        }
+        // produced by `rewrite::fuse_add_layernorm`, same reasoning; the bias
+        // and the escaping sum are optional
+        "AddLayerNormalization" => {
+            node.domain == crate::rewrite::REWRITE_DOMAIN
+                && (3..=4).contains(&node.inputs.len())
+                && (1..=2).contains(&node.outputs.len())
+        }
         _ => true,
     }
 }
@@ -525,12 +644,17 @@ const FLOAT_ONLY_INPUT0: &[&str] = &[
     "LayerNormalization",
     "SimplifiedLayerNormalization",
     "SkipSimplifiedLayerNormalization",
+    "AddLayerNormalization",
     "GroupQueryAttention",
     "RotaryEmbedding",
     "Conv",
     "ConvTranspose",
     "Gemm",
     "GridSample",
+    "Sign",
+    "InstanceNormalization",
+    "Einsum",
+    "FlashAttention",
 ];
 
 /// Why this node's operand types are outside what the kernels read, or `None`.
@@ -720,6 +844,8 @@ pub fn execute_host_nodes(
     env: &mut Env<'_, '_>,
     nodes: &[usize],
 ) -> crate::Result<()> {
+    // no liveness here: every value keeps its buffer
+    env.set_first_input_dies(false);
     for &index in nodes {
         exec_node(env, &ir.nodes[index]).map_err(|e| crate::Error::Backend(format!("{e:#}")))?;
     }
@@ -743,11 +869,21 @@ fn execute_nodes_inner(
     // run. See `NODE_PROBE`.
     let timing = std::env::var_os("NODE_PROBE").is_some();
     let mut by_op: HashMap<&str, (u64, u64, u64)> = HashMap::new();
+    let _span = vk_compute::stats::span("execute nodes");
     for (index, node) in ir.nodes.iter().enumerate() {
         let before = probe.then(vk_compute::stats::allocs);
         let clock = timing.then(std::time::Instant::now);
         let dispatched = timing.then(vk_compute::stats::dispatches);
         let issued = env.context().capture_len();
+        // Not while capturing: a node that takes its input's buffer issues
+        // nothing, and a plan would take it for host work to redo each step.
+        env.set_first_input_dies(
+            issued.is_none()
+                && node
+                    .inputs
+                    .first()
+                    .is_some_and(|input| dead[index].contains(&input.as_str())),
+        );
         exec_node(env, node)?;
         if let Some(trace) = trace.as_mut() {
             let start = issued.unwrap_or(0);
@@ -773,6 +909,7 @@ fn execute_nodes_inner(
             env.release(name);
         }
     }
+    env.set_first_input_dies(false);
     if timing {
         let mut rows: Vec<_> = by_op.into_iter().collect();
         rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
@@ -864,6 +1001,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "LayerNormalization" => layernorm(env, node, Norm::Centered),
         "SimplifiedLayerNormalization" => layernorm(env, node, Norm::Rms),
         "SkipSimplifiedLayerNormalization" => layernorm(env, node, Norm::RmsSkip),
+        "AddLayerNormalization" => add_layernorm(env, node),
         "GroupQueryAttention" => group_query_attention(env, node),
         "RotaryEmbedding" => rotary_embedding(env, node),
         "Cast" => cast(env, node),
@@ -905,6 +1043,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Less" => host_cmp(env, node, host_ops::CmpOp::Less),
         "LessOrEqual" => host_cmp(env, node, host_ops::CmpOp::LessOrEqual),
         "Greater" => host_cmp(env, node, host_ops::CmpOp::Greater),
+        "GreaterOrEqual" => host_cmp(env, node, host_ops::CmpOp::GreaterOrEqual),
         "GatherElements" => gather_elements(env, node),
         "ScatterND" => scatter_nd(env, node),
         "TopK" => top_k(env, node),
@@ -924,9 +1063,11 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "ArgMax" => argmax(env, node),
         "ArgMin" => argmin(env, node),
         "Flatten" => flatten(env, node),
+        "Identity" => identity(env, node),
         "LeakyRelu" => leaky_relu(env, node),
         "Elu" => elu(env, node),
-        "IsNaN" => host_unary(env, node, host_ops::is_nan),
+        "IsNaN" => is_nan(env, node),
+        "OneHot" => one_hot(env, node),
         "CumSum" => cumsum(env, node),
         "Gemm" => gemm(env, node),
         "Resize" => resize(env, node),
@@ -945,6 +1086,18 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Pow" => elementwise_binary(env, node, POW_EXPR, BinOp::Pow),
         "Min" => elementwise_binary(env, node, "min(a[off_a], b[off_b])", BinOp::Min),
         "Max" => elementwise_binary(env, node, "max(a[off_a], b[off_b])", BinOp::Max),
+        "Sign" => unary(env, node, "Sign", "sign(v)"),
+        "InstanceNormalization" => instance_norm(env, node),
+        "Einsum" => einsum(env, node),
+        "FlashAttention" => flash_attention(env, node),
+        "MatMulIntegerScaleBias" => matmul_integer_scale_bias(env, node),
+        "ConvIntegerScaleBias" => conv_integer_scale_bias(env, node),
+        "DecomposedGelu" => decomposed_gelu(env, node),
+        "DecomposedGeluQuantize" => decomposed_gelu_quantize(env, node),
+        "InterleavedRope" => interleaved_rope(env, node),
+        "PackPositiveBits" => pack_positive_bits(env, node),
+        "AddTransposePad" => add_transpose_pad(env, node),
+        "MulAddRelu" => mul_add_relu(env, node),
         other => bail!("compiling EP: op '{other}' not implemented in the interpreter"),
     }
 }
@@ -1135,6 +1288,13 @@ fn flatten(env: &mut Env, node: &NodeIr) -> Result<()> {
     meta_reshape_out(env, node, vec![outer, inner])
 }
 
+/// `Identity`: a copy with the same shape. Exporters and `onnxscript`'s
+/// optimizer leave it where a no-op `Slice` or `Reshape` used to be.
+fn identity(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let shape = env.shape_of(&node.inputs[0])?;
+    meta_reshape_out(env, node, shape)
+}
+
 /// `Unsqueeze`: inserts size-1 dimensions (axes = input[1] or attr).
 fn unsqueeze(env: &mut Env, node: &NodeIr) -> Result<()> {
     let axes = axes_arg(env, node)?;
@@ -1241,12 +1401,31 @@ fn resolve_reshape(in_shape: &[i64], target: &[i64]) -> Result<Vec<i64>> {
 }
 
 /// Pure-metadata op (Reshape/Unsqueeze/Squeeze): same layout, new shape.
-/// Host → new `HostTensor` (data cloned); device → GPU copy of the buffer
-/// with the new shape (stays in VRAM, no CPU round-trip). The copy avoids
-/// aliasing of owned buffers across multiple consumers.
+/// Host → new `HostTensor` (data cloned); device → the input's own buffer
+/// when this node is its last reader and the runtime owns it, otherwise a GPU
+/// copy with the new shape (stays in VRAM, no CPU round-trip). Either way one
+/// buffer has one owner: no aliasing across consumers.
 fn meta_reshape_out(env: &mut Env, node: &NodeIr, new_shape: Vec<i64>) -> Result<()> {
     let src = &node.inputs[0];
-    if env.on_device(src) {
+    // A large f32 constant is copied from its VRAM-resident upload: on host it
+    // would be cloned every run and carried down the chain to the first GPU op
+    // (SAM 3's 5.3 MB positional encoding through Tile, Unsqueeze, Reshape and
+    // a host Transpose).
+    if env.is_initializer(src)
+        && !env.host_resident_small(src, Env::SMALL_HOST_BYTES)
+        && env.dtype_of(src)? == FLOAT
+    {
+        env.ensure_device(src)?;
+    }
+    if let Some(moved) = env.take_dying_device(src) {
+        env.set(
+            &node.outputs[0],
+            Tensor::Device(DevTensor {
+                shape: new_shape,
+                ..moved
+            }),
+        );
+    } else if env.on_device(src) {
         let ctx = env.context();
         let d = env.device(src)?;
         let nbytes = d.elem_count * elem_size(d.dtype);
@@ -1290,10 +1469,9 @@ fn transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
         perm.len()
     );
     let out_shape: Vec<i64> = perm.iter().map(|&p| in_shape[p]).collect();
-    // GPU kernel only for 4-byte dtypes (f32/i32). A quantized activation
-    // (u8/i8) goes host-side: its consumer (e.g. MatMulInteger) is still on
-    // the CPU EP anyway, so a host output is natural.
-    if env.on_device(src) && elem_size(env.dtype_of(src)?) == 4 {
+    // GPU kernels for 4-byte dtypes (f32/i32) and 1-byte ones (a quantized
+    // activation feeding a device MatMulInteger, as in SAM 3's decoder).
+    if env.on_device(src) && matches!(elem_size(env.dtype_of(src)?), 1 | 4) {
         transpose_device(env, node, &in_shape, &perm, out_shape)
     } else {
         let h = env.host(src)?;
@@ -1303,7 +1481,112 @@ fn transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
     }
 }
 
-/// GPU permutation of an activation (reuses `WGSL_TRANSPOSE`; 4-byte dtype).
+/// The same permutation on fewer axes: axes of size 1 are dropped, and input
+/// axes that follow each other in the output too are merged into one. The
+/// bytes move to the same places. Returns the input dims and the permutation.
+fn collapse_permutation(shape: &[i64], perm: &[usize]) -> (Vec<i64>, Vec<usize>) {
+    let kept: Vec<usize> = (0..shape.len()).filter(|&axis| shape[axis] != 1).collect();
+    // runs of input axes, in output order: (first, last)
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &p in perm.iter().filter(|&&p| shape[p] != 1) {
+        let p = kept.iter().position(|&axis| axis == p).expect("kept axis");
+        match runs.last_mut() {
+            Some(run) if run.1 + 1 == p => run.1 = p,
+            _ => runs.push((p, p)),
+        }
+    }
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by_key(|&run| runs[run].0);
+    let dims = order
+        .iter()
+        .map(|&run| {
+            kept[runs[run].0..=runs[run].1]
+                .iter()
+                .map(|&a| shape[a])
+                .product()
+        })
+        .collect();
+    let perm = (0..runs.len())
+        .map(|run| order.iter().position(|&r| r == run).expect("run"))
+        .collect();
+    (dims, perm)
+}
+
+/// Push constants and workgroups of `TRANSPOSE_TILED` for 4-byte elements on
+/// collapsed axes, or `None` when the permutation does not fit it: a kept
+/// innermost axis of more than 4 elements, more than 4 batch axes, or a grid
+/// beyond 65535 workgroups along an axis. A kept innermost axis becomes the
+/// unit the tile moves whole.
+fn tiled_transpose(in_shape: &[i64], perm: &[usize]) -> Option<(Vec<u8>, [u32; 3])> {
+    let mut dims: Vec<u64> = in_shape.iter().map(|&d| d.max(0) as u64).collect();
+    let mut perm = perm.to_vec();
+    let mut unit = 1;
+    if perm.last() == Some(&(dims.len() - 1)) {
+        unit = dims.pop()?;
+        perm.pop();
+    }
+    let rank = dims.len();
+    if !(1..=4).contains(&unit) || rank < 2 {
+        return None;
+    }
+    let (a, b) = (rank - 1, perm[rank - 1]);
+    if a == b {
+        return None;
+    }
+    // strides in words: input row-major, output by output position
+    let mut in_strides = vec![unit; rank];
+    for d in (0..rank - 1).rev() {
+        in_strides[d] = in_strides[d + 1] * dims[d + 1];
+    }
+    let mut out_strides = vec![unit; rank];
+    for k in (0..rank - 1).rev() {
+        out_strides[perm[k]] = out_strides[perm[k + 1]] * dims[perm[k + 1]];
+    }
+    let batch: Vec<usize> = perm
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&x| x != a && x != b)
+        .collect();
+    let groups = [
+        dims[a].div_ceil(32),
+        dims[b].div_ceil(32),
+        batch.iter().map(|&x| dims[x]).product(),
+    ];
+    if batch.len() > 4 || groups.iter().any(|&g| g > 65535) {
+        return None;
+    }
+    let pick = |values: &[u64], fill: u64| -> Vec<u64> {
+        (0..4)
+            .map(|i| batch.get(i).map_or(fill, |&x| values[x]))
+            .collect()
+    };
+    let header = [
+        dims[a],
+        dims[b],
+        in_strides[b],
+        out_strides[a],
+        unit,
+        batch.len() as u64,
+        0,
+        0,
+    ];
+    let push = header
+        .into_iter()
+        .chain(pick(&dims, 1))
+        .chain(pick(&in_strides, 0))
+        .chain(pick(&out_strides, 0))
+        .flat_map(|value| (value as u32).to_le_bytes())
+        .collect();
+    Some((push, groups.map(|g| g as u32)))
+}
+
+/// GPU permutation of an activation, on its collapsed axes
+/// ([`collapse_permutation`]): a plain copy if nothing moves,
+/// `TRANSPOSE_ROWS` if the innermost axis stays innermost on rows of whole
+/// 16-byte words, `TRANSPOSE_TILED` for the other 4-byte permutations it fits
+/// ([`tiled_transpose`]), otherwise `WGSL_TRANSPOSE` for 4-byte dtypes and
+/// `TRANSPOSE_BYTES` for 1-byte ones.
 fn transpose_device(
     env: &mut Env,
     node: &NodeIr,
@@ -1312,6 +1595,7 @@ fn transpose_device(
     out_shape: Vec<i64>,
 ) -> Result<()> {
     let ctx = env.context();
+    let (in_shape, perm) = collapse_permutation(in_shape, perm);
     let rank = in_shape.len();
     ensure!(rank <= 8, "Transpose: rank {rank} > 8 not supported");
     // row-major input strides, then reordered by perm (one per output dim)
@@ -1321,23 +1605,65 @@ fn transpose_device(
         in_strides[d] = acc;
         acc *= in_shape[d].max(0) as u32;
     }
-    let perm_strides: Vec<u32> = perm.iter().map(|&p| in_strides[p]).collect();
-    let out_dims: Vec<u32> = out_shape.iter().map(|&d| d.max(0) as u32).collect();
+    let mut perm_strides: Vec<u32> = perm.iter().map(|&p| in_strides[p]).collect();
+    let mut out_dims: Vec<u32> = perm.iter().map(|&p| in_shape[p].max(0) as u32).collect();
     let n: usize = out_shape.iter().product::<i64>().max(0) as usize;
 
     let d = env.device(&node.inputs[0])?;
+    let size = elem_size(d.dtype);
+    let bytes = size == 1;
     ensure!(
-        elem_size(d.dtype) == 4,
-        "Transpose device: elem size {} != 4 (kernel u32)",
-        elem_size(d.dtype)
+        bytes || size == 4,
+        "Transpose device: elem size {size} not 1 or 4"
     );
     let dtype = d.dtype;
-    let out = ctx.create_storage_buffer((n.max(1) * 4) as u64)?;
-    if n > 0 {
+    let out = ctx.create_storage_buffer(device_storage_bytes(dtype, n)?)?;
+    let row_bytes = in_shape
+        .last()
+        .map_or(0, |&inner| inner.max(0) as usize * size);
+    let rows = rank > 1 && perm[rank - 1] == rank - 1 && row_bytes % 16 == 0;
+    let tiled = if rank > 1 && !rows && !bytes {
+        tiled_transpose(&in_shape, &perm)
+    } else {
+        None
+    };
+    let (key, source, threads, header) = if rows {
+        // the outer strides are multiples of a row, so of a word too
+        let words = (n * size / 16) as u32;
+        out_dims.pop();
+        perm_strides.pop();
+        for stride in &mut perm_strides {
+            *stride = *stride * size as u32 / 16;
+        }
+        let header = [words, rank as u32 - 1, (row_bytes / 16) as u32];
+        ("Transpose_rows", TRANSPOSE_ROWS, words as usize, header)
+    } else if bytes {
+        let header = [n as u32, rank as u32, 0];
+        ("Transpose_bytes", TRANSPOSE_BYTES, n.div_ceil(4), header)
+    } else {
+        ("Transpose", WGSL_TRANSPOSE, n, [n as u32, rank as u32, 0])
+    };
+    if n > 0 && rank <= 1 {
+        // nothing moves, e.g. a permutation of axes of size 1
+        ctx.stream_copy(d.buffer(), &out, (n * size) as u64)?;
+    } else if let (true, Some((push, groups))) = (n > 0, &tiled) {
+        with_pipeline(
+            env.cache(),
+            "Transpose_tiled",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(TRANSPOSE_TILED)?,
+                    TRANSPOSE_BINDINGS,
+                    TRANSPOSE_PUSH_BYTES,
+                )
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[d.buffer(), &out], push, *groups),
+        )?;
+    } else if n > 0 {
         let mut push = Vec::with_capacity(80);
-        push.extend_from_slice(&(n as u32).to_le_bytes());
-        push.extend_from_slice(&(rank as u32).to_le_bytes());
-        push.extend_from_slice(&0u32.to_le_bytes());
+        for value in header {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
         push.extend_from_slice(&0u32.to_le_bytes());
         for d in 0..8 {
             push.extend_from_slice(&out_dims.get(d).copied().unwrap_or(1).to_le_bytes());
@@ -1347,10 +1673,10 @@ fn transpose_device(
         }
         with_pipeline(
             env.cache(),
-            "Transpose",
+            key,
             || {
                 ctx.create_pipeline(
-                    &compile_wgsl(WGSL_TRANSPOSE)?,
+                    &compile_wgsl(source)?,
                     TRANSPOSE_BINDINGS,
                     TRANSPOSE_PUSH_BYTES,
                 )
@@ -1360,7 +1686,7 @@ fn transpose_device(
                     pipe,
                     &[d.buffer(), &out],
                     &push,
-                    [(n as u32).div_ceil(256), 1, 1],
+                    [(threads as u32).div_ceil(256), 1, 1],
                 )
             },
         )?;
@@ -1377,14 +1703,30 @@ fn transpose_device(
     Ok(())
 }
 
-/// Dtype-generic host-side permutation (per-element bytes).
-fn host_transpose(h: &HostTensor, perm: &[usize], out_shape: &[i64]) -> Result<HostTensor> {
+/// Dtype-generic host-side permutation (per-element bytes). Also the load-time
+/// fold of a constant `Transpose` (`rewrite::evaluate`).
+pub(crate) fn host_transpose(
+    h: &HostTensor,
+    perm: &[usize],
+    out_shape: &[i64],
+) -> Result<HostTensor> {
     let rank = h.shape.len();
     let es = elem_size(h.dtype);
     ensure!(
         es > 0,
         "Transpose host: dtype {} with unknown size",
         h.dtype
+    );
+    ensure!(
+        h.data.len()
+            == h.shape
+                .iter()
+                .map(|&d| d.max(0) as usize)
+                .product::<usize>()
+                * es,
+        "Transpose host: {} bytes for shape {:?}",
+        h.data.len(),
+        h.shape
     );
     let mut in_strides = vec![0usize; rank];
     let mut acc = 1usize;
@@ -1505,64 +1847,111 @@ fn concat_device(env: &mut Env, node: &NodeIr, ins: &[&str], axis: i64) -> Resul
 }
 
 /// `DynamicQuantizeLinear`: f32 x → (u8 y, scalar f32 y_scale, scalar u8 y_zp),
-/// all on-device. Reuses the 3 core shaders (partial/finalize/quantize).
+/// all on-device, see `quantize_on_device`.
 fn dynamic_quantize(env: &mut Env, node: &NodeIr) -> Result<()> {
-    use crate::shaders::dynamic_quantize as dq;
-    let ctx = env.context();
     env.ensure_device(&node.inputs[0])?;
     let x = env.device(&node.inputs[0])?;
     let (shape, n) = (x.shape.clone(), x.elem_count);
-    ensure!(n > 0, "DynamicQuantizeLinear: empty input");
+    if n == 0 {
+        // The range of no values is [0, 0], as for all zeros: ORT answers
+        // scale 1, zero point 0 (SAM 3's decoder quantizes "no boxes").
+        let outs = &node.outputs;
+        env.set(
+            &outs[0],
+            Tensor::Host(HostTensor::new(UINT8, shape, vec![])),
+        );
+        if outs.len() > 1 && !outs[1].is_empty() {
+            env.set(&outs[1], Tensor::Host(HostTensor::from_f32(vec![], &[1.0])));
+        }
+        if outs.len() > 2 && !outs[2].is_empty() {
+            env.set(
+                &outs[2],
+                Tensor::Host(HostTensor::new(UINT8, vec![], vec![0])),
+            );
+        }
+        return Ok(());
+    }
 
+    quantize_on_device(env, &node.inputs[0], &node.outputs, None)
+}
+
+/// The device passes of `DynamicQuantizeLinear` over the device tensor `x`,
+/// which holds at least one value: min/max into a zeroed range slot, then
+/// quantization. When the kernel that wrote `x` already folded its range into
+/// a slot (`ExecutionEnv::set_range`), the first pass is skipped. With `gelu`, the push constants of
+/// `gelu_push`, the passes read `DecomposedGelu(x)` instead of `x`.
+fn quantize_on_device(env: &mut Env, x: &str, outs: &[String], gelu: Option<&[u8]>) -> Result<()> {
+    use crate::shaders::dynamic_quantize as dq;
+    let computed = env.computed_range(x).filter(|_| gelu.is_none());
+    let (range_index, range_offset) = match computed {
+        Some(slot) => slot,
+        None => env.range_slot()?,
+    };
+    let range = BufferSlice {
+        buf: env.range_buffer(range_index),
+        offset: range_offset,
+    };
+    let ctx = env.context();
+    let x = env.device(x)?;
+    let (shape, n) = (x.shape.clone(), x.elem_count);
     let y = ctx.create_storage_buffer(device_storage_bytes(UINT8, n)?)?;
     let y_scale = ctx.create_storage_buffer(4)?;
     let y_zp = ctx.create_storage_buffer(4)?;
     let groups = (n as u32).div_ceil(256).min(1024);
-    let partial = ctx.create_storage_buffer(u64::from(groups) * 8)?;
+    let tail = gelu.unwrap_or_default();
+    let (partial_key, quantize_key) = match gelu {
+        Some(_) => ("DecomposedGeluQuantize_partial", "DecomposedGeluQuantize"),
+        None => ("DQL_partial", "DQL_quantize"),
+    };
 
-    with_pipeline(
-        env.cache(),
-        "DQL_partial",
-        || ctx.create_pipeline(&compile_wgsl(dq::PARTIAL)?, 2, 4),
-        |pipe| {
-            ctx.stream_dispatch(
-                pipe,
-                &[x.buffer(), &partial],
-                &(n as u32).to_le_bytes(),
-                [groups, 1, 1],
-            )
-        },
-    )?;
-    with_pipeline(
-        env.cache(),
-        "DQL_finalize",
-        || ctx.create_pipeline(&compile_wgsl(dq::FINALIZE)?, 3, 4),
-        |pipe| {
-            ctx.stream_dispatch(
-                pipe,
-                &[&partial, &y_scale, &y_zp],
-                &groups.to_le_bytes(),
-                [1, 1, 1],
-            )
-        },
-    )?;
+    if computed.is_none() {
+        with_pipeline(
+            env.cache(),
+            partial_key,
+            || {
+                let src = match gelu {
+                    Some(_) => dq::gelu_partial(),
+                    None => dq::PARTIAL.to_owned(),
+                };
+                ctx.create_pipeline(&compile_wgsl(&src)?, 2, 4 + tail.len() as u32)
+            },
+            |pipe| {
+                ctx.stream_dispatch_slices(
+                    pipe,
+                    &[x.buffer().into(), range],
+                    &[&(n as u32).to_le_bytes()[..], tail].concat(),
+                    [groups, 1, 1],
+                )
+            },
+        )?;
+    }
     let words = n.div_ceil(4) as u32;
     with_pipeline(
         env.cache(),
-        "DQL_quantize",
-        || ctx.create_pipeline(&compile_wgsl(dq::QUANTIZE)?, 4, 4),
+        quantize_key,
+        || {
+            let src = match gelu {
+                Some(_) => dq::gelu_quantize(),
+                None => dq::QUANTIZE.to_owned(),
+            };
+            ctx.create_pipeline(&compile_wgsl(&src)?, 5, 8 + tail.len() as u32)
+        },
         |pipe| {
-            ctx.stream_dispatch(
+            ctx.stream_dispatch_slices(
                 pipe,
-                &[x.buffer(), &y_scale, &y_zp, &y],
-                &(n as u32).to_le_bytes(),
+                &[
+                    x.buffer().into(),
+                    range,
+                    (&y_scale).into(),
+                    (&y_zp).into(),
+                    (&y).into(),
+                ],
+                // the second word is the shaders' opaque `zero`
+                &[&[n as u32, 0].map(u32::to_le_bytes).concat()[..], tail].concat(),
                 [words.div_ceil(256), 1, 1],
             )
         },
     )?;
-    ctx.defer_destroy(partial);
-
-    let outs = &node.outputs;
     env.set(
         &outs[0],
         Tensor::Device(DevTensor {
@@ -1605,6 +1994,19 @@ fn dynamic_quantize(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// per-tensor zero-points. Reuses the tiled 16×16 kernel; B is transposed+packed
 /// and cached by name (constant). All on-device.
 fn matmul_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
+    // The kernel reads rows as 4-byte words. A K that does not fill them is a
+    // coordinate projection (SAM 3's point and box encodings: K = 2): on the
+    // device when A already is, else a few host rows computed on host.
+    let k = *env.shape_of(&node.inputs[0])?.last().unwrap_or(&0);
+    if k % 4 != 0 {
+        if env.on_device(&node.inputs[0]) && matmul_integer_any_k(env, node, None)? {
+            return Ok(());
+        }
+        let input = |i: usize| env.host(&node.inputs[i]);
+        let out = host_ops::matmul_integer(&input(0)?, &input(1)?, &input(2)?, &input(3)?)?;
+        env.set(&node.outputs[0], Tensor::Host(out));
+        return Ok(());
+    }
     let ctx = env.context();
     env.ensure_device_dtype(&node.inputs[0])?; // A (u8)
     env.ensure_device_dtype(&node.inputs[2])?; // a_zero_point (u8 scalare)
@@ -1619,10 +2021,6 @@ fn matmul_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
     );
     let k = *a_shape.last().unwrap() as usize;
     let m: usize = a_shape[..a_shape.len() - 1].iter().product::<i64>().max(0) as usize;
-    ensure!(
-        k.is_multiple_of(4),
-        "MatMulInteger: K={k} non multiplo di 4"
-    );
 
     // B: [K, N] u8 initializer → packed [N, K/4], cached by name.
     let b_name = node.inputs[1].clone();
@@ -1690,6 +2088,121 @@ fn matmul_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// `MatMulInteger` with a K the packed kernels cannot read, on the device
+/// (see `shaders::matmul_integer::ANY_K`). `false` when the node is outside
+/// what the shader covers: zero points other than one per tensor, a K that
+/// could overflow `i32`, or a grid past the dispatch limits.
+///
+/// With `epilogue` = `(scale_step, bias_step)` the node is a
+/// `MatMulIntegerScaleBias` and the output is the f32 `float(acc) · scale +
+/// bias` of its inputs 4 and 5 (see `glsl/matmul_integer_any_k.comp`).
+fn matmul_integer_any_k(
+    env: &mut Env,
+    node: &NodeIr,
+    epilogue: Option<(u32, u32)>,
+) -> Result<bool> {
+    let inputs = &node.inputs;
+    if inputs.len() < 4 || inputs[2].is_empty() || inputs[3].is_empty() {
+        return Ok(false);
+    }
+    let a_shape = env.shape_of(&inputs[0])?;
+    let b_shape = env.shape_of(&inputs[1])?;
+    let scalar = |shape: Vec<i64>| shape.iter().product::<i64>() == 1;
+    if a_shape.len() < 2
+        || b_shape.len() != 2
+        || b_shape[0] != *a_shape.last().unwrap_or(&0)
+        || !scalar(env.shape_of(&inputs[2])?)
+        || !scalar(env.shape_of(&inputs[3])?)
+    {
+        return Ok(false);
+    }
+    let k = b_shape[0] as usize;
+    let n = b_shape[1] as usize;
+    let m = a_shape[..a_shape.len() - 1].iter().product::<i64>().max(0) as usize;
+    // |(a - za)(b - zb)| <= 255², so K terms fit i32 up to K = 33025
+    let max_rows = 65535 * 16;
+    if k > 33025 || m > max_rows || n > max_rows || m * k.max(n) > u32::MAX as usize {
+        return Ok(false);
+    }
+    for input in &inputs[..4] {
+        env.ensure_device_dtype(input)?;
+    }
+    if epilogue.is_some() {
+        env.ensure_device(&inputs[4])?;
+        env.ensure_device(&inputs[5])?;
+    }
+    let signed = |name: &str| -> Result<u32> { Ok(u32::from(env.dtype_of(name)? == INT8)) };
+    let mut push = Vec::with_capacity(MMI_ANY_K_EPILOGUE_PUSH_BYTES as usize);
+    for value in [
+        m as u32,
+        k as u32,
+        n as u32,
+        signed(&inputs[0])?,
+        signed(&inputs[1])?,
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    let (dtype, key, bindings) = match epilogue {
+        Some((scale_step, bias_step)) => {
+            push.extend_from_slice(&scale_step.to_le_bytes());
+            push.extend_from_slice(&bias_step.to_le_bytes());
+            push.extend_from_slice(&u32::from(fused_relu(node)).to_le_bytes());
+            (FLOAT, MMI_ANY_K_EPILOGUE_KEY, MMI_ANY_K_EPILOGUE_BINDINGS)
+        }
+        None => (INT32, MMI_ANY_K_KEY, MMI_ANY_K_BINDINGS),
+    };
+    let ctx = env.context();
+    let elem_count = m * n;
+    let out = ctx.create_storage_buffer(device_storage_bytes(dtype, elem_count)?)?;
+    if elem_count > 0 {
+        let mut buffers = vec![
+            env.device(&inputs[0])?.buffer(),
+            env.device(&inputs[1])?.buffer(),
+            env.device(&inputs[2])?.buffer(),
+            env.device(&inputs[3])?.buffer(),
+            &out,
+        ];
+        if epilogue.is_some() {
+            buffers.push(env.device(&inputs[4])?.buffer());
+            buffers.push(env.device(&inputs[5])?.buffer());
+        }
+        with_pipeline(
+            env.cache(),
+            key,
+            || match epilogue {
+                Some(_) => ctx.create_pipeline(
+                    &mmi_any_k_epilogue_spirv(),
+                    bindings,
+                    MMI_ANY_K_EPILOGUE_PUSH_BYTES,
+                ),
+                None => {
+                    ctx.create_pipeline(&compile_wgsl(MMI_ANY_K)?, bindings, MMI_ANY_K_PUSH_BYTES)
+                }
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &buffers,
+                    &push,
+                    [(n as u32).div_ceil(16), (m as u32).div_ceil(16), 1],
+                )
+            },
+        )?;
+    }
+    let mut out_shape = a_shape[..a_shape.len() - 1].to_vec();
+    out_shape.push(n as i64);
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(true)
+}
+
 /// Shape and signature of an integer matmul: `A [M, K] × B [K, N]`, `k` in bytes.
 ///
 /// The sign of the operands is already reduced to masks: `a_byte_flip` is
@@ -1736,7 +2249,7 @@ fn mmi_dispatch(
         1,
     ];
 
-    if let Some(v) = mmi_coop_variant(&ctx.coop_u8, ctx.subgroup_size)
+    if let Some(v) = mmi_coop_variant(ctx, m, n)
         && mmi_coop_applies(v, m, k, n, a_byte_flip != 0)
     {
         let mut push = Vec::with_capacity(MMI_COOP_PUSH_BYTES as usize);
@@ -1747,7 +2260,7 @@ fn mmi_dispatch(
             cache,
             v.key,
             || ctx.create_pipeline(&v.spirv(), MMI_COOP_BINDINGS, MMI_COOP_PUSH_BYTES),
-            |pipe| ctx.stream_dispatch(pipe, buffers, &push, grid),
+            |pipe| ctx.stream_dispatch(pipe, buffers, &push, v.grid(m, n)),
         );
     }
 
@@ -1775,6 +2288,284 @@ fn mmi_dispatch(
         },
         |pipe| ctx.stream_dispatch(pipe, buffers, &push, grid),
     )
+}
+
+/// `MatMulInteger → Cast(FLOAT) → Mul(scale) → Add(bias)`, fused by
+/// `rewrite::fuse_matmul_integer_epilogue`: the cooperative kernel writes
+/// `float(acc) · scale + bias` in f32 and the i32 product is never stored.
+///
+/// The epilogue rounds exactly as the three kernels it replaces (see the
+/// shader), so the output is bit-identical to the unfused graph. It exists only
+/// in the cooperative kernel, and it reads scale and bias as one value or one
+/// per column; anything else — no cooperative matrix, signed A, a scale that
+/// broadcasts over rows — runs the four original steps, so the rewrite never
+/// changes what a graph computes or whether it runs.
+///
+/// Products the cooperative tiles cannot cover, fewer than 16 rows or
+/// columns, run the same epilogue on a kernel with one output per thread
+/// (`glsl/matmul_integer_small.comp`).
+///
+/// With a seventh input the scale is the product of inputs 4 and 6, which the
+/// kernel forms as the `Mul` it replaces did; the paths that cannot run that
+/// `Mul` first (see `with_scale_product`).
+fn matmul_integer_scale_bias(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let a_shape = env.shape_of(&node.inputs[0])?;
+    let b_shape = env.shape_of(&node.inputs[1])?;
+    let k = *a_shape.last().unwrap_or(&0) as usize;
+    let m: usize = a_shape[..a_shape.len().saturating_sub(1)]
+        .iter()
+        .product::<i64>()
+        .max(0) as usize;
+    let n = *b_shape.last().unwrap_or(&0) as usize;
+    let ctx = env.context();
+    let variant = mmi_coop_variant(ctx, m, n).filter(|v| mmi_coop_applies(v, m, k, n, false));
+    let small = variant.is_none() && mmi_small_applies(m, k, n);
+    let (scale, bias) = (&node.inputs[4], &node.inputs[5]);
+    let rank = a_shape.len();
+    let fits = a_shape.len() >= 2
+        && b_shape.len() == 2
+        && b_shape[0] as usize == k
+        && k.is_multiple_of(4)
+        && env.dtype_of(&node.inputs[0])? == UINT8
+        && env.dtype_of(scale)? == FLOAT
+        && env.dtype_of(bias)? == FLOAT;
+    let steps = (
+        column_step(&env.shape_of(scale)?, n, rank),
+        column_step(&env.shape_of(bias)?, n, rank),
+    );
+    let product = node.inputs.get(6);
+    if let Some(p) = product {
+        let folds = (variant.is_some() || small)
+            && fits
+            && steps.0.is_some()
+            && steps.1.is_some()
+            && env.dtype_of(p)? == FLOAT
+            && column_step(&env.shape_of(p)?, n, rank).is_some();
+        if !folds {
+            return with_scale_product(env, node, matmul_integer_scale_bias);
+        }
+    }
+    let product_step = match product {
+        Some(p) => column_step(&env.shape_of(p)?, n, rank).unwrap_or(0),
+        None => 0,
+    };
+    // A K the packed kernels cannot read goes where the unfused MatMulInteger
+    // would go, the any-K kernel, with the epilogue folded in
+    if !k.is_multiple_of(4)
+        && env.on_device(&node.inputs[0])
+        && env.dtype_of(scale)? == FLOAT
+        && env.dtype_of(bias)? == FLOAT
+        && let (Some(scale_step), Some(bias_step)) = steps
+        && matmul_integer_any_k(env, node, Some((scale_step, bias_step)))?
+    {
+        return Ok(());
+    }
+    let (true, true, (Some(scale_step), Some(bias_step))) =
+        (variant.is_some() || small, fits, steps)
+    else {
+        return integer_scale_bias_unfused(env, node, "MatMulInteger");
+    };
+
+    env.ensure_device_dtype(&node.inputs[0])?;
+    env.ensure_device_dtype(&node.inputs[2])?;
+    env.ensure_device_dtype(&node.inputs[3])?;
+    env.ensure_device(scale)?;
+    env.ensure_device(bias)?;
+    if let Some(p) = product {
+        env.ensure_device(p)?;
+    }
+    let b_signed = env.dtype_of(&node.inputs[1])? == INT8;
+    let range_slot = if fused_range(node) {
+        Some(env.range_slot()?)
+    } else {
+        None
+    };
+    let packed_ptr = packed_b(env, &node.inputs[1], k, n, b_signed)?;
+    // SAFETY: the packed weight lives in the session cache, which never
+    // removes an entry (see `packed_b`).
+    let packed: &GpuBuffer = unsafe { &*packed_ptr };
+    let (a, a_zp, b_zp) = (
+        env.device(&node.inputs[0])?,
+        env.device(&node.inputs[2])?,
+        env.device(&node.inputs[3])?,
+    );
+    let (scale, bias) = (env.device(scale)?, env.device(bias)?);
+    let product = product.map(|p| env.device(p)).transpose()?;
+    let elem_count = m * n;
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    let mut push = Vec::with_capacity(MMI_COOP_EPILOGUE_PUSH_BYTES as usize);
+    let b_zp_xor = if b_signed { MMI_SIGN_FLIP_BYTE } else { 0 };
+    let flags = u32::from(fused_relu(node))
+        | u32::from(range_slot.is_some()) << 1
+        | u32::from(product.is_some()) << 2;
+    for value in [
+        m as u32,
+        k as u32,
+        n as u32,
+        0,
+        b_zp_xor,
+        scale_step,
+        bias_step,
+        flags,
+        product_step,
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    let (key, grid) = match variant {
+        Some(v) => (v.epilogue_key, v.grid(m, n)),
+        // `small` checked the grid
+        None => (
+            MMI_SMALL_EPILOGUE_KEY,
+            mmi_small_grid(m, n).unwrap_or([1; 3]),
+        ),
+    };
+    with_pipeline(
+        env.cache(),
+        key,
+        || {
+            ctx.create_pipeline(
+                &variant.map_or_else(mmi_small_epilogue_spirv, |v| v.spirv_epilogue()),
+                MMI_COOP_EPILOGUE_BINDINGS,
+                MMI_COOP_EPILOGUE_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            // unread without the range flag: any buffer fills the binding
+            let range = match range_slot {
+                Some((index, offset)) => BufferSlice {
+                    buf: env.range_buffer(index),
+                    offset,
+                },
+                None => (&out).into(),
+            };
+            // likewise the product without its flag
+            let product = product.map_or(scale.buffer(), |p| p.buffer());
+            ctx.stream_dispatch_slices(
+                pipe,
+                &[
+                    a.buffer().into(),
+                    packed.into(),
+                    a_zp.buffer().into(),
+                    b_zp.buffer().into(),
+                    (&out).into(),
+                    scale.buffer().into(),
+                    bias.buffer().into(),
+                    range,
+                    product.into(),
+                ],
+                &push,
+                grid,
+            )
+        },
+    )?;
+    if let Some(slot) = range_slot {
+        env.set_range(&node.outputs[0], slot);
+    }
+    let mut out_shape = a_shape[..rank - 1].to_vec();
+    out_shape.push(n as i64);
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// A fused integer node whose scale is the product of inputs 4 and 6, run
+/// where the kernel cannot form that product: the `Mul` the rewrite removed,
+/// then `run` on the six-input node reading its result.
+fn with_scale_product(
+    env: &mut Env,
+    node: &NodeIr,
+    run: fn(&mut Env, &NodeIr) -> Result<()>,
+) -> Result<()> {
+    let scale = format!("{}/scale", node.outputs[0]);
+    let i = &node.inputs;
+    let product = NodeIr {
+        attrs: HashMap::new(),
+        ..lowered(node, "Mul", &[&i[4], &i[6]], &[&scale])
+    };
+    exec_dispatch(env, &product)?;
+    let mut fused = node.clone();
+    fused.inputs.truncate(6);
+    fused.inputs[4] = scale.clone();
+    run(env, &fused)?;
+    env.release(&scale);
+    Ok(())
+}
+
+/// The epilogue stride of an operand broadcast against an `[.., n]` output of
+/// rank `rank`: 0 for one value, 1 for one value per column, `None` when it
+/// broadcasts over rows too or would raise the output's rank.
+fn column_step(shape: &[i64], n: usize, rank: usize) -> Option<u32> {
+    let leading_ones = shape.iter().rev().skip(1).all(|&d| d == 1);
+    if shape.len() > rank || !leading_ones {
+        return None;
+    }
+    match shape.last() {
+        None | Some(1) => Some(0),
+        Some(&d) if d == n as i64 => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether `rewrite::fuse_matmul_integer_epilogue` folded the `Relu` that
+/// followed into this `MatMulIntegerScaleBias`.
+fn fused_relu(node: &NodeIr) -> bool {
+    node.attrs.get("relu").and_then(AttrValue::as_i64) == Some(1)
+}
+
+/// Whether a fused `MatMulInteger` should fold the range of its result for the
+/// `DynamicQuantizeLinear` that reads it (`range = 1`, see
+/// `rewrite::fuse_matmul_integer_epilogue`).
+fn fused_range(node: &NodeIr) -> bool {
+    node.attrs.get("range").and_then(AttrValue::as_i64) == Some(1)
+}
+
+/// The nodes `rewrite::fuse_matmul_integer_epilogue` or
+/// `rewrite::fuse_conv_integer_epilogue` replaced, run as they were: `op`, the
+/// integer node, keeps the fused node's attributes but `relu` and `range`, the
+/// others get none; a fused `Relu` runs last. No range is recorded: the
+/// quantization that follows makes its own pass.
+fn integer_scale_bias_unfused(env: &mut Env, node: &NodeIr, op: &str) -> Result<()> {
+    let acc = format!("{}/acc", node.outputs[0]);
+    let dequantized = format!("{}/dequantized", node.outputs[0]);
+    let scaled = format!("{}/scaled", node.outputs[0]);
+    let biased = format!("{}/biased", node.outputs[0]);
+    let relu = fused_relu(node);
+    let i = &node.inputs;
+    let mut integer = lowered(
+        node,
+        op,
+        &[&i[0], &i[1], &i[2], &i[3]].map(String::as_str),
+        &[&acc],
+    );
+    integer.attrs.remove("relu");
+    integer.attrs.remove("range");
+    exec_dispatch(env, &integer)?;
+    let plain = |op: &str, inputs: &[&str], output: &str| NodeIr {
+        attrs: HashMap::new(),
+        ..lowered(node, op, inputs, &[output])
+    };
+    let mut cast = plain("Cast", &[&acc], &dequantized);
+    cast.attrs
+        .insert("to".to_owned(), AttrValue::Int(i64::from(FLOAT)));
+    exec_dispatch(env, &cast)?;
+    env.release(&acc);
+    exec_dispatch(env, &plain("Mul", &[&dequantized, &i[4]], &scaled))?;
+    env.release(&dequantized);
+    let sum = if relu { &biased } else { &node.outputs[0] };
+    exec_dispatch(env, &plain("Add", &[&scaled, &i[5]], sum))?;
+    env.release(&scaled);
+    if relu {
+        exec_dispatch(env, &plain("Relu", &[&biased], &node.outputs[0]))?;
+        env.release(&biased);
+    }
+    Ok(())
 }
 
 /// Copy of a constant u8 tensor with the sign bit flipped, cached by name.
@@ -2117,6 +2908,46 @@ fn host_unary(
     Ok(())
 }
 
+/// `IsNaN`: on the GPU when the input already lives there, so a guard after
+/// an attention `Softmax` (`Where(IsNaN(p), 0, p)`, 13 nodes of SAM 3's
+/// detector, up to [1, 8, 5184, 32]) no longer reads the probabilities back.
+fn is_nan(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let x = &node.inputs[0];
+    if !env.on_device(x) || env.dtype_of(x)? != FLOAT {
+        return host_unary(env, node, host_ops::is_nan);
+    }
+    let ctx = env.context();
+    let xd = env.device(x)?;
+    let (shape, n) = (xd.shape.clone(), xd.elem_count);
+    let words = n.div_ceil(4) as u32;
+    let out = ctx.create_storage_buffer(device_storage_bytes(BOOL, n)?)?;
+    if n > 0 {
+        with_pipeline(
+            env.cache(),
+            "IsNaN",
+            || ctx.create_pipeline(&compile_wgsl(IS_NAN)?, IS_NAN_BINDINGS, IS_NAN_PUSH_BYTES),
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[xd.buffer(), &out],
+                    &(n as u32).to_le_bytes(),
+                    [words.div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: BOOL,
+            shape,
+            elem_count: n,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
 /// Host-side `Mod`: the two remainders (`fmod`) and broadcasting live in
 /// `host_ops::modulo`.
 fn host_mod(env: &mut Env, node: &NodeIr) -> Result<()> {
@@ -2138,6 +2969,22 @@ fn host_cmp(env: &mut Env, node: &NodeIr, op: host_ops::CmpOp) -> Result<()> {
         &node.outputs[0],
         Tensor::Host(host_ops::compare(&a, &b, op)?),
     );
+    Ok(())
+}
+
+/// `OneHot`: on host, like the comparisons. In the SAM 3 mask decoder it
+/// expands a handful of constant indices.
+fn one_hot(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let indices = env.host(&node.inputs[0])?;
+    let depth = env.host(&node.inputs[1])?;
+    let values = env.host(&node.inputs[2])?;
+    let axis = node
+        .attrs
+        .get("axis")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(-1);
+    let out = host_ops::one_hot(&indices, &depth, &values, axis)?;
+    env.set(&node.outputs[0], Tensor::Host(out));
     Ok(())
 }
 
@@ -2229,7 +3076,20 @@ fn constant_of_shape(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// `Expand`: broadcasts input[0] toward the shape input[1] (host int).
 fn expand(env: &mut Env, node: &NodeIr) -> Result<()> {
     let target = env.host(&node.inputs[1])?.to_i64()?;
-    let x = env.host(&node.inputs[0])?;
+    let src = &node.inputs[0];
+    // An f32 activation, or a small vector broadcast to one (SAM 3 spreads a
+    // [1, 256, 1, 1] embedding over 72×72), is copied on the GPU: on host it
+    // costs a readback and a re-upload. Shape math stays on host.
+    if env.dtype_of(src)? == FLOAT {
+        let bc = broadcast(&env.shape_of(src)?, &target)?;
+        let out_bytes = bc.out_shape.iter().product::<i64>().max(0) as usize * 4;
+        if env.on_device(src) || out_bytes > Env::SMALL_HOST_BYTES {
+            env.ensure_device(src)?;
+            // `b` only lends the target shape: the expression reads `a` alone
+            return broadcast_dispatch(env, &node.outputs[0], src, src, bc, "a[off_a]");
+        }
+    }
+    let x = env.host(src)?;
     env.set(
         &node.outputs[0],
         Tensor::Host(host_ops::expand(&x, &target)?),
@@ -2240,6 +3100,12 @@ fn expand(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// `Tile`: replicates input[0] by repeats (input[1], host int).
 fn tile(env: &mut Env, node: &NodeIr) -> Result<()> {
     let repeats = env.host(&node.inputs[1])?.to_i64()?;
+    if repeats.iter().all(|&r| r == 1) {
+        // a copy, kept where it lives (SAM 3 tiles its image embeddings by the
+        // number of prompts, 1): on host it would round-trip megabytes
+        let shape = env.shape_of(&node.inputs[0])?;
+        return meta_reshape_out(env, node, shape);
+    }
     let x = env.host(&node.inputs[0])?;
     env.set(
         &node.outputs[0],
@@ -2292,6 +3158,11 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
     let begins = pads[..rank].to_vec();
     let ends = pads[rank..].to_vec();
 
+    // no padding, as SAM 3's window partition when the grid divides: a copy
+    if pads.iter().all(|&p| p == 0) && env.on_device(data) && env.dtype_of(data)? == FLOAT {
+        let shape = env.shape_of(data)?;
+        return meta_reshape_out(env, node, shape);
+    }
     if env.dtype_of(data)? == FLOAT {
         pad_device(env, node, &begins, &ends)
     } else {
@@ -2642,8 +3513,12 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
             .cache()
             .tuning()
             .resolve(&tuning_key, |record| {
-                ConvTactic::from_persistent(record.tactic(), record.parameters())
-                    .is_some_and(|candidate| candidate.is_viable(geometry, limits))
+                ConvTactic::from_persistent(record.tactic(), record.parameters()).is_some_and(
+                    |candidate| {
+                        candidate.is_viable(geometry, limits)
+                            && conv_generated_source(candidate).is_some()
+                    },
+                )
             })
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let tactic = selected
@@ -2653,28 +3528,23 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
         let split = tactic.split();
         push.extend_from_slice(&split.to_le_bytes());
         let bias: &GpuBuffer = unsafe { &*bias };
-        let (operation, source) = match tactic {
-            ConvTactic::Direct { .. } => ("Conv_grouped", conv_direct_source()),
-            ConvTactic::ImplicitGemm { .. } => ("Conv16", conv_gemm_source()),
+        // Every tactic runs the source generated from all of its parameters, the
+        // one the tuner measured: a family-wide committed source with this
+        // tactic's dispatch grid leaves outputs unwritten when the sizes differ.
+        let operation = match tactic {
+            ConvTactic::Direct { .. } => "Conv_grouped",
+            ConvTactic::ImplicitGemm { .. } => "Conv16",
             ConvTactic::Blocked {
                 output_tile: 32, ..
-            } => (
-                "Conv32",
-                conv_generated_source(tactic).ok_or_else(|| {
-                    anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}")
-                })?,
-            ),
+            } => "Conv32",
             ConvTactic::Blocked {
                 output_tile: 128, ..
-            } => (
-                "Conv128",
-                conv_generated_source(tactic).ok_or_else(|| {
-                    anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}")
-                })?,
-            ),
-            ConvTactic::Blocked { .. } => ("Conv", conv_blocked_source()),
-            ConvTactic::SplitK { .. } => ("Conv_split", conv_blocked_splitk_source()),
+            } => "Conv128",
+            ConvTactic::Blocked { .. } => "Conv",
+            ConvTactic::SplitK { .. } => "Conv_split",
         };
+        let source = conv_generated_source(tactic)
+            .ok_or_else(|| anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}"))?;
         let key = PipelineKey::tactic(operation, format!("{tactic:?}"));
         let groups = tactic.dispatch_grid(g.total as u32, pixels, g.c_out as u32, g.n as u32);
         // With a split the kernel writes one partial image per slice and the
@@ -3131,6 +4001,84 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// Direct 1D/2D conv (1D normalized to 2D with W=1): handles group (depthwise),
 /// stride, pad, dilation. Zero-points read from buffers (no readback).
 fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
+    ensure!(conv_integer_with(env, node, false)?);
+    Ok(())
+}
+
+/// `ConvInteger → Cast(FLOAT) → Mul(scale) → Add(bias)`, fused by
+/// `rewrite::fuse_conv_integer_epilogue`: the cooperative kernel writes
+/// `float(acc) · scale + bias` in f32 and the i32 convolution is never stored.
+///
+/// The same epilogue as `MatMulIntegerScaleBias`, bit-identical to the unfused
+/// graph, with scale and bias one value or one per output channel — a row of
+/// the `[C_out, P]` product. Anything the cooperative paths of `ConvInteger`
+/// do not take, or another broadcast, runs the four original steps.
+///
+/// A seventh input is a second factor of the scale, as in
+/// `matmul_integer_scale_bias`.
+fn conv_integer_scale_bias(env: &mut Env, node: &NodeIr) -> Result<()> {
+    if conv_integer_with(env, node, true)? {
+        return Ok(());
+    }
+    if node.inputs.len() == 7 {
+        return with_scale_product(env, node, conv_integer_scale_bias);
+    }
+    integer_scale_bias_unfused(env, node, "ConvInteger")
+}
+
+/// The epilogue strides of a `ConvIntegerScaleBias` (see
+/// `glsl/matmul_integer_coop.comp`): scale, bias and the scale's second
+/// factor, 0 when there is none. `None` when one of them is not f32 or
+/// broadcasts other than per tensor or per channel. Makes them resident.
+fn conv_epilogue(
+    env: &mut Env,
+    node: &NodeIr,
+    c_out: i64,
+    rank: usize,
+) -> Result<Option<[u32; 3]>> {
+    let operands = [
+        Some(&node.inputs[4]),
+        Some(&node.inputs[5]),
+        node.inputs.get(6),
+    ];
+    let mut steps = [0; 3];
+    for (step, name) in steps.iter_mut().zip(operands) {
+        let Some(name) = name else { continue };
+        if env.dtype_of(name)? != FLOAT {
+            return Ok(None);
+        }
+        let Some(s) = channel_step(&env.shape_of(name)?, c_out, rank) else {
+            return Ok(None);
+        };
+        *step = s;
+    }
+    for name in operands.into_iter().flatten() {
+        env.ensure_device(name)?;
+    }
+    Ok(Some(steps))
+}
+
+/// The epilogue stride of an operand broadcast against an `[N, C_out, ..]`
+/// output of rank `rank`: 0 for one value, 2 (one per row of the product) for
+/// one per channel, `None` otherwise or when it would raise the output's rank.
+fn channel_step(shape: &[i64], c_out: i64, rank: usize) -> Option<u32> {
+    let ones = |dims: &[i64]| dims.iter().all(|&d| d == 1);
+    if shape.len() > rank {
+        return None;
+    }
+    if ones(shape) {
+        return Some(0);
+    }
+    // the channel axis, counted from the right as broadcasting aligns
+    let spatial = rank.checked_sub(2)?;
+    let channel = shape.len().checked_sub(spatial + 1)?;
+    (shape[channel] == c_out && ones(&shape[..channel]) && ones(&shape[channel + 1..])).then_some(2)
+}
+
+/// `ConvInteger`, or with `fused` the `ConvIntegerScaleBias` whose inputs 4
+/// and 5 are the scale and bias of its epilogue. `false` only when `fused`
+/// and neither cooperative path takes the node: nothing has run then.
+fn conv_integer_with(env: &mut Env, node: &NodeIr, fused: bool) -> Result<bool> {
     let ctx = env.context();
     let x_name = node.inputs[0].clone();
     let w_name = node.inputs[1].clone();
@@ -3159,14 +4107,6 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
     } = g;
     let out_shape = g.out_shape.clone();
 
-    env.ensure_device_dtype(&x_name)?;
-    env.ensure_device_dtype(&w_name)?;
-    // ONNX allows both uint8 and int8 for X and W, independently
-    let x_signed = u32::from(env.dtype_of(&x_name)? == INT8);
-    let w_signed = u32::from(env.dtype_of(&w_name)? == INT8);
-    ensure_zp(env, node.inputs.get(2))?; // zero-point of the X activation
-    ensure_zp(env, node.inputs.get(3))?; // zero-point of the W weights
-
     // Fast path: a 1×1 (pointwise) conv, group=1, stride/dil=1, no pad is exactly
     // a matmul W[C_out,C_in] × X[C_in, T] → [C_out, T]. Routed to the shared
     // tiled MatMulInteger kernel, much faster than naive direct conv. Dominates
@@ -3184,8 +4124,43 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
         && pwb == 0
         && pwe == 0
         && (c_in as usize).is_multiple_of(4);
+    // Second fast path: state the convolution as an explicit GEMM and put it on
+    // the tensor cores. It costs a materialized im2col matrix — the write the
+    // implicit kernels below exist to avoid — and pays for it only because the
+    // cooperative kernel is that much faster: measured over resnet50-int8's own
+    // geometries (`examples/conv_integer_coop`) im2col + cooperative matrix is
+    // **1.47×** the implicit ladder, while im2col + the WGSL matmul is 0.79×.
+    // So the path is taken only when the cooperative variant actually applies,
+    // never as a fallback.
+    let pixels = (h_out * w_out) as usize;
+    let kdepth = (g.gsi * kh * kw) as usize;
+    let coop = if group == 1 && n == 1 && total > 0 {
+        mmi_coop_variant(ctx, c_out as usize, pixels)
+            .filter(|v| mmi_coop_applies(v, c_out as usize, kdepth, pixels, false))
+    } else {
+        None
+    };
+    // the epilogue exists only in the cooperative kernel, which the pointwise
+    // path reaches with the same A, B and K as the general one
+    let epilogue = match (fused, coop) {
+        (false, _) => None,
+        (true, None) => return Ok(false),
+        (true, Some(variant)) => match conv_epilogue(env, node, c_out, out_shape.len())? {
+            Some(steps) => Some((variant, steps)),
+            None => return Ok(false),
+        },
+    };
+
+    env.ensure_device_dtype(&x_name)?;
+    env.ensure_device_dtype(&w_name)?;
+    // ONNX allows both uint8 and int8 for X and W, independently
+    let x_signed = u32::from(env.dtype_of(&x_name)? == INT8);
+    let w_signed = u32::from(env.dtype_of(&w_name)? == INT8);
+    ensure_zp(env, node.inputs.get(2))?; // zero-point of the X activation
+    ensure_zp(env, node.inputs.get(3))?; // zero-point of the W weights
+
     if pointwise && total > 0 {
-        return conv_pointwise_matmul(
+        conv_pointwise_matmul(
             env,
             node,
             &x_name,
@@ -3198,29 +4173,26 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
             node.inputs.get(3).cloned(),
             x_signed,
             w_signed,
-        );
+            epilogue,
+        )?;
+        return Ok(true);
     }
-
-    // Second fast path: state the convolution as an explicit GEMM and put it on
-    // the tensor cores. It costs a materialized im2col matrix — the write the
-    // implicit kernels below exist to avoid — and pays for it only because the
-    // cooperative kernel is that much faster: measured over resnet50-int8's own
-    // geometries (`examples/conv_integer_coop`) im2col + cooperative matrix is
-    // **1.47×** the implicit ladder, while im2col + the WGSL matmul is 0.79×.
-    // So the path is taken only when the cooperative variant actually applies,
-    // never as a fallback.
-    let pixels = (h_out * w_out) as usize;
-    let kdepth = (g.gsi * kh * kw) as usize;
-    let coop = if group == 1 && n == 1 && total > 0 {
-        mmi_coop_variant(&ctx.coop_u8, ctx.subgroup_size)
-            .filter(|v| mmi_coop_applies(v, c_out as usize, kdepth, pixels, false))
-    } else {
-        None
-    };
     if let Some(variant) = coop {
-        return conv_im2col_coop(
-            env, node, &x_name, &w_name, &g, out_shape, pixels, kdepth, x_signed, w_signed, variant,
-        );
+        conv_im2col_coop(
+            env,
+            node,
+            &x_name,
+            &w_name,
+            &g,
+            out_shape,
+            pixels,
+            kdepth,
+            x_signed,
+            w_signed,
+            variant,
+            epilogue.map(|(_, steps)| steps),
+        )?;
+        return Ok(true);
     }
 
     let x = env.device(&x_name)?;
@@ -3330,7 +4302,7 @@ fn conv_integer(env: &mut Env, node: &NodeIr) -> Result<()> {
             buf: BufRef::Owned(out),
         }),
     );
-    Ok(())
+    Ok(true)
 }
 
 /// A node that exists only for the duration of one lowering.
@@ -3495,6 +4467,15 @@ fn qlinear_conv(env: &mut Env, node: &NodeIr) -> Result<()> {
 
     let shape = env.shape_of(&acc)?;
     let inner: usize = shape[2..].iter().product::<i64>().max(1) as usize;
+    // the epilogue indexes `bias` with the same channel as `ratio`: a
+    // per-tensor weight scale must be broadcast to `C_out`, or every channel
+    // would read `bias[0]`
+    let channels = shape.get(1).copied().unwrap_or(1).max(1) as usize;
+    let ratio = if ratio.len() == 1 {
+        vec![ratio[0]; channels]
+    } else {
+        ratio
+    };
     let bias = node.inputs.get(8).filter(|n| !n.is_empty()).cloned();
     requantize(
         env,
@@ -3558,9 +4539,9 @@ fn qlinear_add(env: &mut Env, node: &NodeIr) -> Result<()> {
     };
     let c_scale = scale(&node.inputs[6])?;
     ensure!(c_scale != 0.0, "QLinearAdd: C_scale is zero");
-    let ra = scale(&node.inputs[1])? / c_scale;
-    let rb = scale(&node.inputs[4])? / c_scale;
-    let (a_zp, b_zp) = (
+    let mut ra = scale(&node.inputs[1])? / c_scale;
+    let mut rb = scale(&node.inputs[4])? / c_scale;
+    let (mut a_zp, mut b_zp) = (
         zp_value(env, &node.inputs[2])?,
         zp_value(env, &node.inputs[5])?,
     );
@@ -3570,14 +4551,26 @@ fn qlinear_add(env: &mut Env, node: &NodeIr) -> Result<()> {
     env.ensure_device_dtype(&a_name)?;
     env.ensure_device_dtype(&b_name)?;
     let ctx = env.context();
-    let a = env.device(&a_name)?;
-    let b = env.device(&b_name)?;
-    let bc = broadcast(&a.shape, &b.shape)?;
+    let mut a = env.device(&a_name)?;
+    let mut b = env.device(&b_name)?;
+    let mut bc = broadcast(&a.shape, &b.shape)?;
     ensure!(
         bc.out_shape.len() <= MAX_RANK,
         "QLinearAdd: rank {} > {MAX_RANK}",
         bc.out_shape.len()
     );
+    // ORT hands MLAS the operands exchanged when A is constant along the
+    // innermost broadcast span (or the output is one element), and the kernel
+    // is not symmetric in rounding, so neither is this one.
+    let inner = bc.out_shape.iter().rposition(|&d| d > 1);
+    if inner.is_none_or(|d| bc.a_strides[d] == 0) {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut bc.a_strides, &mut bc.b_strides);
+        std::mem::swap(&mut ra, &mut rb);
+        std::mem::swap(&mut a_zp, &mut b_zp);
+    }
+    // MLAS folds the zero points into one addend, with this contraction.
+    let fixed = c_zp as f32 - ra.mul_add(a_zp as f32, rb * b_zp as f32);
     let elem_count: usize = bc.out_shape.iter().product::<i64>().max(0) as usize;
     let out = ctx.create_storage_buffer(device_storage_bytes(out_dtype, elem_count)?)?;
     if elem_count > 0 {
@@ -3589,9 +4582,7 @@ fn qlinear_add(env: &mut Env, node: &NodeIr) -> Result<()> {
         push_vec4s(&mut push, &bc.out_strides);
         push_vec4s(&mut push, &bc.a_strides);
         push_vec4s(&mut push, &bc.b_strides);
-        push.extend_from_slice(&ra.to_le_bytes());
-        push.extend_from_slice(&rb.to_le_bytes());
-        for value in [a_zp, b_zp, c_zp] {
+        for value in [ra, rb, fixed] {
             push.extend_from_slice(&value.to_le_bytes());
         }
         push.extend_from_slice(&u32::from(out_dtype == INT8).to_le_bytes());
@@ -3701,6 +4692,8 @@ fn qdq_push(n: usize, inner: u32, axis_len: u32, signed: bool, has_zp: bool) -> 
         axis_len,
         u32::from(signed),
         u32::from(has_zp),
+        // `zero` of QuantizeLinear's `div_rn`, opaque to the driver
+        0,
     ];
     let mut push = Vec::with_capacity(fields.len() * 4);
     for v in fields {
@@ -3857,6 +4850,7 @@ fn conv_pointwise_matmul(
     w_zp: Option<String>, // zero-point of W (weights)    → A binding
     x_signed: u32,
     w_signed: u32,
+    epilogue: Option<(&'static CoopVariant, [u32; 3])>,
 ) -> Result<()> {
     let ctx = env.context();
     let k4 = c_in / 4;
@@ -3903,28 +4897,44 @@ fn conv_pointwise_matmul(
     };
     let ctx = env.context();
     let w: &GpuBuffer = unsafe { &*w_ptr };
-    let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
-    let azp = zp_ref(env, w_zp.as_ref())?;
-    let bzp = zp_ref(env, a_zp.as_ref())?;
-    // in the matmul A=W and B=X: the sign flags follow the same swap
-    mmi_dispatch(
-        env.cache(),
-        ctx,
-        &[w, &packed, azp, bzp, &out],
-        MmiProblem {
-            m: c_out,
-            k: c_in,
-            n: nmat,
-            a_byte_flip: 0, // W already unsigned in memory
-            a_zp_xor: if w_signed != 0 { MMI_SIGN_FLIP_BYTE } else { 0 },
-            b_zp_xor: if x_signed != 0 { MMI_SIGN_FLIP_BYTE } else { 0 },
-        },
-    )?;
+    let zp_xor = [w_signed, x_signed].map(|s| if s != 0 { MMI_SIGN_FLIP_BYTE } else { 0 });
+    let (out, dtype) = if let Some((variant, steps)) = epilogue {
+        let out = conv_coop_epilogue(
+            env,
+            node,
+            variant,
+            w,
+            &packed,
+            [c_out, c_in, nmat],
+            zp_xor,
+            steps,
+        )?;
+        (out, FLOAT)
+    } else {
+        let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
+        let azp = zp_ref(env, w_zp.as_ref())?;
+        let bzp = zp_ref(env, a_zp.as_ref())?;
+        // in the matmul A=W and B=X: the sign flags follow the same swap
+        mmi_dispatch(
+            env.cache(),
+            ctx,
+            &[w, &packed, azp, bzp, &out],
+            MmiProblem {
+                m: c_out,
+                k: c_in,
+                n: nmat,
+                a_byte_flip: 0, // W already unsigned in memory
+                a_zp_xor: zp_xor[0],
+                b_zp_xor: zp_xor[1],
+            },
+        )?;
+        (out, INT32)
+    };
     ctx.defer_destroy(packed);
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
-            dtype: INT32,
+            dtype,
             shape: out_shape,
             elem_count: total,
             buf: BufRef::Owned(out),
@@ -3970,14 +4980,23 @@ fn conv_im2col_coop(
     x_signed: u32,
     w_signed: u32,
     variant: &'static CoopVariant,
+    epilogue: Option<[u32; 3]>,
 ) -> Result<()> {
     let c_out = g.c_out as usize;
     let total = c_out * pixels;
     let words = pixels * kdepth / 4;
 
+    // Channels and planes that start on a word go through HWC (see
+    // `shaders::conv_integer::TO_HWC`), with K reordered to (kh, kw, c)
+    let hwc = g.gsi % 4 == 0 && (g.h_in * g.w_in) % 4 == 0;
     let ctx = env.context();
+    // Back to the pool when the product is recorded, like a tensor: destroyed,
+    // the next run allocates it again — 8 ms for the 191 MB of SAM 3's
+    // 3×3 convolution at 288², more than its GPU time.
     let col = ctx.create_storage_buffer((words * 4) as u64)?;
-    {
+    if hwc {
+        conv_im2col_hwc(env, node, x_name, g, &col, words, x_signed)?;
+    } else {
         let x = env.device(x_name)?;
         let azp = zp_ref(env, node.inputs.get(2))?;
         let mut push = Vec::with_capacity(CONV_I_IM2COL_PUSH_BYTES as usize);
@@ -4020,7 +5039,9 @@ fn conv_im2col_coop(
         )?;
     }
 
-    let w_ptr = if w_signed != 0 {
+    let w_ptr = if hwc {
+        hwc_weight(env, w_name, g, w_signed != 0)?
+    } else if w_signed != 0 {
         flipped_const(env, w_name, c_out * kdepth)?
     } else {
         env.device(w_name)?.buffer() as *const GpuBuffer
@@ -4030,6 +5051,30 @@ fn conv_im2col_coop(
     // entries and keeps them boxed; an unflipped one is the tensor's own
     // buffer, alive for the whole execution.
     let w: &GpuBuffer = unsafe { &*w_ptr };
+    let zp_xor = [w_signed, x_signed].map(|s| if s != 0 { MMI_SIGN_FLIP_BYTE } else { 0 });
+    if let Some(steps) = epilogue {
+        let out = conv_coop_epilogue(
+            env,
+            node,
+            variant,
+            w,
+            &col,
+            [c_out, kdepth, pixels],
+            zp_xor,
+            steps,
+        )?;
+        ctx.recycle_storage_buffer(col);
+        env.set(
+            &node.outputs[0],
+            Tensor::Device(DevTensor {
+                dtype: FLOAT,
+                shape: out_shape,
+                elem_count: total,
+                buf: BufRef::Owned(out),
+            }),
+        );
+        return Ok(());
+    }
     let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
     let azp = zp_ref(env, node.inputs.get(3))?; // A = W → weight zero point
     let bzp = zp_ref(env, node.inputs.get(2))?; // B = im2col → activation zero point
@@ -4050,22 +5095,18 @@ fn conv_im2col_coop(
     }
     with_pipeline(
         env.cache(),
-        "ConvInteger_coop",
+        PipelineKey::tactic("ConvInteger_coop", variant.key),
         || ctx.create_pipeline(&variant.spirv(), MMI_COOP_BINDINGS, MMI_COOP_PUSH_BYTES),
         |pipe| {
             ctx.stream_dispatch(
                 pipe,
                 &[w, &col, azp, bzp, &out],
                 &push,
-                [
-                    (pixels as u32).div_ceil(MMI_COOP_TILE),
-                    (c_out as u32).div_ceil(MMI_COOP_TILE),
-                    1,
-                ],
+                variant.grid(c_out, pixels),
             )
         },
     )?;
-    ctx.defer_destroy(col);
+    ctx.recycle_storage_buffer(col);
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -4076,6 +5117,196 @@ fn conv_im2col_coop(
         }),
     );
     Ok(())
+}
+
+/// The cooperative product `W [C_out, K] × B [P, K]ᵀ` of a
+/// `ConvIntegerScaleBias` with the dequantizing epilogue: the f32
+/// `float(acc) · scale + bias` of its inputs 4 and 5 (the scale times input
+/// 6 when there is one), NCHW at `n == 1`, with `steps` from `conv_epilogue`. `zp_xor` is the zero-point shift of W and of
+/// X, as in `conv_im2col_coop`.
+#[allow(clippy::too_many_arguments)]
+fn conv_coop_epilogue(
+    env: &Env,
+    node: &NodeIr,
+    variant: &'static CoopVariant,
+    w: &GpuBuffer,
+    b: &GpuBuffer,
+    [m, k, n]: [usize; 3],
+    zp_xor: [u32; 2],
+    steps: [u32; 3],
+) -> Result<GpuBuffer> {
+    let ctx = env.context();
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, m * n)?)?;
+    let azp = zp_ref(env, node.inputs.get(3))?; // A = W → weight zero point
+    let bzp = zp_ref(env, node.inputs.get(2))?; // B = X → activation zero point
+    let (scale, bias) = (env.device(&node.inputs[4])?, env.device(&node.inputs[5])?);
+    // unread without its flag: any buffer fills the binding
+    let product = match node.inputs.get(6) {
+        Some(name) => env.device(name)?.buffer(),
+        None => scale.buffer(),
+    };
+    let flags = u32::from(node.inputs.len() == 7) << 2;
+    let mut push = Vec::with_capacity(MMI_COOP_EPILOGUE_PUSH_BYTES as usize);
+    for value in [
+        m as u32, k as u32, n as u32, zp_xor[0], zp_xor[1], steps[0], steps[1], flags, steps[2],
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    with_pipeline(
+        env.cache(),
+        PipelineKey::tactic("ConvInteger_coop_epilogue", variant.epilogue_key),
+        || {
+            ctx.create_pipeline(
+                &variant.spirv_epilogue(),
+                MMI_COOP_EPILOGUE_BINDINGS,
+                MMI_COOP_EPILOGUE_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                // the range binding is unread: a convolution never folds it
+                &[
+                    w,
+                    b,
+                    azp,
+                    bzp,
+                    &out,
+                    scale.buffer(),
+                    bias.buffer(),
+                    &out,
+                    product,
+                ],
+                &push,
+                variant.grid(m, n),
+            )
+        },
+    )?;
+    Ok(out)
+}
+
+/// The im2col matrix of `conv_im2col_coop` with K ordered `(kh, kw, c)`:
+/// X to HWC, then whole words of it to `col` (see
+/// `shaders::conv_integer::IM2COL_HWC`). Needs `C_in` and `H·W` multiples of
+/// four.
+fn conv_im2col_hwc(
+    env: &mut Env,
+    node: &NodeIr,
+    x_name: &str,
+    g: &ConvGeom,
+    col: &GpuBuffer,
+    words: usize,
+    x_signed: u32,
+) -> Result<()> {
+    let ctx = env.context();
+    let channels = g.gsi as u32;
+    let plane = (g.h_in * g.w_in) as u32;
+    let xt = ctx.create_storage_buffer(u64::from(channels) * u64::from(plane))?;
+    let x = env.device(x_name)?;
+    let mut push = Vec::with_capacity(CONV_I_TO_HWC_PUSH_BYTES as usize);
+    for value in [channels, plane] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    with_pipeline(
+        env.cache(),
+        CONV_I_TO_HWC_KEY,
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(CONV_I_TO_HWC)?,
+                CONV_I_TO_HWC_BINDINGS,
+                CONV_I_TO_HWC_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[x.buffer(), &xt],
+                &push,
+                [
+                    plane.div_ceil(CONV_I_TO_HWC_TILE),
+                    channels.div_ceil(CONV_I_TO_HWC_TILE),
+                    1,
+                ],
+            )
+        },
+    )?;
+    let azp = zp_ref(env, node.inputs.get(2))?;
+    let channel_words = channels / 4;
+    let mut push = Vec::with_capacity(CONV_I_IM2COL_HWC_PUSH_BYTES as usize);
+    for value in [
+        words as u32,
+        channel_words * (g.kh * g.kw) as u32,
+        channel_words,
+        g.h_in as u32,
+        g.w_in as u32,
+        g.w_out as u32,
+        g.kw as u32,
+        g.sh as u32,
+        g.sw as u32,
+        g.phb as u32,
+        g.pwb as u32,
+        g.dh as u32,
+        g.dw as u32,
+        if x_signed != 0 { MMI_SIGN_FLIP_WORD } else { 0 },
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    let max_groups = ctx.compute_limits().max_workgroup_count[0];
+    with_pipeline(
+        env.cache(),
+        CONV_I_IM2COL_HWC_KEY,
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(CONV_I_IM2COL_HWC)?,
+                CONV_I_IM2COL_HWC_BINDINGS,
+                CONV_I_IM2COL_HWC_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[&xt, azp, col],
+                &push,
+                [(words as u32).div_ceil(256).min(max_groups), 1, 1],
+            )
+        },
+    )?;
+    ctx.defer_destroy(xt);
+    Ok(())
+}
+
+/// The constant weight `[C_out, C_in, KH, KW]` permuted to
+/// `[C_out, KH, KW, C_in]` for `conv_im2col_hwc`, sign-flipped when it is
+/// `int8`: done once on the host, cached for the session.
+fn hwc_weight(env: &mut Env, name: &str, g: &ConvGeom, flip: bool) -> Result<*const GpuBuffer> {
+    let (c_out, c_in, taps) = (g.c_out as usize, g.gsi as usize, (g.kh * g.kw) as usize);
+    let bytes = c_out * c_in * taps;
+    let cache = env.cache();
+    let key = (format!("{name}#hwc"), bytes, usize::from(flip));
+    if let Some(cached) = cache.packed_weight_cached(&key) {
+        return Ok(cached);
+    }
+    let w = env.host(name)?;
+    ensure!(
+        w.data.len() == bytes,
+        "ConvInteger: weight {name} has {} bytes, expected {bytes}",
+        w.data.len()
+    );
+    let xor = if flip { 0x80 } else { 0 };
+    let mut permuted = vec![0u8; bytes.next_multiple_of(4).max(4)];
+    for o in 0..c_out {
+        for c in 0..c_in {
+            for t in 0..taps {
+                permuted[(o * taps + t) * c_in + c] = w.data[(o * c_in + c) * taps + t] ^ xor;
+            }
+        }
+    }
+    let ctx = env.context();
+    cache.packed_weight(key, || {
+        let dst = ctx.create_storage_buffer(permuted.len() as u64)?;
+        ctx.stream_upload(&dst, &permuted)?;
+        Ok(dst)
+    })
 }
 
 /// Makes the scalar zero-point resident in VRAM, if the input is present.
@@ -4208,6 +5439,11 @@ fn slice(env: &mut Env, node: &NodeIr) -> Result<()> {
         steps.as_deref(),
     )?;
 
+    // the whole input, as SAM 3's window unpartition when the grid divides: a copy
+    let whole = out_shape == data_shape && st.iter().all(|&s| s == 0) && sp.iter().all(|&s| s == 1);
+    if whole && env.on_device(data) && env.dtype_of(data)? == FLOAT {
+        return meta_reshape_out(env, node, data_shape);
+    }
     if env.dtype_of(data)? == FLOAT {
         let src = data.clone();
         let t = slice_device(env, &src, &data_shape, &out_shape, &st, &sp)?;
@@ -4339,14 +5575,98 @@ fn split(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// Resolve only geometries covered by the matrix family runner.
+fn matrix_tactic(
+    env: &Env,
+    node: &NodeIr,
+    output: &[i64],
+    allowed: &[&str],
+) -> Result<Option<String>> {
+    let inputs = node
+        .inputs
+        .iter()
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            Ok(crate::tuning::TensorSignature {
+                dtype: crate::ElementType::try_from(env.dtype_of(name)?)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                dimensions: env
+                    .shape_of(name)?
+                    .into_iter()
+                    .map(u64::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let key = crate::tuning::TuningKey {
+        device: env.context().device_fingerprint().into(),
+        workload: crate::tuning::WorkloadSignature {
+            domain: node.domain.clone(),
+            op: node.op.clone(),
+            inputs,
+            outputs: vec![crate::tuning::TensorSignature {
+                dtype: crate::ElementType::Float32,
+                dimensions: output
+                    .iter()
+                    .copied()
+                    .map(u64::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            }],
+            attributes_digest: crate::tuning::attributes_digest(node),
+        },
+        implementation: crate::shaders::matrix::implementation_fingerprint(),
+    };
+    Ok(env
+        .cache()
+        .tuning()
+        .resolve(&key, |record| {
+            record.tactic().family() == "matrix-f32"
+                && record.parameters().is_empty()
+                && allowed.contains(&record.tactic().variant())
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .map(|record| record.tactic().variant().to_owned()))
+}
+
 /// `MatMul` f32 (opset ≥13) with batch broadcasting. Reuses the tiled 16×16 kernel.
 fn matmul_fp32(env: &mut Env, node: &NodeIr) -> Result<()> {
-    let ctx = env.context();
     env.ensure_device(&node.inputs[0])?;
     env.ensure_device(&node.inputs[1])?;
+    let a_shape = env.device(&node.inputs[0])?.shape.clone();
+    let b_shape = env.device(&node.inputs[1])?.shape.clone();
+    let (out, out_shape, elem_count) = matmul_fp32_shaped(env, node, &a_shape, &b_shape)?;
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// The MatMul of `node`'s two device inputs read as `a_shape` and `b_shape`,
+/// which may differ from their stored shapes by a reshape: `Einsum` runs its
+/// matmul forms here without copying operands into reshaped buffers. Returns the
+/// output buffer, its shape and its element count.
+fn matmul_fp32_shaped(
+    env: &mut Env,
+    node: &NodeIr,
+    a_shape: &[i64],
+    b_shape: &[i64],
+) -> Result<(GpuBuffer, Vec<i64>, usize)> {
+    let ctx = env.context();
     let a = env.device(&node.inputs[0])?;
     let b = env.device(&node.inputs[1])?;
-    let (a_shape, b_shape) = (a.shape.clone(), b.shape.clone());
+    let numel = |shape: &[i64]| shape.iter().product::<i64>().max(0) as usize;
+    ensure!(
+        numel(a_shape) == a.elem_count && numel(b_shape) == b.elem_count,
+        "MatMul: shapes A {a_shape:?}, B {b_shape:?} do not match {} and {} elements",
+        a.elem_count,
+        b.elem_count
+    );
     ensure!(
         a_shape.len() >= 2 && b_shape.len() >= 2,
         "MatMul: rank < 2 (A {a_shape:?}, B {b_shape:?})"
@@ -4440,7 +5760,15 @@ fn matmul_fp32(env: &mut Env, node: &NodeIr) -> Result<()> {
         push_vec4s(&mut push, &bc.b_strides);
         // Thin matrices lose more to the blocked kernel's 64×64 padding than
         // they gain from its register blocking; see `prefer_blocked`.
-        let blocked = mm_prefer_blocked(m, n);
+        let selected = if a_shape.len() == 2 && b_shape.len() == 2 && m > 1 {
+            matrix_tactic(env, node, &out_shape, &["matmul16", "matmul64"])?
+        } else {
+            None
+        };
+        let blocked = selected
+            .as_deref()
+            .map(|id| id == "matmul64")
+            .unwrap_or_else(|| mm_prefer_blocked(m, n));
         let (key, src, tile) = if blocked {
             ("MatMul", MM_MATMUL, MM_TILE_SIZE)
         } else {
@@ -4464,11 +5792,186 @@ fn matmul_fp32(env: &mut Env, node: &NodeIr) -> Result<()> {
             },
         )?;
     }
+    Ok((out, out_shape, elem_count))
+}
+
+/// How many labels of an `Einsum` equation fall in each MatMul role: batch (in
+/// both inputs and the output), `m` (first input and output), `k` (both
+/// inputs, summed) and `n` (second input and output).
+#[derive(Debug, PartialEq, Eq)]
+struct EinsumMatmul {
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+}
+
+/// The equations that are a batched MatMul once the operands are reshaped:
+/// `A = batch·m·k`, `B = batch·k·n`, `out = batch·m·n`, each group in the same
+/// label order everywhere (SAM 3's mask head, `bqc,bchw->bqhw`). Anything that
+/// would need a transpose, a diagonal, an ellipsis, an implicit output or a
+/// label summed on one side only is `None`.
+fn einsum_as_matmul(equation: &str) -> Option<EinsumMatmul> {
+    let equation: String = equation.chars().filter(|c| !c.is_whitespace()).collect();
+    let (inputs, out) = equation.split_once("->")?;
+    let (a, b) = inputs.split_once(',')?;
+    let labels = |term: &str| -> Option<Vec<char>> {
+        let chars: Vec<char> = term.chars().collect();
+        let distinct: HashSet<char> = chars.iter().copied().collect();
+        (chars.iter().all(char::is_ascii_alphabetic) && distinct.len() == chars.len())
+            .then_some(chars)
+    };
+    let (a, b, out) = (labels(a)?, labels(b)?, labels(out)?);
+    let pick = |from: &[char], in_b: bool, in_out: bool, other: &[char]| -> Vec<char> {
+        from.iter()
+            .copied()
+            .filter(|c| other.contains(c) == in_b && out.contains(c) == in_out)
+            .collect()
+    };
+    let batch = pick(&a, true, true, &b);
+    let m = pick(&a, false, true, &b);
+    let k = pick(&a, true, false, &b);
+    let n = pick(&b, false, true, &a);
+    let joined = |parts: [&[char]; 3]| parts.concat();
+    (a == joined([&batch, &m, &k])
+        && b == joined([&batch, &k, &n])
+        && out == joined([&batch, &m, &n]))
+    .then_some(EinsumMatmul {
+        batch: batch.len(),
+        m: m.len(),
+        k: k.len(),
+        n: n.len(),
+    })
+}
+
+/// `Einsum` in its MatMul forms ([`einsum_as_matmul`]): the operands are read
+/// as `[batch.., M, K]` and `[batch.., K, N]` by the MatMul kernel, and its
+/// `[batch.., M, N]` output is already the einsum's layout.
+fn einsum(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let equation = node
+        .attrs
+        .get("equation")
+        .and_then(AttrValue::as_str)
+        .context("Einsum: attribute 'equation' missing")?;
+    let plan = einsum_as_matmul(equation)
+        .with_context(|| format!("Einsum: '{equation}' is not a MatMul form"))?;
+    env.ensure_device(&node.inputs[0])?;
+    env.ensure_device(&node.inputs[1])?;
+    let a = env.device(&node.inputs[0])?.shape.clone();
+    let b = env.device(&node.inputs[1])?.shape.clone();
+    let EinsumMatmul { batch, m, k, n } = plan;
+    ensure!(
+        a.len() == batch + m + k && b.len() == batch + k + n,
+        "Einsum '{equation}': ranks {} and {} disagree with the labels",
+        a.len(),
+        b.len()
+    );
+    ensure!(
+        a[..batch] == b[..batch] && a[batch + m..] == b[batch..batch + k],
+        "Einsum '{equation}': shared labels differ in size ({a:?}, {b:?})"
+    );
+    let product = |dims: &[i64]| dims.iter().product::<i64>();
+    let (rows, inner, cols) = (
+        product(&a[batch..batch + m]),
+        product(&a[batch + m..]),
+        product(&b[batch + k..]),
+    );
+    let a_shape = [&a[..batch], &[rows, inner]].concat();
+    let b_shape = [&b[..batch], &[inner, cols]].concat();
+    let (out, _, elem_count) = matmul_fp32_shaped(env, node, &a_shape, &b_shape)?;
+    let shape = [&a[..batch + m], &b[batch + k..]].concat();
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
             dtype: FLOAT,
-            shape: out_shape,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `InstanceNormalization` f32: each `(n, c)` slice of `[N, C, D..]` normalized
+/// over its spatial elements, then scaled and shifted per channel. One
+/// workgroup per slice; see `INSTANCENORM`.
+fn instance_norm(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let ctx = env.context();
+    for name in &node.inputs[..3] {
+        env.ensure_device(name)?;
+    }
+    let epsilon = node
+        .attrs
+        .get("epsilon")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or(1e-5);
+    let x = env.device(&node.inputs[0])?;
+    let scale = env.device(&node.inputs[1])?;
+    let bias = env.device(&node.inputs[2])?;
+    let (shape, elem_count) = (x.shape.clone(), x.elem_count);
+    ensure!(
+        shape.len() >= 2,
+        "InstanceNormalization: rank {} < 2",
+        shape.len()
+    );
+    let channels = shape[1].max(0) as usize;
+    ensure!(
+        scale.elem_count == channels && bias.elem_count == channels,
+        "InstanceNormalization: scale {} / bias {} elements for {channels} channels",
+        scale.elem_count,
+        bias.elem_count
+    );
+    let rows = shape[0].max(0) as usize * channels;
+    ensure!(
+        rows <= 65535,
+        "InstanceNormalization: {rows} slices is too many"
+    );
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        let len = (elem_count / rows) as u32;
+        let chunks = len.div_ceil(INSTANCENORM_CHUNK);
+        ensure!(
+            chunks <= 65535,
+            "InstanceNormalization: {len} elements per slice is too many"
+        );
+        // sums of each chunk, then sums of squared deviations
+        let part =
+            ctx.create_storage_buffer(device_storage_bytes(FLOAT, 2 * rows * chunks as usize)?)?;
+        for mode in 0u32..3 {
+            let mut push = Vec::with_capacity(INSTANCENORM_PUSH_BYTES as usize);
+            push.extend_from_slice(&len.to_le_bytes());
+            push.extend_from_slice(&(channels as u32).to_le_bytes());
+            push.extend_from_slice(&epsilon.to_le_bytes());
+            push.extend_from_slice(&chunks.to_le_bytes());
+            push.extend_from_slice(&(rows as u32).to_le_bytes());
+            push.extend_from_slice(&mode.to_le_bytes());
+            with_pipeline(
+                env.cache(),
+                "InstanceNormalization",
+                || {
+                    ctx.create_pipeline(
+                        &compile_wgsl(INSTANCENORM)?,
+                        INSTANCENORM_BINDINGS,
+                        INSTANCENORM_PUSH_BYTES,
+                    )
+                },
+                |pipe| {
+                    ctx.stream_dispatch(
+                        pipe,
+                        &[x.buffer(), scale.buffer(), bias.buffer(), &out, &part],
+                        &push,
+                        [chunks, rows as u32, 1],
+                    )
+                },
+            )?;
+        }
+        ctx.defer_destroy(part);
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
             elem_count,
             buf: BufRef::Owned(out),
         }),
@@ -4652,10 +6155,22 @@ fn elementwise_binary(
 
 /// f32 binary on GPU with broadcasting (reuses the elementwise template).
 fn gpu_binary(env: &mut Env, node: &NodeIr, gpu_op: &'static str) -> Result<()> {
+    let (a, b) = (&node.inputs[0], &node.inputs[1]);
+    let bc = broadcast(&env.device(a)?.shape, &env.device(b)?.shape)?;
+    broadcast_dispatch(env, &node.outputs[0], a, b, bc, gpu_op)
+}
+
+/// Runs the elementwise template over `bc` on two device f32 tensors.
+fn broadcast_dispatch(
+    env: &mut Env,
+    output: &str,
+    a: &str,
+    b: &str,
+    bc: Broadcast,
+    gpu_op: &'static str,
+) -> Result<()> {
     let ctx = env.context();
-    let a = env.device(&node.inputs[0])?;
-    let b = env.device(&node.inputs[1])?;
-    let bc = broadcast(&a.shape, &b.shape)?;
+    let (a, b) = (env.device(a)?, env.device(b)?);
     ensure!(
         bc.out_shape.len() <= MAX_RANK,
         "elementwise: rank {} > {}",
@@ -4689,7 +6204,7 @@ fn gpu_binary(env: &mut Env, node: &NodeIr, gpu_op: &'static str) -> Result<()> 
         )?;
     }
     env.set(
-        &node.outputs[0],
+        output,
         Tensor::Device(DevTensor {
             dtype: FLOAT,
             shape: bc.out_shape,
@@ -4786,6 +6301,374 @@ fn softmax(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// `MatMul(a, b) → Softmax → MatMul(p, v)`, fused by
+/// `rewrite::fuse_attention`, in one dispatch that never stores the scores.
+///
+/// The kernel covers what the rewrite cannot check without shapes: f32
+/// operands, identical batch dimensions (no broadcast) and head sizes the
+/// shader keeps in registers. Anything else runs the three original steps, so
+/// the rewrite never turns a graph that ran into one that is refused.
+///
+/// With `v_bshd`, `v` is `[B, n, H, DV]` and stands for its
+/// `Transpose(·, [0, 2, 1, 3])`; with `out_bshd`, the output is written as
+/// `[B, m, H, DV]`, the same transpose of the attention's result.
+///
+/// A fourth input is a bias added to the scores; the kernel takes it when it
+/// is f32 and broadcasts to the scores without growing them
+/// ([`attention_bias_strides`]). `nan_to_zero` zeroes the rows whose
+/// probabilities would be NaN.
+fn flash_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
+    use crate::shaders::flash_attention as fa;
+    for name in &node.inputs {
+        env.ensure_device(name)?;
+    }
+    let (v_bshd, out_bshd) = attention_layout(node);
+    let ctx = env.context();
+    let (a, b, v) = (
+        env.device(&node.inputs[0])?,
+        env.device(&node.inputs[1])?,
+        env.device(&node.inputs[2])?,
+    );
+    let bias = node
+        .inputs
+        .get(3)
+        .map(|name| env.device(name))
+        .transpose()?;
+    let nan_to_zero = node.attrs.get("nan_to_zero").and_then(AttrValue::as_i64) == Some(1);
+    let limits = ctx.compute_limits();
+    let swap_heads = |shape: &[i64]| match *shape {
+        [batch, x, heads, y] => Some(vec![batch, heads, x, y]),
+        _ => None,
+    };
+    let v_shape = if v_bshd {
+        swap_heads(&v.shape)
+    } else {
+        Some(v.shape.clone())
+    };
+    let Some((bh, m, n, d, dv, bc)) = v_shape
+        .and_then(|v_shape| flash_attention_dims(&a.shape, &b.shape, &v_shape))
+        .filter(|_| !out_bshd || a.shape.len() == 4)
+        .filter(|_| [a.dtype, b.dtype, v.dtype].iter().all(|&t| t == FLOAT))
+        .filter(|&(bh, m, n, d, dv)| {
+            let fits_u32 = |elems: usize| u32::try_from(elems).is_ok();
+            m.div_ceil(fa::BR as usize) <= limits.max_workgroup_count[0] as usize
+                && bh <= limits.max_workgroup_count[1] as usize
+                && fits_u32(bh * m * d as usize)
+                && fits_u32(bh * n * d.max(dv) as usize)
+                && fits_u32(bh * m * dv as usize)
+        })
+        .and_then(|(bh, m, n, d, dv)| {
+            let bc = fa::key_tile(d, dv, limits.max_shared_memory_bytes)?;
+            Some((bh, m, n, d, dv, bc))
+        })
+    else {
+        return attention_unfused(env, node);
+    };
+    // `[heads, outer, head, row]`, all zero without a bias
+    let bias_push = match bias {
+        None => Some([1, 0, 0, 0]),
+        Some(bias) if bias.dtype == FLOAT => attention_bias_strides(&a.shape, n, &bias.shape),
+        Some(_) => None,
+    };
+    let Some(bias_push) = bias_push else {
+        return attention_unfused(env, node);
+    };
+    let mut out_shape = a.shape.clone();
+    *out_shape.last_mut().expect("rank checked") = i64::from(dv);
+    // heads of the [B, ·, H, DV] sides; 1 leaves a side [bh, ·, DV]
+    let v_heads = if v_bshd { v.shape[2] as u32 } else { 1 };
+    let out_heads = if out_bshd {
+        out_shape = swap_heads(&out_shape).expect("rank 4 checked");
+        out_shape[2] as u32
+    } else {
+        1
+    };
+    let elem_count = bh * m * dv as usize;
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    let mut push = Vec::with_capacity(fa::PUSH_BYTES as usize);
+    for value in [
+        m as u32,
+        n as u32,
+        v_heads,
+        out_heads,
+        u32::from(nan_to_zero),
+    ]
+    .into_iter()
+    .chain(bias_push)
+    {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut buffers = vec![a.buffer(), b.buffer(), v.buffer(), &out];
+    buffers.extend(bias.map(|bias| bias.buffer()));
+    let (bindings, suffix) = if bias.is_some() {
+        (fa::BIAS_BINDINGS, "_bias")
+    } else {
+        (fa::BINDINGS, "")
+    };
+    if attention_fp16()
+        && coop_attention_fits(ctx, m, d, dv)
+        && ctx.coop_f16_wg
+        && n <= fa::WG_MAX_KEYS
+    {
+        with_pipeline(
+            env.cache(),
+            PipelineKey::tactic("FlashAttention_f16_wg", format!("d{d}_dv{dv}{suffix}")),
+            || ctx.create_pipeline(&fa::wg_spirv(d, bias.is_some()), bindings, fa::PUSH_BYTES),
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &buffers,
+                    &push,
+                    [(m as u32).div_ceil(fa::COOP_BR), bh as u32, 1],
+                )
+            },
+        )?;
+    } else if attention_fp16() && coop_attention_fits(ctx, m, d, dv) {
+        with_pipeline(
+            env.cache(),
+            PipelineKey::tactic("FlashAttention_f16", format!("d{d}_dv{dv}{suffix}")),
+            || ctx.create_pipeline(&fa::coop_spirv(d, bias.is_some()), bindings, fa::PUSH_BYTES),
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &buffers,
+                    &push,
+                    [(m as u32).div_ceil(fa::COOP_BR), bh as u32, 1],
+                )
+            },
+        )?;
+    } else {
+        with_pipeline(
+            env.cache(),
+            PipelineKey::tactic("FlashAttention", format!("d{d}_dv{dv}_bc{bc}{suffix}")),
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(&fa::source(d, dv, bc, bias.is_some()))?,
+                    bindings,
+                    fa::PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &buffers,
+                    &push,
+                    [(m as u32).div_ceil(fa::BR), bh as u32, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// Environment switch for the f16 FlashAttention kernel: `1` turns it on.
+pub const ATTENTION_FP16_ENV: &str = "ONNX_VULKAN_ATTENTION_FP16";
+
+/// Whether `ONNX_VULKAN_ATTENTION_FP16=1`: fused attention with heads of 32
+/// or 64 multiplies in f16 on cooperative matrices (f32 accumulation, softmax
+/// and normalization) instead of in f32. Off by default because the results
+/// change beyond summation order: Q, K, V and the probabilities are rounded to
+/// f16. An application turns it on only behind its own quality gate. Read once
+/// per process, so the EP and standalone hosts of one run agree.
+pub fn attention_fp16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var(ATTENTION_FP16_ENV).is_ok_and(|v| v == "1");
+        if on {
+            log::warn!(
+                "{ATTENTION_FP16_ENV}=1: FlashAttention with heads of 32 or 64 multiplies in f16 \
+                 (f32 accumulation); results differ from the f32 kernel"
+            );
+        }
+        on
+    })
+}
+
+/// Whether the f16 cooperative-matrix kernel runs this attention on `ctx`:
+/// the device advertises the `f16 × f16 → f32` configuration on subgroups of
+/// 32, and the heads are the kernel's.
+fn coop_attention_fits(ctx: &VkContext, m: usize, d: u32, dv: u32) -> bool {
+    use crate::shaders::flash_attention as fa;
+    let limits = ctx.compute_limits();
+    ctx.coop_f16
+        && ctx.subgroup_size == fa::COOP_SUBGROUP
+        && fa::COOP_HEADS.contains(&d)
+        && dv == d
+        && fa::COOP_INVOCATIONS <= limits.max_workgroup_invocations
+        && fa::COOP_INVOCATIONS <= limits.max_workgroup_size[0]
+        && fa::coop_shared_bytes(d) <= limits.max_shared_memory_bytes
+        && m.div_ceil(fa::COOP_BR as usize) <= limits.max_workgroup_count[0] as usize
+}
+
+/// `(batch, m, n, d, dv)` when `a [.., m, d]`, `b [.., d, n]` and
+/// `v [.., n, dv]` share their batch dimensions exactly and fit the shader.
+fn flash_attention_dims(
+    a: &[i64],
+    b: &[i64],
+    v: &[i64],
+) -> Option<(usize, usize, usize, u32, u32)> {
+    use crate::shaders::flash_attention::{DV_MULTIPLE, MAX_D, MAX_DV};
+    let rank = a.len();
+    if rank < 2 || b.len() != rank || v.len() != rank {
+        return None;
+    }
+    let batch = &a[..rank - 2];
+    if b[..rank - 2] != *batch || v[..rank - 2] != *batch || batch.iter().any(|&x| x < 1) {
+        return None;
+    }
+    let (m, d, n, dv) = (a[rank - 2], a[rank - 1], b[rank - 1], v[rank - 1]);
+    let fits = m >= 1
+        && n >= 1
+        && b[rank - 2] == d
+        && v[rank - 2] == n
+        && (1..=i64::from(MAX_D)).contains(&d)
+        && (i64::from(DV_MULTIPLE)..=i64::from(MAX_DV)).contains(&dv)
+        && dv % i64::from(DV_MULTIPLE) == 0;
+    fits.then(|| {
+        let bh = batch.iter().product::<i64>() as usize;
+        (bh, m as usize, n as usize, d as u32, dv as u32)
+    })
+}
+
+/// The kernel's bias push constants `[heads, outer, head, row]` for scores
+/// `[.., H, m, n]` (queries `a` are `[.., H, m, d]`), when `bias` is
+/// contiguous and broadcasts to the scores without growing them, and its
+/// batch dimensions before `H` are all broadcast or all present: the kernel
+/// splits a slice index only into `(outer, head)`.
+fn attention_bias_strides(a: &[i64], n: usize, bias: &[i64]) -> Option<[u32; 4]> {
+    let rank = a.len();
+    if bias.len() > rank || rank < 2 {
+        return None;
+    }
+    let mut padded = vec![1; rank - bias.len()];
+    padded.extend_from_slice(bias);
+    let (m, n) = (a[rank - 2], i64::try_from(n).ok()?);
+    let (bm, bn) = (padded[rank - 2], padded[rank - 1]);
+    let heads = if rank >= 3 { a[rank - 3] } else { 1 };
+    let bh = if rank >= 3 { padded[rank - 3] } else { 1 };
+    let (outer, b_outer) = (
+        &a[..rank.saturating_sub(3)],
+        &padded[..rank.saturating_sub(3)],
+    );
+    let outer_ones = b_outer.iter().all(|&x| x == 1);
+    let fits = bn == n
+        && (bm == 1 || bm == m)
+        && (bh == 1 || bh == heads)
+        && (outer_ones || b_outer == outer)
+        && u32::try_from(padded.iter().product::<i64>()).is_ok();
+    if !fits {
+        return None;
+    }
+    let row = if bm == 1 { 0 } else { n };
+    let head = if bh == 1 { 0 } else { bm * n };
+    let outer = if outer_ones { 0 } else { bh * bm * n };
+    let [heads, outer, head, row] = [heads, outer, head, row].map(|x| u32::try_from(x).ok());
+    Some([heads?, outer?, head?, row?])
+}
+
+/// The nodes `rewrite::fuse_attention` replaced, run as they were.
+/// `(v_bshd, out_bshd)`: which head transposes `rewrite::fuse_attention`
+/// folded into the node.
+fn attention_layout(node: &NodeIr) -> (bool, bool) {
+    let flag = |key| node.attrs.get(key).and_then(AttrValue::as_i64) == Some(1);
+    (flag("v_bshd"), flag("out_bshd"))
+}
+
+fn attention_unfused(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let scores = format!("{}/attention_scores", node.outputs[0]);
+    let probs = format!("{}/attention_probs", node.outputs[0]);
+    let (v_bshd, out_bshd) = attention_layout(node);
+    let v_heads = format!("{}/attention_v", node.outputs[0]);
+    let product = format!("{}/attention_product", node.outputs[0]);
+    let heads_swap = |input: &str, output: &str| {
+        let mut step = lowered(node, "Transpose", &[input], &[output]);
+        step.attrs = HashMap::from([("perm".to_owned(), AttrValue::Ints(vec![0, 2, 1, 3]))]);
+        step
+    };
+    let v = if v_bshd {
+        exec_dispatch(env, &heads_swap(&node.inputs[2], &v_heads))?;
+        v_heads.as_str()
+    } else {
+        node.inputs[2].as_str()
+    };
+    let y = if out_bshd {
+        product.as_str()
+    } else {
+        node.outputs[0].as_str()
+    };
+    let step = |op: &str, inputs: &[&str], output: &str, attrs| NodeIr {
+        domain: String::new(),
+        op: op.to_owned(),
+        opset: node.opset,
+        name: node.name.clone(),
+        inputs: inputs
+            .iter()
+            .filter(|n| !n.is_empty())
+            .map(|&n| n.to_owned())
+            .collect(),
+        outputs: vec![output.to_owned()],
+        attrs,
+    };
+    let last_axis = HashMap::from([("axis".to_owned(), AttrValue::Int(-1))]);
+    exec_dispatch(
+        env,
+        &step(
+            "MatMul",
+            &[&node.inputs[0], &node.inputs[1]],
+            &scores,
+            HashMap::new(),
+        ),
+    )?;
+    if let Some(bias) = node.inputs.get(3) {
+        let biased = format!("{}/attention_biased", node.outputs[0]);
+        exec_dispatch(env, &step("Add", &[&scores, bias], &biased, HashMap::new()))?;
+        env.release(&scores);
+        exec_dispatch(env, &step("Softmax", &[&biased], &probs, last_axis))?;
+        env.release(&biased);
+    } else {
+        exec_dispatch(env, &step("Softmax", &[&scores], &probs, last_axis))?;
+        env.release(&scores);
+    }
+    let cleaned = format!("{}/attention_cleaned", node.outputs[0]);
+    let probs = if node.attrs.get("nan_to_zero").and_then(AttrValue::as_i64) == Some(1) {
+        let (is_nan, zero) = (
+            format!("{}/attention_is_nan", node.outputs[0]),
+            format!("{}/attention_zero", node.outputs[0]),
+        );
+        exec_dispatch(env, &step("IsNaN", &[&probs], &is_nan, HashMap::new()))?;
+        env.set(&zero, Tensor::Host(HostTensor::from_f32(vec![], &[0.0])));
+        exec_dispatch(
+            env,
+            &step("Where", &[&is_nan, &zero, &probs], &cleaned, HashMap::new()),
+        )?;
+        for name in [&is_nan, &zero, &probs] {
+            env.release(name);
+        }
+        cleaned.as_str()
+    } else {
+        probs.as_str()
+    };
+    exec_dispatch(env, &step("MatMul", &[probs, v], y, HashMap::new()))?;
+    env.release(probs);
+    if v_bshd {
+        env.release(&v_heads);
+    }
+    if out_bshd {
+        exec_dispatch(env, &heads_swap(&product, &node.outputs[0]))?;
+        env.release(&product);
+    }
+    Ok(())
+}
+
 /// Which of the three row normalizations `layernorm` is running.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Norm {
@@ -4796,6 +6679,9 @@ enum Norm {
     /// `SkipSimplifiedLayerNormalization`: RMS over `x + skip`, and the sum
     /// itself as the optional fourth output.
     RmsSkip,
+    /// `AddLayerNormalization`: `Centered` over `x + skip`, and the sum as the
+    /// optional second output.
+    AddCentered,
 }
 
 /// `LayerNormalization` f32 on the last dimension; scale (+optional bias)
@@ -4806,21 +6692,26 @@ enum Norm {
 /// three share one pipeline and differ by push constants.
 fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
     let ctx = env.context();
-    let simplified = form != Norm::Centered;
+    let simplified = matches!(form, Norm::Rms | Norm::RmsSkip);
     let op = match form {
         Norm::Centered => "LayerNormalization",
         Norm::Rms => "SimplifiedLayerNormalization",
         Norm::RmsSkip => "SkipSimplifiedLayerNormalization",
+        Norm::AddCentered => "AddLayerNormalization",
     };
-    // the skip form's second input is the residual, not a scale: its scale is
-    // input 2 and there is no bias in the shape this kernel claims
-    let scale_index = if form == Norm::RmsSkip { 2 } else { 1 };
-    let has_bias = form == Norm::Centered && node.inputs.len() > 2 && !node.inputs[2].is_empty();
-    let has_skip = form == Norm::RmsSkip;
+    let has_skip = matches!(form, Norm::RmsSkip | Norm::AddCentered);
+    // the skip forms' second input is the residual, not a scale: their scale
+    // is input 2. The RMS one has no bias in the shape this kernel claims
+    let scale_index = if has_skip { 2 } else { 1 };
+    let bias_index = scale_index + 1;
+    let has_bias =
+        !simplified && node.inputs.len() > bias_index && !node.inputs[bias_index].is_empty();
+    // where the residual sum goes when the graph asks for it
+    let sum_index = if form == Norm::RmsSkip { 3 } else { 1 };
     env.ensure_device(&node.inputs[0])?;
     env.ensure_device(&node.inputs[scale_index])?;
     if has_bias {
-        env.ensure_device(&node.inputs[2])?;
+        env.ensure_device(&node.inputs[bias_index])?;
     }
     if has_skip {
         env.ensure_device(&node.inputs[1])?;
@@ -4834,7 +6725,7 @@ fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
     let x = env.device(&node.inputs[0])?;
     let scale = env.device(&node.inputs[scale_index])?;
     let bias = if has_bias {
-        env.device(&node.inputs[2])?
+        env.device(&node.inputs[bias_index])?
     } else {
         scale
     };
@@ -4861,7 +6752,7 @@ fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
     let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
     // the residual sum, only when the graph asks for it: `x + skip` is what the
     // next layer adds onto, and recomputing it there would be a second pass
-    let has_sum = has_skip && node.outputs.get(3).is_some_and(|o| !o.is_empty());
+    let has_sum = has_skip && node.outputs.get(sum_index).is_some_and(|o| !o.is_empty());
     let sum = if has_sum {
         Some(ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?)
     } else {
@@ -4915,7 +6806,7 @@ fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
     );
     if let Some(sum) = sum {
         env.set(
-            &node.outputs[3],
+            &node.outputs[sum_index],
             Tensor::Device(DevTensor {
                 dtype: FLOAT,
                 shape,
@@ -4923,6 +6814,40 @@ fn layernorm(env: &mut Env, node: &NodeIr, form: Norm) -> Result<()> {
                 buf: BufRef::Owned(sum),
             }),
         );
+    }
+    Ok(())
+}
+
+/// The node `rewrite::fuse_add_layernorm` writes: inputs `a`, `b`, scale and
+/// optional bias; outputs the normalization and, when it escapes, `a + b`.
+///
+/// The kernel reads the residual element for element, so it claims only two
+/// `f32` operands of one shape. A broadcast or shape-math `Add` runs as the
+/// graph wrote it.
+fn add_layernorm(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let (a, b) = (&node.inputs[0], &node.inputs[1]);
+    // the rule of `elementwise_binary`: small host operands are shape math
+    let small_host = env.host_resident_small(a, Env::SMALL_HOST_BYTES)
+        && env.host_resident_small(b, Env::SMALL_HOST_BYTES);
+    if env.dtype_of(a)? == FLOAT
+        && env.dtype_of(b)? == FLOAT
+        && env.shape_of(a)? == env.shape_of(b)?
+        && !small_host
+    {
+        return layernorm(env, node, Norm::AddCentered);
+    }
+    let out = node.outputs[0].as_str();
+    let escapes = node.outputs.get(1).filter(|o| !o.is_empty());
+    let temp = format!("{out}/sum");
+    let sum = escapes.map_or(temp.as_str(), String::as_str);
+    let mut add = lowered(node, "Add", &[a, b], &[sum]);
+    add.attrs.clear();
+    exec_dispatch(env, &add)?;
+    let mut norm = vec![sum];
+    norm.extend(node.inputs[2..].iter().map(String::as_str));
+    exec_dispatch(env, &lowered(node, "LayerNormalization", &norm, &[out]))?;
+    if escapes.is_none() {
+        env.release(&temp);
     }
     Ok(())
 }
@@ -5584,6 +7509,18 @@ fn group_query_attention<'values>(env: &mut Env<'_, 'values>, node: &NodeIr) -> 
 /// `Clip` (opset ≥6): bounds from attributes (opset 6) or scalar inputs
 /// (opset ≥11); a missing bound does not constrain that side.
 fn clip(env: &mut Env, node: &NodeIr) -> Result<()> {
+    if env.dtype_of(&node.inputs[0])? != FLOAT {
+        // integer Clip (SAM 3 clips its point labels): a few values, on host
+        let bound = |index: usize| -> Result<Option<i64>> {
+            match node.inputs.get(index) {
+                Some(name) if !name.is_empty() => Ok(env.host(name)?.to_i64()?.first().copied()),
+                _ => Ok(None),
+            }
+        };
+        let out = host_ops::clip_int(&env.host(&node.inputs[0])?, bound(1)?, bound(2)?)?;
+        env.set(&node.outputs[0], Tensor::Host(out));
+        return Ok(());
+    }
     let ctx = env.context();
     // the bound is a scalar: reading it host-side does not touch the GPU when it
     // is an initializer, and it is the only way to put it in the push constants
@@ -6312,6 +8249,12 @@ fn gemm(env: &mut Env, node: &NodeIr) -> Result<()> {
     let elem_count = (m * n).max(0) as usize;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
     if elem_count > 0 {
+        let selected = matrix_tactic(env, node, &[m, n], &["gemm64", "gemm16"])?;
+        let (label, source, tile) = if selected.as_deref() == Some("gemm16") {
+            ("Gemm16", crate::shaders::matrix::GEMM16, 16)
+        } else {
+            ("Gemm", GEMM, GEMM_TILE_SIZE)
+        };
         let flags =
             u32::from(trans_a) | (u32::from(trans_b) << 1) | (u32::from(c_name.is_some()) << 2);
         let mut push = Vec::with_capacity(GEMM_PUSH_BYTES as usize);
@@ -6325,18 +8268,14 @@ fn gemm(env: &mut Env, node: &NodeIr) -> Result<()> {
         }
         with_pipeline(
             env.cache(),
-            "Gemm",
-            || ctx.create_pipeline(&compile_wgsl(GEMM)?, GEMM_BINDINGS, GEMM_PUSH_BYTES),
+            label,
+            || ctx.create_pipeline(&compile_wgsl(source)?, GEMM_BINDINGS, GEMM_PUSH_BYTES),
             |pipe| {
                 ctx.stream_dispatch(
                     pipe,
                     &[a.buffer(), b.buffer(), c_buf, &out],
                     &push,
-                    [
-                        (n as u32).div_ceil(GEMM_TILE_SIZE),
-                        (m as u32).div_ceil(GEMM_TILE_SIZE),
-                        1,
-                    ],
+                    [(n as u32).div_ceil(tile), (m as u32).div_ceil(tile), 1],
                 )
             },
         )?;
@@ -6546,6 +8485,839 @@ fn gelu(env: &mut Env, node: &NodeIr) -> Result<()> {
     }
 }
 
+/// The five nodes of an exact GELU that `rewrite::fuse_decomposed_gelu`
+/// replaced, `Div(x, c1) → Erf → Add(c2) → Mul(x) → Mul(c3)` or, with
+/// `factor_first`, `… → Mul(c3) → Mul(x)`, in one pass with the same rounding
+/// (see `DECOMPOSED_GELU`).
+///
+/// The `Div` alone may run on host: `elementwise_binary` keeps two small host
+/// operands there. That case, and a non-f32 operand, replays the five steps
+/// rather than move the division to the GPU.
+fn decomposed_gelu(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let Some(gelu) = gelu_push(env, node)? else {
+        return decomposed_gelu_unfused(env, node);
+    };
+
+    let ctx = env.context();
+    let x = &node.inputs[0];
+    env.ensure_device(x)?;
+    let x = env.device(x)?;
+    let (shape, elem_count) = (x.shape.clone(), x.elem_count);
+    let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
+    if elem_count > 0 {
+        let mut push = (elem_count as u32).to_le_bytes().to_vec();
+        push.extend_from_slice(&gelu);
+        with_pipeline(
+            env.cache(),
+            "DecomposedGelu",
+            || {
+                let src = format!("{UNARY_HELPERS_ERF}{DECOMPOSED_GELU_FN}{DECOMPOSED_GELU}");
+                ctx.create_pipeline(
+                    &compile_wgsl(&src)?,
+                    DECOMPOSED_GELU_BINDINGS,
+                    DECOMPOSED_GELU_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[x.buffer(), &out],
+                    &push,
+                    [(elem_count as u32).div_ceil(256), 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// Whether the fused GELU scales `erf + c2` by `c3` before gating by `x`.
+fn gelu_factor_first(node: &NodeIr) -> bool {
+    node.attrs.get("factor_first").and_then(AttrValue::as_i64) == Some(1)
+}
+
+/// The push constants `DECOMPOSED_GELU_FN` reads after the shader's own —
+/// `divisor`, `offset`, `factor`, `factor_first` — or `None` when the GELU of
+/// `node` (inputs `x, c1, c2, c3`) must replay its five steps: a non-f32
+/// operand, a constant that is not one value, or an `x` and `c1` small and on
+/// host, where `elementwise_binary` keeps the `Div`.
+fn gelu_push(env: &Env, node: &NodeIr) -> Result<Option<Vec<u8>>> {
+    let [x, c1, c2, c3] = [0, 1, 2, 3].map(|i| node.inputs[i].as_str());
+    for name in [x, c1, c2, c3] {
+        if env.dtype_of(name)? != FLOAT {
+            return Ok(None);
+        }
+    }
+    if env.host_resident_small(x, Env::SMALL_HOST_BYTES)
+        && env.host_resident_small(c1, Env::SMALL_HOST_BYTES)
+    {
+        return Ok(None);
+    }
+    let mut push = Vec::with_capacity(16);
+    for name in [c1, c2, c3] {
+        match env.host(name)?.to_f32()?.as_slice() {
+            [only] => push.extend_from_slice(&only.to_le_bytes()),
+            _ => return Ok(None),
+        }
+    }
+    push.extend_from_slice(&u32::from(gelu_factor_first(node)).to_le_bytes());
+    Ok(Some(push))
+}
+
+/// `DynamicQuantizeLinear(DecomposedGelu(x))`, which
+/// `rewrite::fuse_gelu_quantize` made one node: the min/max and the quantize
+/// passes each compute the GELU from `x` again, with the same function as
+/// `DecomposedGelu`, so the f32 GELU is never stored and every byte matches
+/// the two nodes. What `DecomposedGelu` would replay, and an empty `x`, run as
+/// the two nodes.
+fn decomposed_gelu_quantize(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let gelu = gelu_push(env, node)?;
+    let x = &node.inputs[0];
+    if let Some(gelu) = gelu
+        && env.shape_of(x)?.iter().product::<i64>() > 0
+    {
+        env.ensure_device(x)?;
+        return quantize_on_device(env, x, &node.outputs, Some(&gelu));
+    }
+    let activation = format!("{}/gelu", node.outputs[0]);
+    let mut gelu = lowered(
+        node,
+        "DecomposedGelu",
+        &node.inputs.iter().map(String::as_str).collect::<Vec<_>>(),
+        &[&activation],
+    );
+    gelu.domain = crate::rewrite::REWRITE_DOMAIN.to_owned();
+    decomposed_gelu(env, &gelu)?;
+    let outputs: Vec<&str> = node.outputs.iter().map(String::as_str).collect();
+    let quantize = lowered(node, "DynamicQuantizeLinear", &[&activation], &outputs);
+    dynamic_quantize(env, &quantize)?;
+    env.release(&activation);
+    Ok(())
+}
+
+/// The five nodes `rewrite::fuse_decomposed_gelu` replaced, run as they were.
+fn decomposed_gelu_unfused(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let out = &node.outputs[0];
+    let [scaled, erf, shifted, product] =
+        ["scaled", "erf", "shifted", "product"].map(|step| format!("{out}/{step}"));
+    let i = &node.inputs;
+    // the operand the first product multiplies `erf + c2` by, then the last's
+    let (first, last) = if gelu_factor_first(node) {
+        (i[3].as_str(), i[0].as_str())
+    } else {
+        (i[0].as_str(), i[3].as_str())
+    };
+    let steps = [
+        ("Div", vec![i[0].as_str(), i[1].as_str()], scaled.as_str()),
+        ("Erf", vec![scaled.as_str()], erf.as_str()),
+        ("Add", vec![erf.as_str(), i[2].as_str()], shifted.as_str()),
+        ("Mul", vec![first, shifted.as_str()], product.as_str()),
+        ("Mul", vec![product.as_str(), last], out.as_str()),
+    ];
+    let mut previous: Option<&str> = None;
+    for (op, inputs, output) in steps {
+        exec_dispatch(env, &lowered(node, op, &inputs, &[output]))?;
+        if let Some(done) = previous {
+            env.release(done);
+        }
+        previous = Some(output);
+    }
+    Ok(())
+}
+
+/// The interleaved rotary embedding `rewrite::fuse_interleaved_rope`
+/// replaced, `x · cos + rot(x) · sin`, with the Transpose before it, the
+/// Transpose after it and the scale when the rewrite folded them, in one pass
+/// with the same roundings (see `glsl/interleaved_rope.comp`).
+///
+/// What the rewrite could not see without shapes is checked here: f32
+/// operands, `cos` and `sin` broadcasting as `[S, D]`, an even `D`. Anything
+/// else, and an input small enough that the original `Mul` would have run on
+/// host, replays the original steps instead.
+fn interleaved_rope(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let [x, cos, sin] = [0, 1, 2].map(|i| node.inputs[i].as_str());
+    let scale = node.inputs.get(3).map(String::as_str);
+    let flag = |name: &str| node.attrs.get(name).and_then(AttrValue::as_i64) == Some(1);
+    let (bshd, transpose) = (flag("bshd"), flag("transpose_output"));
+    let shape = env.shape_of(x)?;
+    let [b, s, h, d] = match (bshd, shape.as_slice()) {
+        (true, &[b, s, h, d]) | (false, &[b, h, s, d]) => [b, s, h, d],
+        _ => bail!(
+            "InterleavedRope: input of rank {} instead of 4",
+            shape.len()
+        ),
+    };
+    // the dynamo form's reshapes have constant shapes: they assumed this one
+    if let Some(assumed) = node.attrs.get("shape").and_then(AttrValue::as_ints)
+        && assumed != [b, h, s, d]
+    {
+        bail!(
+            "InterleavedRope: input [B, H, S, D] = {:?}, the graph's reshapes assume {assumed:?}",
+            [b, h, s, d]
+        );
+    }
+
+    let mut all_f32 = true;
+    for name in [x, cos, sin].into_iter().chain(scale) {
+        all_f32 &= env.dtype_of(name)? == FLOAT;
+    }
+    let mut tables = true;
+    for name in [cos, sin] {
+        let table = env.shape_of(name)?;
+        let (lead, last) = table.split_at(table.len().saturating_sub(2));
+        tables &= table.len() <= 4 && last == [s, d] && lead.iter().all(|&dim| dim == 1);
+    }
+    let n = b * h * s * d;
+    let factor = match scale {
+        Some(name) => match env.host(name)?.to_f32()?.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        },
+        None => Some(1.0),
+    };
+    let small_host = env.host_resident_small(x, Env::SMALL_HOST_BYTES);
+    let limits = env.context().compute_limits().max_workgroup_count;
+    let groups = interleaved_rope_groups((b * h) as usize, s as usize, d as usize, transpose)
+        .filter(|groups| groups.iter().zip(limits).all(|(&g, max)| g <= max));
+    let (Some(factor), true, true, false, 0, Ok(n32), Some(groups)) = (
+        factor,
+        all_f32,
+        tables,
+        small_host,
+        d % 2,
+        u32::try_from(n),
+        groups,
+    ) else {
+        return interleaved_rope_unfused(env, node, [b, h, s, d], bshd, transpose);
+    };
+
+    for name in [x, cos, sin] {
+        env.ensure_device(name)?;
+    }
+    let ctx = env.context();
+    let (xt, ct, st) = (env.device(x)?, env.device(cos)?, env.device(sin)?);
+    let out = ctx.create_storage_buffer((n.max(1) * 4) as u64)?;
+    if n > 0 {
+        let mut flags = 0;
+        for (on, bit) in [
+            (bshd, INTERLEAVED_ROPE_BSHD),
+            (transpose, INTERLEAVED_ROPE_TRANSPOSE),
+            (scale.is_some(), INTERLEAVED_ROPE_SCALE),
+        ] {
+            if on {
+                flags |= bit;
+            }
+        }
+        let mut push = Vec::with_capacity(INTERLEAVED_ROPE_PUSH_BYTES as usize);
+        for value in [n32, h as u32, s as u32, d as u32, flags] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        push.extend_from_slice(&factor.to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "InterleavedRope",
+            || {
+                ctx.create_pipeline(
+                    &interleaved_rope_spirv(),
+                    INTERLEAVED_ROPE_BINDINGS,
+                    INTERLEAVED_ROPE_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[xt.buffer(), ct.buffer(), st.buffer(), &out],
+                    &push,
+                    groups,
+                )
+            },
+        )?;
+    }
+    let shape = if transpose {
+        vec![b, h, d, s]
+    } else {
+        vec![b, h, s, d]
+    };
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count: n as usize,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `Mul(x, scale) → Add(·, bias) → Relu`, the node `rewrite::fuse_mul_add_relu`
+/// made, in one pass with the rounding of the three kernels
+/// (`glsl/mul_add_relu.comp`). Needs f32 operands, an `x` of rank ≥ 2 on the
+/// device and `scale`, `bias` one value or one per channel (axis 1); anything
+/// else replays the three steps.
+fn mul_add_relu(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let [x, scale, bias] = [0, 1, 2].map(|i| node.inputs[i].as_str());
+    let shape = env.shape_of(x)?;
+    let rank = shape.len();
+    let mut all_f32 = true;
+    for name in [x, scale, bias] {
+        all_f32 &= env.dtype_of(name)? == FLOAT;
+    }
+    let channels = shape.get(1).copied().unwrap_or(0);
+    let step = |name: &str| -> Result<Option<u32>> {
+        Ok(channel_step(&env.shape_of(name)?, channels, rank).map(|step| step.min(1)))
+    };
+    let (scale_step, bias_step) = (step(scale)?, step(bias)?);
+    let n: i64 = shape.iter().product();
+    let plane: i64 = shape.iter().skip(2).product();
+    let small_host = env.host_resident_small(x, Env::SMALL_HOST_BYTES);
+    // below 2^31 the shader's grid-stride index cannot wrap
+    let n32 = u32::try_from(n).ok().filter(|&n| n <= i32::MAX as u32);
+    let (true, Some(scale_step), Some(bias_step), false, true, Some(n32), Ok(plane32), Ok(c32)) = (
+        all_f32,
+        scale_step,
+        bias_step,
+        small_host,
+        rank >= 2,
+        n32,
+        u32::try_from(plane),
+        u32::try_from(channels),
+    ) else {
+        return mul_add_relu_unfused(env, node);
+    };
+
+    for name in [x, scale, bias] {
+        env.ensure_device(name)?;
+    }
+    let ctx = env.context();
+    let (xt, st, bt) = (env.device(x)?, env.device(scale)?, env.device(bias)?);
+    let out = ctx.create_storage_buffer((n.max(1) * 4) as u64)?;
+    if n > 0 {
+        let mut push = Vec::with_capacity(MUL_ADD_RELU_PUSH_BYTES as usize);
+        for value in [n32, plane32, c32, scale_step, bias_step] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        let groups = n32
+            .div_ceil(256)
+            .min(ctx.compute_limits().max_workgroup_count[0]);
+        with_pipeline(
+            env.cache(),
+            "MulAddRelu",
+            || {
+                ctx.create_pipeline(
+                    &mul_add_relu_spirv(),
+                    MUL_ADD_RELU_BINDINGS,
+                    MUL_ADD_RELU_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[xt.buffer(), st.buffer(), bt.buffer(), &out],
+                    &push,
+                    [groups, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count: n as usize,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// The three nodes `rewrite::fuse_mul_add_relu` replaced, run as they were.
+fn mul_add_relu_unfused(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let scaled = format!("{}/scaled", node.outputs[0]);
+    let shifted = format!("{}/shifted", node.outputs[0]);
+    let i = &node.inputs;
+    exec_dispatch(env, &lowered(node, "Mul", &[&i[0], &i[1]], &[&scaled]))?;
+    exec_dispatch(env, &lowered(node, "Add", &[&scaled, &i[2]], &[&shifted]))?;
+    env.release(&scaled);
+    exec_dispatch(
+        env,
+        &lowered(node, "Relu", &[&shifted], &[&node.outputs[0]]),
+    )?;
+    env.release(&shifted);
+    Ok(())
+}
+
+/// `numpy.packbits(x > 0, axis = -1)`, the node `rewrite::fuse_pack_positive_bits`
+/// made of `Reshape → Greater → Cast → Mul → ReduceSum → Cast`. Input 1 is the
+/// reshape target `[..., W/8, 8]`; the output is that shape without its last
+/// axis, as u8. On the GPU when `x` is there, else on host: both pack the
+/// flattened `x` eight at a time, which is what the reshape groups.
+fn pack_positive_bits(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let x = node.inputs[0].as_str();
+    ensure!(
+        env.dtype_of(x)? == FLOAT,
+        "PackPositiveBits: input of type {} instead of f32",
+        env.dtype_of(x)?
+    );
+    let target = env.host(&node.inputs[1])?.to_i64()?;
+    let grouped = resolve_reshape(&env.shape_of(x)?, &target)?;
+    let Some((&8, shape)) = grouped.split_last() else {
+        bail!("PackPositiveBits: last axis of {grouped:?} is not 8");
+    };
+    let shape = shape.to_vec();
+    let bytes = shape.iter().product::<i64>() as usize;
+
+    let on_device = env.on_device(x);
+    let Ok(bytes32) = u32::try_from(bytes) else {
+        bail!("PackPositiveBits: {bytes} output bytes exceed u32 indexing");
+    };
+    if !on_device {
+        let values = env.host(x)?.to_f32()?;
+        let data = values
+            .chunks_exact(8)
+            .map(|group| {
+                group
+                    .iter()
+                    .fold(0u8, |byte, &v| (byte << 1) | u8::from(v > 0.0))
+            })
+            .collect();
+        env.set(
+            &node.outputs[0],
+            Tensor::Host(HostTensor::new(UINT8, shape, data)),
+        );
+        return Ok(());
+    }
+
+    let ctx = env.context();
+    let xt = env.device(x)?;
+    let out = ctx.create_storage_buffer(device_storage_bytes(UINT8, bytes)?)?;
+    if bytes > 0 {
+        let words = bytes32.div_ceil(4);
+        let max_groups = ctx.compute_limits().max_workgroup_count[0];
+        let groups = words.div_ceil(256).min(max_groups);
+        with_pipeline(
+            env.cache(),
+            "PackPositiveBits",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(PACK_POSITIVE_BITS)?,
+                    PACK_POSITIVE_BITS_BINDINGS,
+                    PACK_POSITIVE_BITS_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[xt.buffer(), &out],
+                    &bytes32.to_le_bytes(),
+                    [groups, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: UINT8,
+            shape,
+            elem_count: bytes,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `Add(a, b) → Reshape → Transpose → Pad`, the node
+/// `rewrite::fuse_add_transpose_pad` writes: inputs `a`, `b`, the reshape
+/// target, the pads and the optional pad value, the permutation as attribute.
+/// One `ADD_TRANSPOSE_PAD` pass when both operands are f32 for the GPU, the
+/// reshape only merges axes, no pad is negative or falls on a merged axis, and
+/// at most four axes remain once unit axes are dropped and neighbours merged;
+/// otherwise the four original steps.
+fn add_transpose_pad(env: &mut Env, node: &NodeIr) -> Result<()> {
+    match add_transpose_pad_plan(env, node)? {
+        Some(plan) => add_transpose_pad_fused(env, node, plan),
+        None => add_transpose_pad_unfused(env, node),
+    }
+}
+
+/// One axis of the padded output as `ADD_TRANSPOSE_PAD` walks it.
+#[derive(Clone, Copy)]
+struct PaddedAxis {
+    extent: u32,
+    begin: u32,
+    interior: u32,
+    sa: u32,
+    sb: u32,
+}
+
+struct AddTransposePadPlan {
+    /// outer first, at most four
+    axes: Vec<PaddedAxis>,
+    shape: Vec<i64>,
+    n: u32,
+    value: f32,
+}
+
+fn add_transpose_pad_plan(env: &mut Env, node: &NodeIr) -> Result<Option<AddTransposePadPlan>> {
+    let (a, b) = (&node.inputs[0], &node.inputs[1]);
+    // the rule of `elementwise_binary`: small host operands are shape math
+    let small_host = env.host_resident_small(a, Env::SMALL_HOST_BYTES)
+        && env.host_resident_small(b, Env::SMALL_HOST_BYTES);
+    if env.dtype_of(a)? != FLOAT || env.dtype_of(b)? != FLOAT || small_host {
+        return Ok(None);
+    }
+    let bc = broadcast(&env.shape_of(a)?, &env.shape_of(b)?)?;
+    let sum = &bc.out_shape;
+    let reshaped = resolve_reshape(sum, &env.host(&node.inputs[2])?.to_i64()?)?;
+    let rank = reshaped.len();
+    let perm: Vec<usize> = match node.attrs.get("perm").and_then(AttrValue::as_ints) {
+        Some(perm) => perm.iter().map(|&p| p as usize).collect(),
+        None => (0..rank).rev().collect(),
+    };
+    let mut sorted = perm.clone();
+    sorted.sort_unstable();
+    let pads = env.host(&node.inputs[3])?.to_i64()?;
+    if !sorted.iter().copied().eq(0..rank)
+        || pads.len() != 2 * rank
+        || pads.iter().any(|&p| p < 0)
+        || sum.contains(&0)
+    {
+        return Ok(None);
+    }
+
+    // the axes of the sum each reshaped axis merges, unit axes left out
+    let mut groups: Vec<Vec<usize>> = Vec::with_capacity(rank);
+    let mut next = 0;
+    for &dim in &reshaped {
+        let (mut group, mut size) = (Vec::new(), 1);
+        while size < dim && next < sum.len() {
+            if sum[next] != 1 {
+                group.push(next);
+            }
+            size *= sum[next];
+            next += 1;
+        }
+        if size != dim {
+            return Ok(None);
+        }
+        groups.push(group);
+    }
+    if sum[next..].iter().any(|&d| d != 1) {
+        return Ok(None);
+    }
+
+    let shape: Vec<i64> = (0..rank)
+        .map(|k| reshaped[perm[k]] + pads[k] + pads[rank + k])
+        .collect();
+    let Ok(n) = u32::try_from(shape.iter().product::<i64>()) else {
+        return Ok(None);
+    };
+    let mut axes: Vec<PaddedAxis> = Vec::new();
+    for (k, &p) in perm.iter().enumerate() {
+        let (begin, extent) = (pads[k] as u32, shape[k] as u32);
+        match groups[p].as_slice() {
+            [] => axes.push(PaddedAxis {
+                extent,
+                begin,
+                interior: 1,
+                sa: 0,
+                sb: 0,
+            }),
+            [d] => axes.push(PaddedAxis {
+                extent,
+                begin,
+                interior: sum[*d] as u32,
+                sa: bc.a_strides[*d],
+                sb: bc.b_strides[*d],
+            }),
+            merged if extent as i64 == reshaped[p] => axes.extend(merged.iter().map(|&d| {
+                let size = sum[d] as u32;
+                PaddedAxis {
+                    extent: size,
+                    begin: 0,
+                    interior: size,
+                    sa: bc.a_strides[d],
+                    sb: bc.b_strides[d],
+                }
+            })),
+            _ => return Ok(None),
+        }
+    }
+    // neighbours both operands walk contiguously become one axis
+    let mut merged: Vec<PaddedAxis> = Vec::new();
+    for axis in axes.into_iter().filter(|axis| axis.extent > 1) {
+        let plain = |axis: &PaddedAxis| axis.begin == 0 && axis.extent == axis.interior;
+        match merged.last_mut() {
+            Some(outer)
+                if plain(outer)
+                    && plain(&axis)
+                    && axis.sa.checked_mul(axis.extent) == Some(outer.sa)
+                    && axis.sb.checked_mul(axis.extent) == Some(outer.sb) =>
+            {
+                outer.extent *= axis.extent;
+                outer.interior = outer.extent;
+                outer.sa = axis.sa;
+                outer.sb = axis.sb;
+            }
+            _ => merged.push(axis),
+        }
+    }
+    if merged.len() > 4 {
+        return Ok(None);
+    }
+    let value = match node.inputs.get(4).filter(|v| !v.is_empty()) {
+        Some(v) => *env.host(v)?.to_f32()?.first().unwrap_or(&0.0),
+        None => 0.0,
+    };
+    Ok(Some(AddTransposePadPlan {
+        axes: merged,
+        shape,
+        n,
+        value,
+    }))
+}
+
+fn add_transpose_pad_fused(env: &mut Env, node: &NodeIr, plan: AddTransposePadPlan) -> Result<()> {
+    let (a, b) = (&node.inputs[0], &node.inputs[1]);
+    env.ensure_device(a)?;
+    env.ensure_device(b)?;
+    let ctx = env.context();
+    let (ta, tb) = (env.device(a)?, env.device(b)?);
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, plan.n as usize)?)?;
+    let unit = PaddedAxis {
+        extent: 1,
+        begin: 0,
+        interior: 1,
+        sa: 0,
+        sb: 0,
+    };
+    let mut axes = vec![unit; 4 - plan.axes.len()];
+    axes.extend(plan.axes);
+    let mut push = Vec::with_capacity(ADD_TRANSPOSE_PAD_PUSH_BYTES as usize);
+    push.extend_from_slice(&plan.n.to_le_bytes());
+    push.extend_from_slice(&plan.value.to_le_bytes());
+    push.extend_from_slice(&[0; 8]);
+    let fields: [fn(&PaddedAxis) -> u32; 5] = [
+        |axis| axis.extent,
+        |axis| axis.begin,
+        |axis| axis.interior,
+        |axis| axis.sa,
+        |axis| axis.sb,
+    ];
+    for field in fields {
+        for axis in &axes {
+            push.extend_from_slice(&field(axis).to_le_bytes());
+        }
+    }
+    let max_groups = ctx.compute_limits().max_workgroup_count[0];
+    let groups = plan.n.div_ceil(256).min(max_groups);
+    with_pipeline(
+        env.cache(),
+        "AddTransposePad",
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(ADD_TRANSPOSE_PAD)?,
+                ADD_TRANSPOSE_PAD_BINDINGS,
+                ADD_TRANSPOSE_PAD_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[ta.buffer(), tb.buffer(), &out],
+                &push,
+                [groups, 1, 1],
+            )
+        },
+    )?;
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: plan.shape,
+            elem_count: plan.n as usize,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// The steps `rewrite::fuse_add_transpose_pad` replaced, run as the graph
+/// wrote them.
+fn add_transpose_pad_unfused(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let out = node.outputs[0].as_str();
+    let sum = format!("{out}/sum");
+    let reshaped = format!("{out}/reshaped");
+    let transposed = format!("{out}/transposed");
+    let i: Vec<&str> = node.inputs.iter().map(String::as_str).collect();
+    exec_dispatch(env, &lowered(node, "Add", &[i[0], i[1]], &[&sum]))?;
+    exec_dispatch(env, &lowered(node, "Reshape", &[&sum, i[2]], &[&reshaped]))?;
+    env.release(&sum);
+    exec_dispatch(
+        env,
+        &lowered(node, "Transpose", &[&reshaped], &[&transposed]),
+    )?;
+    env.release(&reshaped);
+    let mut pad = vec![transposed.as_str()];
+    pad.extend(&i[3..]);
+    exec_dispatch(env, &lowered(node, "Pad", &pad, &[out]))?;
+    env.release(&transposed);
+    Ok(())
+}
+
+/// The steps `rewrite::fuse_interleaved_rope` replaced, run as the graph wrote
+/// them. Squeeze and Unsqueeze are left out: they only rename a shape. `dims`
+/// is `[B, H, S, D]`.
+fn interleaved_rope_unfused(
+    env: &mut Env,
+    node: &NodeIr,
+    dims: [i64; 4],
+    bshd: bool,
+    transpose: bool,
+) -> Result<()> {
+    let [b, h, s, _] = dims;
+    let out = node.outputs[0].clone();
+    let name = |step: &str| format!("{out}/{step}");
+    let mut temps: Vec<String> = Vec::new();
+    for (step, values) in [
+        ("pairs_shape", vec![b, h, s, -1, 2]),
+        ("halves", vec![1, 1]),
+        ("rot_shape", vec![b, h, s, -1]),
+    ] {
+        let tensor = HostTensor::from_i64(vec![values.len() as i64], &values);
+        env.set(&name(step), Tensor::Host(tensor));
+        temps.push(name(step));
+    }
+    let run = |env: &mut Env,
+               op: &str,
+               inputs: &[&str],
+               outputs: &[&str],
+               attrs: Vec<(&str, AttrValue)>|
+     -> Result<()> {
+        let mut step = lowered(node, op, inputs, outputs);
+        step.attrs = attrs
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
+        exec_dispatch(env, &step)
+    };
+    let i = &node.inputs;
+    let t = if bshd {
+        let t = name("t");
+        let perm = AttrValue::Ints(vec![0, 2, 1, 3]);
+        run(env, "Transpose", &[&i[0]], &[&t], vec![("perm", perm)])?;
+        temps.push(t.clone());
+        t
+    } else {
+        i[0].clone()
+    };
+    let last_axis = || vec![("axis", AttrValue::Int(-1))];
+    let [
+        direct,
+        pairs,
+        even,
+        odd,
+        neg,
+        swapped,
+        rot,
+        rotated,
+        sum,
+        transposed,
+    ] = [
+        "direct",
+        "pairs",
+        "even",
+        "odd",
+        "neg",
+        "swapped",
+        "rot",
+        "rotated",
+        "sum",
+        "transposed",
+    ]
+    .map(name);
+    run(env, "Mul", &[&t, &i[1]], &[&direct], vec![])?;
+    run(
+        env,
+        "Reshape",
+        &[&t, &name("pairs_shape")],
+        &[&pairs],
+        vec![],
+    )?;
+    run(
+        env,
+        "Split",
+        &[&pairs, &name("halves")],
+        &[&even, &odd],
+        last_axis(),
+    )?;
+    run(env, "Neg", &[&odd], &[&neg], vec![])?;
+    run(env, "Concat", &[&neg, &even], &[&swapped], last_axis())?;
+    run(
+        env,
+        "Reshape",
+        &[&swapped, &name("rot_shape")],
+        &[&rot],
+        vec![],
+    )?;
+    run(env, "Mul", &[&rot, &i[2]], &[&rotated], vec![])?;
+    temps.extend([
+        direct.clone(),
+        pairs,
+        even,
+        odd,
+        neg,
+        swapped,
+        rot,
+        rotated.clone(),
+    ]);
+
+    // each remaining step writes the output when it is the last one
+    let scale = i.get(3);
+    let sum = if transpose || scale.is_some() {
+        sum
+    } else {
+        out.clone()
+    };
+    run(env, "Add", &[&direct, &rotated], &[&sum], vec![])?;
+    let mut value = sum;
+    if transpose {
+        let target = if scale.is_some() {
+            transposed
+        } else {
+            out.clone()
+        };
+        let perm = AttrValue::Ints(vec![0, 1, 3, 2]);
+        run(
+            env,
+            "Transpose",
+            &[&value],
+            &[&target],
+            vec![("perm", perm)],
+        )?;
+        temps.push(std::mem::replace(&mut value, target));
+    }
+    if let Some(scale) = scale {
+        run(env, "Mul", &[&value, scale], &[&out], vec![])?;
+        temps.push(value);
+    }
+    for temp in &temps {
+        env.release(temp);
+    }
+    Ok(())
+}
+
 /// Like [`unary`], but prepends to the source the helper functions used by
 /// the expression (WGSL lacks `erf`, for example).
 fn unary_with_helpers(
@@ -6589,4 +9361,45 @@ fn unary_with_helpers(
         }),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collapse_permutation;
+
+    #[test]
+    fn window_partition_collapses_to_rows() {
+        // [B, a, u, b, v, C] → [B, a, b, u, v, C]: B is dropped, (a) stays,
+        // u and b swap, (v, C) merge into rows
+        assert_eq!(
+            collapse_permutation(&[1, 3, 24, 3, 24, 1024], &[0, 1, 3, 2, 4, 5]),
+            (vec![3, 24, 3, 24 * 1024], vec![0, 2, 1, 3])
+        );
+    }
+
+    #[test]
+    fn adjacent_axes_merge_and_unit_axes_drop() {
+        assert_eq!(
+            collapse_permutation(&[2, 3, 4, 5], &[2, 3, 0, 1]),
+            (vec![6, 20], vec![1, 0])
+        );
+        assert_eq!(
+            collapse_permutation(&[1, 4, 1, 6], &[2, 3, 0, 1]),
+            (vec![4, 6], vec![1, 0])
+        );
+        assert_eq!(
+            collapse_permutation(&[2, 3, 4], &[2, 1, 0]),
+            (vec![2, 3, 4], vec![2, 1, 0])
+        );
+    }
+
+    #[test]
+    fn nothing_moves_collapses_to_one_axis_or_none() {
+        assert_eq!(collapse_permutation(&[3, 4], &[0, 1]), (vec![12], vec![0]));
+        assert_eq!(
+            collapse_permutation(&[1, 5, 1], &[2, 1, 0]),
+            (vec![5], vec![0])
+        );
+        assert_eq!(collapse_permutation(&[1, 1], &[1, 0]), (vec![], vec![]));
+    }
 }

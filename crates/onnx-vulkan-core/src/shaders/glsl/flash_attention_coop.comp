@@ -1,0 +1,312 @@
+// FlashAttention, softmax(Q·Kᵀ)·V, with both products on f16 cooperative
+// matrices and f32 accumulation.
+//
+// Same bindings, push constants and layouts as the WGSL kernel in
+// flash_attention.rs (queries [bh, m, D] with the scale applied, keys
+// transposed [bh, D, n], values [bh, n, DV] or [B, n, H, DV], output
+// [bh, m, DV] or [B, m, H, DV]), for D = DV = HEAD (32 or 64, a build
+// define). Not the same results: Q, K,
+// V and the probabilities are rounded to f16 before they are multiplied. The
+// products accumulate in f32, and the running maximum, the exponentials, the
+// denominator and the final division stay in f32. This is a declared
+// precision change, run only when the caller opts in.
+//
+// One workgroup is four subgroups of 32 and owns 64 query rows; each subgroup
+// owns 16 of them. Per tile of 64 keys:
+//
+// 1. The workgroup copies Kᵀ and V (f32 -> f16) to shared memory. Each
+//    thread loads its share of the next tile into registers before
+//    the current tile is multiplied, so the global latency overlaps compute.
+// 2. Each subgroup computes its 16 x 64 scores with 4 x 4 multiplies, Q held
+//    in registers as four 16 x 16 fragments, and stores them to its own
+//    shared rows.
+// 3. Two lanes per row, reading interleaved 16-byte quads of it, update the
+//    running maximum and denominator and write the f16 probabilities over the
+//    scores they read. The rescale factor of each row goes through a 16 x 16
+//    shared tile whose row r is that row's factor, loaded as an accumulator:
+//    two matrices of the same type share their element layout, so the
+//    element-wise product rescales every row of the output without knowing
+//    which lane holds which element.
+// 4. Output += P·V, another 4 x 4 multiplies.
+//
+// Rows past m are computed on zero queries and never stored; keys past n are
+// zero in shared memory and score -inf, so they are excluded from the maximum
+// and their probability is 0. Only a partial last tile tests the keys.
+//
+// Built with -DBIAS, binding 4 is added to the f32 scores before the softmax,
+// addressed as in the WGSL kernel (zero strides broadcast). With nan_to_zero,
+// a row whose denominator is not positive is stored as zeros.
+
+#version 450 core
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef HEAD
+#define HEAD 64
+#endif
+#define D HEAD
+#define DV HEAD
+#define TILE 16
+#define SUBGROUPS 4
+#define THREADS (SUBGROUPS * 32)
+// query rows per workgroup and keys per tile
+#define BR (SUBGROUPS * TILE)
+#define BC 64
+// f16 row pitch of the shared K, V and P tiles (rows of at most BC = 64
+// values): 16 bytes of padding, so that the rows a cooperative load reads
+// start in different banks
+#define HP (64 + 8)
+// f32 row pitch of a subgroup's scores, in words: 8 banks apart, so the
+// 16-byte reads of a quarter-warp (four rows, two lanes each, see QUADS) hit
+// all 32 banks
+#define SP (BC + 8)
+// quads of columns each lane reads from its row of scores: lane (r, h) owns
+// columns 8 i + 4 h .. 8 i + 4 h + 3, so the two lanes of a row interleave
+#define QUADS (BC / 8)
+#define NEG_MAX (-3.4028235e38)
+#define NEG_INF uintBitsToFloat(0xff800000u)
+// values of Kᵀ and of V each thread copies per tile
+#define PER_THREAD (BC * D / THREADS)
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float a[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float b[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; };
+#ifdef BIAS
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float bias[]; };
+#endif
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint v_heads;
+    uint out_heads;
+    uint nan_to_zero;
+    // bias addressing: slice bh reads from (bh / heads) * bias_outer +
+    // (bh % heads) * bias_head, query row r from there + r * bias_row
+    uint heads;
+    uint bias_outer;
+    uint bias_head;
+    uint bias_row;
+} pc;
+
+// Kᵀ of the tile, kt[k * HP + j]
+shared float16_t kt[D * HP];
+// values of the tile, vt[j * HP + c]; holds the queries, q[r * HP + k], before
+// the first tile (BR = BC rows)
+shared float16_t vt[BC * HP];
+// each subgroup's 16 rows of f32 scores [16 x BC]; then, over the same rows,
+// its f16 probabilities (two per word, the first BC / 2 words of a row) and its
+// row-factor tile [16 x 16] at word FACTOR of each row; at the end its f32
+// output rows [16 x DV]
+shared uvec4 ss[SUBGROUPS * TILE * SP / 4];
+#define FACTOR (BC / 2 + 16)
+
+#define FragA coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FragB coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+#define FragC coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ROW_MAJOR gl_CooperativeMatrixLayoutRowMajor
+
+// Loads this thread's share of the Kᵀ and V tile starting at key `key0`:
+// element i is kᵀ[e / BC][e % BC] and v[e / DV][e % DV] at e = i * THREADS +
+// lid, so consecutive threads read consecutive addresses. Keys past n are
+// zero.
+void load_tile(uint lid, uint key0, uint b_base, uint v_base, uint v_row,
+               out float kr[PER_THREAD], out float vr[PER_THREAD]) {
+    [[unroll]] for (uint i = 0; i < PER_THREAD; i++) {
+        const uint e = i * THREADS + lid;
+        const uint k = e / BC;
+        const uint j = e % BC;
+        kr[i] = key0 + j < pc.n ? b[b_base + k * pc.n + key0 + j] : 0.0;
+        const uint vj = e / DV;
+        const uint c = e % DV;
+        vr[i] = key0 + vj < pc.n ? v[v_base + (key0 + vj) * v_row + c] : 0.0;
+    }
+}
+
+// Writes `x` to row `row` of the subgroup's 16 x 16 factor tile (eight
+// columns per lane, two lanes per row) and loads the tile.
+FragC row_factor(uint ss_base, uint row, uint half_row, float x) {
+    subgroupBarrier();
+    const uint w = (ss_base + row * SP + FACTOR + half_row * 8) / 4;
+    ss[w] = uvec4(floatBitsToUint(x));
+    ss[w + 1] = uvec4(floatBitsToUint(x));
+    subgroupBarrier();
+    FragC f;
+    coopMatLoad(f, ss, (ss_base + FACTOR) / 4, SP / 4, ROW_MAJOR);
+    return f;
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint bh = gl_WorkGroupID.y;
+    const uint row0 = gl_WorkGroupID.x * BR;
+    const uint q_base = bh * pc.m * D;
+    const uint b_base = bh * D * pc.n;
+    // value row j of slice bh = (b, h) is v[((b * n + j) * v_heads + h) * DV ..]
+    const uint v_base = ((bh / pc.v_heads) * pc.n * pc.v_heads + bh % pc.v_heads) * DV;
+    const uint v_row = pc.v_heads * DV;
+    // the lane's row within its subgroup, and which half of the keys it reads
+    const uint r = lane >> 1;
+    const uint half_row = lane & 1u;
+    const uint ss_base = sg * TILE * SP;
+#ifdef BIAS
+    // rows past m read the last row's bias and store nothing
+    const uint bias_base = (bh / pc.heads) * pc.bias_outer + (bh % pc.heads) * pc.bias_head
+        + min(row0 + sg * TILE + r, pc.m - 1) * pc.bias_row;
+#endif
+
+    for (uint e = lid; e < BR * D; e += THREADS) {
+        const uint row = e / D;
+        float x = 0.0;
+        if (row0 + row < pc.m) {
+            x = a[q_base + (row0 + row) * D + e % D];
+        }
+        vt[row * HP + e % D] = float16_t(x);
+    }
+    barrier();
+    FragA q[D / TILE];
+    [[unroll]] for (uint c = 0; c < D / TILE; c++) {
+        coopMatLoad(q[c], vt, sg * TILE * HP + c * TILE, HP, ROW_MAJOR);
+    }
+    FragC acc[DV / TILE];
+    [[unroll]] for (uint c = 0; c < DV / TILE; c++) {
+        acc[c] = FragC(0.0);
+    }
+    float m_run = NEG_MAX;
+    float l_run = 0.0;
+
+    const uint tiles = (pc.n + BC - 1) / BC;
+    float kr[PER_THREAD];
+    float vr[PER_THREAD];
+    load_tile(lid, 0, b_base, v_base, v_row, kr, vr);
+    for (uint t = 0; t < tiles; t++) {
+        const uint key0 = t * BC;
+        // every subgroup has read its queries, or finished the previous tile
+        barrier();
+        [[unroll]] for (uint i = 0; i < PER_THREAD; i++) {
+            const uint e = i * THREADS + lid;
+            kt[(e / BC) * HP + e % BC] = float16_t(kr[i]);
+            vt[(e / DV) * HP + e % DV] = float16_t(vr[i]);
+        }
+        barrier();
+        if (t + 1 < tiles) {
+            load_tile(lid, key0 + BC, b_base, v_base, v_row, kr, vr);
+        }
+
+        [[unroll]] for (uint kb = 0; kb < BC / TILE; kb++) {
+            FragC s = FragC(0.0);
+            [[unroll]] for (uint c = 0; c < D / TILE; c++) {
+                FragB k;
+                coopMatLoad(k, kt, c * TILE * HP + kb * TILE, HP, ROW_MAJOR);
+                s = coopMatMulAdd(q[c], k, s);
+            }
+            coopMatStore(s, ss, (ss_base + kb * TILE) / 4, SP / 4, ROW_MAJOR);
+        }
+        subgroupBarrier();
+
+        // keys past n score -inf: excluded from the maximum (which starts
+        // at NEG_MAX), and their exponential is exactly 0. A whole tile of
+        // keys, the uniform common case, skips the per-key test.
+        vec4 sv[QUADS];
+        float tile_max = NEG_MAX;
+        if (key0 + BC <= pc.n) {
+            [[unroll]] for (uint i = 0; i < QUADS; i++) {
+                const uint j = 8 * i + 4 * half_row;
+                sv[i] = uintBitsToFloat(ss[(ss_base + r * SP + j) / 4]);
+                [[unroll]] for (uint e = 0; e < 4; e++) {
+#ifdef BIAS
+                    sv[i][e] += bias[bias_base + key0 + j + e];
+#endif
+                    tile_max = max(tile_max, sv[i][e]);
+                }
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < QUADS; i++) {
+                const uint j = 8 * i + 4 * half_row;
+                sv[i] = uintBitsToFloat(ss[(ss_base + r * SP + j) / 4]);
+                [[unroll]] for (uint e = 0; e < 4; e++) {
+                    if (key0 + j + e < pc.n) {
+#ifdef BIAS
+                        sv[i][e] += bias[bias_base + key0 + j + e];
+#endif
+                        tile_max = max(tile_max, sv[i][e]);
+                    } else {
+                        sv[i][e] = NEG_INF;
+                    }
+                }
+            }
+        }
+        tile_max = max(tile_max, subgroupShuffleXor(tile_max, 1));
+        // the probabilities overwrite the scores of both lanes of the row
+        subgroupBarrier();
+        const float m_new = max(m_run, tile_max);
+        const float alpha = exp(m_run - m_new);
+        float sum = 0.0;
+        [[unroll]] for (uint i = 0; i < QUADS; i++) {
+            const uint j = 8 * i + 4 * half_row;
+            vec4 p;
+            [[unroll]] for (uint e = 0; e < 4; e++) {
+                p[e] = exp(sv[i][e] - m_new);
+                sum += p[e];
+            }
+            // f16 columns j .. j + 3 are words j / 2 and j / 2 + 1: the low
+            // half of a 16-byte group for h = 0, the high half for h = 1
+            const uint w = (ss_base + r * SP + j / 2) / 4;
+            ss[w][2 * half_row] = packFloat2x16(f16vec2(p.xy));
+            ss[w][2 * half_row + 1] = packFloat2x16(f16vec2(p.zw));
+        }
+        sum += subgroupShuffleXor(sum, 1);
+        l_run = l_run * alpha + sum;
+        m_run = m_new;
+
+        const FragC scale = row_factor(ss_base, r, half_row, alpha);
+        [[unroll]] for (uint c = 0; c < DV / TILE; c++) {
+            [[unroll]] for (uint i = 0; i < acc[c].length(); i++) {
+                acc[c][i] *= scale[i];
+            }
+        }
+        [[unroll]] for (uint kb = 0; kb < BC / TILE; kb++) {
+            FragA p;
+            coopMatLoad(p, ss, (ss_base + kb * TILE / 2) / 4, SP / 4, ROW_MAJOR);
+            [[unroll]] for (uint c = 0; c < DV / TILE; c++) {
+                FragB val;
+                coopMatLoad(val, vt, kb * TILE * HP + c * TILE, HP, ROW_MAJOR);
+                acc[c] = coopMatMulAdd(p, val, acc[c]);
+            }
+        }
+    }
+
+    const FragC inv = row_factor(ss_base, r, half_row, 1.0 / l_run);
+    subgroupBarrier();
+    [[unroll]] for (uint c = 0; c < DV / TILE; c++) {
+        [[unroll]] for (uint i = 0; i < acc[c].length(); i++) {
+            acc[c][i] *= inv[i];
+        }
+        coopMatStore(acc[c], ss, (ss_base + c * TILE) / 4, SP / 4, ROW_MAJOR);
+    }
+    subgroupBarrier();
+    const uint row = row0 + sg * TILE + r;
+    if (row < pc.m) {
+        const uint heads = pc.out_heads;
+        const uint ob = ((bh / heads) * pc.m * heads + row * heads + bh % heads) * DV;
+        // `!(l_run > 0)` is also true for a NaN denominator
+        const bool clear = pc.nan_to_zero != 0 && !(l_run > 0.0);
+        [[unroll]] for (uint i = 0; i < DV / 2; i += 4) {
+            const uint c = half_row * (DV / 2) + i;
+            const vec4 x = clear ? vec4(0.0) : uintBitsToFloat(ss[(ss_base + r * SP + c) / 4]);
+            [[unroll]] for (uint e = 0; e < 4; e++) {
+                o[ob + c + e] = x[e];
+            }
+        }
+    }
+}

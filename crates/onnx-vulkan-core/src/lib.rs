@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod comparison;
+pub mod compatibility;
 pub mod device;
 mod error;
 pub mod execution;
@@ -21,6 +22,9 @@ pub mod tuning;
 pub mod work;
 
 pub use cache::{KernelCache, PackedWeightInfo, PipelineKey};
+pub use compatibility::{
+    COMPATIBILITY_SCHEMA_VERSION, CompatibilityIssue, CompatibilityReport, compatibility_report,
+};
 pub use device::{DeviceBuffer, DeviceTensor, Tensor};
 pub use error::{Error, Result};
 pub use execution::{ExecutionEnv, device_storage_bytes};

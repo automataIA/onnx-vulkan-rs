@@ -203,3 +203,32 @@ fn the_shape_of_an_op_ignores_what_a_step_changes() {
     ctx.destroy_buffer(buf_out);
     ctx.destroy_pipeline(pipeline);
 }
+
+/// A fill sets only its region, after what the stream wrote before it, and a
+/// replay issues it again: the region is cleared once more over new bytes.
+#[test]
+fn a_fill_clears_its_region_and_replays() {
+    let ctx = VkContext::new().expect("Vulkan context");
+    let n = 64usize;
+    let buf = ctx.create_storage_buffer((n * 4) as u64).unwrap();
+    let ones = vec![1u32; n];
+    ctx.stream_upload(&buf, as_bytes(&ones)).unwrap();
+    ctx.begin_capture();
+    ctx.stream_fill(&buf, 16, 32, 0xdead_beef).unwrap();
+    let plan = ctx.end_capture().expect("a capture was open");
+    assert!(matches!(plan[..], [StreamOp::Fill(_)]));
+    let filled: Vec<u32> = from_bytes(&ctx.stream_download(&buf, n * 4).unwrap());
+    let expected = |i: usize| if (4..12).contains(&i) { 0xdead_beef } else { 1 };
+    for (i, value) in filled.iter().enumerate() {
+        assert_eq!(*value, expected(i), "filled at {i}");
+    }
+
+    ctx.stream_upload(&buf, as_bytes(&ones)).unwrap();
+    ctx.replay(&plan).unwrap();
+    let replayed: Vec<u32> = from_bytes(&ctx.stream_download(&buf, n * 4).unwrap());
+    for (i, value) in replayed.iter().enumerate() {
+        assert_eq!(*value, expected(i), "replayed at {i}");
+    }
+    assert!(ctx.stream_fill(&buf, 2, 4, 0).is_err(), "unaligned offset");
+    ctx.destroy_buffer(buf);
+}

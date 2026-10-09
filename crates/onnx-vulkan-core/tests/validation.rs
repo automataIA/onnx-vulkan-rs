@@ -11,7 +11,9 @@
 //!
 //! Neither check needs a GPU: both decide on the IR.
 
-use onnx_vulkan_core::{MAX_OPSET, NodeIr, is_implemented_node, unsupported_dtype};
+use onnx_vulkan_core::{
+    GraphIr, MAX_OPSET, NodeIr, compatibility_report, is_implemented_node, unsupported_dtype,
+};
 use std::collections::HashMap;
 
 fn node(op: &str, opset: i32, domain: &str, inputs: &[&str]) -> NodeIr {
@@ -160,4 +162,32 @@ fn ops_that_are_not_float_only_are_untouched() {
             "{op} must not be constrained to f32"
         );
     }
+}
+
+#[test]
+fn compatibility_report_lists_each_node_issue_without_gpu() {
+    let unsupported = node("DefinitelyNotAnOperator", 12, "", &["x"]);
+    let dtype_mismatch = node("Softmax", 12, "", &["x"]);
+    let graph = GraphIr {
+        nodes: vec![unsupported, dtype_mismatch],
+        value_types: [("x".to_string(), 2)].into(),
+        ..GraphIr::default()
+    };
+    let report = compatibility_report(&graph);
+    assert!(!report.compatible);
+    assert_eq!(report.total_nodes, 2);
+    assert_eq!(report.supported_nodes, 0);
+    assert_eq!(report.issues.len(), 2);
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.node == "DefinitelyNotAnOperator_0" && issue.kind == "execution")
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.node == "Softmax_0" && issue.kind == "dtype")
+    );
 }

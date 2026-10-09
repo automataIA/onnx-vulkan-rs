@@ -147,12 +147,21 @@ unsafe fn output_shape(
         Kind::Squeeze => {
             let axes = unsafe { axes_from_attr_or_input(kernel, ctx_ptr, in_shape.len())? };
             match axes {
-                Some(ax) => in_shape
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !ax.contains(&(*i as i64)))
-                    .map(|(_, &d)| d)
-                    .collect(),
+                Some(ax) => {
+                    // negative axes count from the end (SAM 3's detector
+                    // squeezes with [-1] 31 times)
+                    let rank = in_shape.len() as i64;
+                    let ax: Vec<i64> = ax
+                        .iter()
+                        .map(|&a| if a < 0 { a + rank } else { a })
+                        .collect();
+                    in_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !ax.contains(&(*i as i64)))
+                        .map(|(_, &d)| d)
+                        .collect()
+                }
                 None => in_shape.iter().copied().filter(|&d| d != 1).collect(),
             }
         }

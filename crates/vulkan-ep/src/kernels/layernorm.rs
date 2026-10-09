@@ -92,9 +92,21 @@ unsafe fn compute_impl(
     push.extend_from_slice(&(c as u32).to_le_bytes());
     push.extend_from_slice(&kernel.epsilon.to_le_bytes());
     push.extend_from_slice(&has_bias.to_le_bytes());
+    // plain LayerNormalization: not simplified, no skip, no sum output; the
+    // unused skip and sum bindings rebind x and out, which the flags ignore
+    for flag in [0u32; 3] {
+        push.extend_from_slice(&flag.to_le_bytes());
+    }
     ctx.stream_dispatch_slices(
         &kernel.pipeline,
-        &[x.slice(), scale.slice(), bias_slice, out.slice()],
+        &[
+            x.slice(),
+            scale.slice(),
+            bias_slice,
+            out.slice(),
+            x.slice(),
+            out.slice(),
+        ],
         &push,
         [rows as u32, 1, 1],
     )?;

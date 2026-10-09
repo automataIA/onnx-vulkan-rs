@@ -1,0 +1,170 @@
+// FlashAttention on workgroup-scope cooperative matrices
+// (VK_NV_cooperative_matrix2): the same bindings, push constants, layouts and
+// precision as glsl/flash_attention_coop.comp, but the softmax stays in the
+// matrices. Row maxima and sums are row reductions, the exponentials are
+// per-element operations, and the probabilities become the A operand of P·V by
+// a conversion, so nothing goes through shared memory by hand.
+//
+// One workgroup of 128 threads owns BR = 64 query rows; tiles of BC = 64
+// keys. Q, Kᵀ and V are loaded from f32 into accumulators (out-of-range
+// elements read 0) and converted to f16 operands. Keys past n score -inf in a
+// partial last tile. Rows past m are computed on zero queries and their stores
+// are discarded by the tensor layout.
+
+#version 450 core
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef HEAD
+#define HEAD 64
+#endif
+#define D HEAD
+#define DV HEAD
+#define BR 64
+#define BC 64
+#define NEG_MAX (-3.4028235e38)
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float a[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float b[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; };
+#ifdef BIAS
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float bias[]; };
+#endif
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint v_heads;
+    uint out_heads;
+    uint nan_to_zero;
+    uint heads;
+    uint bias_outer;
+    uint bias_head;
+    uint bias_row;
+} pc;
+
+#define ACC(R, C) coopmat<float, gl_ScopeWorkgroup, R, C, gl_MatrixUseAccumulator>
+#define OPA(R, C) coopmat<float16_t, gl_ScopeWorkgroup, R, C, gl_MatrixUseA>
+#define OPB(R, C) coopmat<float16_t, gl_ScopeWorkgroup, R, C, gl_MatrixUseB>
+#define CLAMP gl_CooperativeMatrixClampModeConstantNV
+
+float max_op(const in float x, const in float y) { return max(x, y); }
+float add_op(const in float x, const in float y) { return x + y; }
+float smear_op(const in float x, const in float y) { return x; }
+
+float exp_op(const in uint row, const in uint col, const in float x) { return exp(x); }
+
+float max_with(const in uint row, const in uint col, const in float x, const in float y) {
+    return max(x, y);
+}
+
+// keys at or past `valid` (the keys left in a partial tile) score -inf
+float clear_keys(const in uint row, const in uint col, const in float x, const in uint valid) {
+    return col < valid ? x : NEG_INF;
+}
+
+#ifdef BIAS
+uint bias_base;
+float add_bias(const in uint row, const in uint col, const in float x, const in uint row0, const in uint key0) {
+    // rows past m read the last row's bias and store nothing; keys past n are
+    // cleared afterwards
+    const uint key = min(key0 + col, pc.n - 1);
+    return x + bias[bias_base + min(row0 + row, pc.m - 1) * pc.bias_row + key];
+}
+#endif
+
+// 1 / l, or 0 for a row whose denominator is not positive under nan_to_zero
+float inverse(const in uint row, const in uint col, const in float l) {
+    if (pc.nan_to_zero != 0 && !(l > 0.0)) {
+        return 0.0;
+    }
+    return 1.0 / l;
+}
+
+void main() {
+    const uint bh = gl_WorkGroupID.y;
+    const uint row0 = gl_WorkGroupID.x * BR;
+    const uint q_base = bh * pc.m * D;
+    const uint b_base = bh * D * pc.n;
+    const uint v_base = ((bh / pc.v_heads) * pc.n * pc.v_heads + bh % pc.v_heads) * DV;
+    const uint heads = pc.out_heads;
+    const uint o_base = ((bh / heads) * pc.m * heads + bh % heads) * DV;
+#ifdef BIAS
+    bias_base = (bh / pc.heads) * pc.bias_outer + (bh % pc.heads) * pc.bias_head;
+#endif
+
+    tensorLayoutNV<2, CLAMP> q_layout = createTensorLayoutNV(2, CLAMP);
+    q_layout = setTensorLayoutDimensionNV(q_layout, pc.m, D);
+    tensorLayoutNV<2, CLAMP> k_layout = createTensorLayoutNV(2, CLAMP);
+    k_layout = setTensorLayoutDimensionNV(k_layout, D, pc.n);
+    tensorLayoutNV<2, CLAMP> v_layout = createTensorLayoutNV(2, CLAMP);
+    v_layout = setTensorLayoutDimensionNV(v_layout, pc.n, DV);
+    v_layout = setTensorLayoutStrideNV(v_layout, pc.v_heads * DV, 1);
+    tensorLayoutNV<2, CLAMP> o_layout = createTensorLayoutNV(2, CLAMP);
+    o_layout = setTensorLayoutDimensionNV(o_layout, pc.m, DV);
+    o_layout = setTensorLayoutStrideNV(o_layout, heads * DV, 1);
+
+    ACC(BR, D) q32;
+    coopMatLoadTensorNV(q32, a, q_base, sliceTensorLayoutNV(q_layout, row0, BR, 0, D));
+    const OPA(BR, D) q = OPA(BR, D)(q32);
+
+    ACC(BR, DV) acc = ACC(BR, DV)(0.0);
+    ACC(BR, BC) m_run = ACC(BR, BC)(NEG_MAX);
+    ACC(BR, BC) l_run = ACC(BR, BC)(0.0);
+
+    // Software pipelining: a tile's V and the next tile's Kᵀ are requested
+    // before the work that does not need them, so their latency overlaps the
+    // products and the softmax.
+    const uint tiles = (pc.n + BC - 1) / BC;
+    ACC(D, BC) k32;
+    coopMatLoadTensorNV(k32, b, b_base, sliceTensorLayoutNV(k_layout, 0, D, 0, BC));
+    [[dont_unroll]] for (uint t = 0; t < tiles; t++) {
+        const uint key0 = t * BC;
+        ACC(BC, DV) v32;
+        coopMatLoadTensorNV(v32, v, v_base, sliceTensorLayoutNV(v_layout, key0, BC, 0, DV));
+        ACC(BR, BC) s = coopMatMulAdd(q, OPB(D, BC)(k32), ACC(BR, BC)(0.0));
+        // past the last tile the clamped load reads zeros, never used
+        coopMatLoadTensorNV(k32, b, b_base, sliceTensorLayoutNV(k_layout, 0, D, key0 + BC, BC));
+#ifdef BIAS
+        coopMatPerElementNV(s, s, add_bias, row0, key0);
+#endif
+        if (key0 + BC > pc.n) {
+            coopMatPerElementNV(s, s, clear_keys, pc.n - key0);
+        }
+
+        ACC(BR, BC) tile_max;
+        coopMatReduceNV(tile_max, s, gl_CooperativeMatrixReduceRowNV, max_op);
+        ACC(BR, BC) m_new;
+        coopMatPerElementNV(m_new, tile_max, max_with, m_run);
+        ACC(BR, BC) p;
+        coopMatPerElementNV(p, s - m_new, exp_op);
+        ACC(BR, BC) alpha;
+        coopMatPerElementNV(alpha, m_run - m_new, exp_op);
+        m_run = m_new;
+
+        // row sums on the tensor cores: every column of P·1 is the sum
+        const OPA(BR, BC) p16 = OPA(BR, BC)(p);
+        l_run = coopMatMulAdd(p16, OPB(BC, BC)(1.0), alpha * l_run);
+
+        ACC(BR, DV) scale;
+        coopMatReduceNV(scale, alpha, gl_CooperativeMatrixReduceRowNV, smear_op);
+        acc = acc * scale;
+
+        acc = coopMatMulAdd(p16, OPB(BC, DV)(v32), acc);
+    }
+
+    ACC(BR, DV) l_wide;
+    coopMatReduceNV(l_wide, l_run, gl_CooperativeMatrixReduceRowNV, smear_op);
+    ACC(BR, DV) inv;
+    coopMatPerElementNV(inv, l_wide, inverse);
+    acc = acc * inv;
+    coopMatStoreTensorNV(acc, o, o_base, sliceTensorLayoutNV(o_layout, row0, BR, 0, DV));
+}

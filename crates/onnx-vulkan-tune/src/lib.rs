@@ -187,7 +187,29 @@ pub struct InventoryWorkload {
     pub node: String,
     pub workload: Workload,
     pub implementation_digest: String,
-    pub runner: ConvRunnerGeometry,
+    pub runner: RunnerGeometry,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum RunnerGeometry {
+    Conv(ConvRunnerGeometry),
+    Matrix(MatrixRunnerGeometry),
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MatrixRunnerGeometry {
+    pub family: String,
+    pub op: String,
+    pub m: u64,
+    pub k: u64,
+    pub n: u64,
+    pub trans_a: bool,
+    pub trans_b: bool,
+    pub alpha_bits: u32,
+    pub beta_bits: u32,
+    pub c_rows: u64,
+    pub c_cols: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,11 +217,21 @@ pub struct ConvRunnerGeometry {
     pub family: String,
     pub c_in: u64,
     pub c_out: u64,
-    pub kernel: u64,
+    pub group: u64,
+    pub kernel_h: u64,
+    pub kernel_w: u64,
     pub h_in: u64,
+    pub w_in: u64,
     pub h_out: u64,
-    pub stride: u64,
-    pub pad: u64,
+    pub w_out: u64,
+    pub stride_h: u64,
+    pub stride_w: u64,
+    pub pad_top: u64,
+    pub pad_bottom: u64,
+    pub pad_left: u64,
+    pub pad_right: u64,
+    pub dilation_h: u64,
+    pub dilation_w: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -207,6 +239,46 @@ pub struct InventorySkip {
     pub node: String,
     pub op: String,
     pub reason: String,
+}
+
+/// GPU-free compatibility result used by `onnx-vulkan-tune model-check`.
+///
+/// `compatible` describes execution compatibility. Shape information is
+/// reported as a tuning issue when it is incomplete, but it does not make a
+/// model incompatible: the interpreter resolves dynamic dimensions from the
+/// tensors supplied at execution time.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ModelCheckReport {
+    pub schema_version: u32,
+    pub compatible: bool,
+    pub issues: Vec<ModelCheckIssue>,
+    pub execution: ExecutionCoverage,
+    pub tuning: TuningCoverage,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ModelCheckIssue {
+    pub node: String,
+    pub op: String,
+    pub kind: String,
+    pub reason: String,
+    /// Whether the issue makes the model incompatible. `shape` issues do not:
+    /// they limit tuning, and the runtime resolves the shape from the tensors.
+    pub blocking: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ExecutionCoverage {
+    pub total_nodes: usize,
+    pub supported_nodes: usize,
+    pub unsupported_nodes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TuningCoverage {
+    pub inventory_workloads: usize,
+    pub tunable_workloads: usize,
+    pub untunable_nodes: usize,
 }
 
 /// Device-specific reconstruction manifest for a model execution plan.
@@ -1563,10 +1635,12 @@ pub fn sha256_file(path: &Path) -> Result<String, ArtifactError> {
     Ok(encoded)
 }
 
-/// Builds the exact, GPU-free workload inventory for the first model-level
-/// tuning slice. Only static/profile-resolved, group-1, square 2D fp32 Conv is
-/// executable by the current generic family runner; every other node is
-/// retained as an explicit skip instead of being silently ignored.
+/// Builds the exact, GPU-free workload inventory for the vision tuning slice.
+/// Static/profile-resolved rank-4 fp32 Conv with batch one,
+/// `auto_pad=NOTSET`, and symmetric 2D padding is executable by the direct
+/// family runner, including rectangular and grouped/depthwise shapes. Rank-2
+/// fp32 MatMul (M > 1) and Gemm use the matrix runner. Other
+/// nodes remain explicit skips instead of being silently ignored.
 pub fn inventory_model(
     path: &Path,
     symbol_values: BTreeMap<String, u64>,
@@ -1630,6 +1704,99 @@ pub fn inventory_model(
             op: node.op.clone(),
             reason,
         };
+        if matches!(node.op.as_str(), "MatMul" | "Gemm")
+            && (node.domain.is_empty() || node.domain == "ai.onnx")
+        {
+            let result = (|| -> Result<InventoryWorkload, String> {
+                let inputs = node
+                    .inputs
+                    .iter()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| resolve_tensor(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let outputs = node
+                    .outputs
+                    .iter()
+                    .map(|name| resolve_tensor(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if inputs.len() < 2
+                    || inputs.len() > 3
+                    || outputs.len() != 1
+                    || inputs.iter().chain(&outputs).any(|t| t.dtype != 1)
+                    || inputs[0].dims.len() != 2
+                    || inputs[1].dims.len() != 2
+                {
+                    return Err("matrix runner requires rank-2 fp32 A/B and fp32 output".into());
+                }
+                let flag = |key| node.attrs.get(key).and_then(AttrValue::as_i64).unwrap_or(0) != 0;
+                let gemm = node.op == "Gemm";
+                let (trans_a, trans_b) = (gemm && flag("transA"), gemm && flag("transB"));
+                let a = &inputs[0].dims;
+                let b = &inputs[1].dims;
+                let (m, k) = if trans_a { (a[1], a[0]) } else { (a[0], a[1]) };
+                let (kb, n) = if trans_b { (b[1], b[0]) } else { (b[0], b[1]) };
+                if k != kb || outputs[0].dims != [m, n] || (!gemm && (m == 1 || inputs.len() != 2))
+                {
+                    return Err("matrix geometry mismatch or GEMV route not yet tunable".into());
+                }
+                if [m, k, n].iter().any(|v| *v > u32::MAX as u64) {
+                    return Err("matrix dimensions exceed dispatch ABI".into());
+                }
+                let (c_rows, c_cols) = match inputs.get(2).map(|c| c.dims.as_slice()) {
+                    None => (0, 0),
+                    Some([]) => (1, 1),
+                    Some([cols]) => (1, *cols),
+                    Some([rows, cols]) => (*rows, *cols),
+                    _ => return Err("unsupported Gemm bias rank".into()),
+                };
+                if c_rows != 0 && !((c_rows == 1 || c_rows == m) && (c_cols == 1 || c_cols == n)) {
+                    return Err("Gemm bias is not broadcastable".into());
+                }
+                let scalar = |key| {
+                    node.attrs
+                        .get(key)
+                        .and_then(AttrValue::as_f32)
+                        .unwrap_or(1.0)
+                };
+                let (alpha, beta) = (scalar("alpha"), scalar("beta"));
+                if !alpha.is_finite() || !beta.is_finite() {
+                    return Err("nonfinite Gemm coefficient".into());
+                }
+                Ok(InventoryWorkload {
+                    node: node_name.clone(),
+                    workload: Workload {
+                        domain: node.domain.clone(),
+                        op: node.op.clone(),
+                        inputs,
+                        outputs,
+                        attributes_digest: encode_bytes(
+                            &onnx_vulkan_core::tuning::attributes_digest(node),
+                        ),
+                    },
+                    implementation_digest: encode_bytes(
+                        onnx_vulkan_core::shaders::matrix::implementation_fingerprint().as_bytes(),
+                    ),
+                    runner: RunnerGeometry::Matrix(MatrixRunnerGeometry {
+                        family: "matrix-f32".into(),
+                        op: node.op.clone(),
+                        m,
+                        k,
+                        n,
+                        trans_a,
+                        trans_b,
+                        alpha_bits: alpha.to_bits(),
+                        beta_bits: beta.to_bits(),
+                        c_rows,
+                        c_cols,
+                    }),
+                })
+            })();
+            match result {
+                Ok(item) => workloads.push(item),
+                Err(reason) => skipped.push(skip(reason)),
+            }
+            continue;
+        }
         if node.op != "Conv" || !(node.domain.is_empty() || node.domain == "ai.onnx") {
             skipped.push(skip("no model-level family runner".into()));
             continue;
@@ -1639,12 +1806,6 @@ pub fn inventory_model(
             .get("group")
             .and_then(AttrValue::as_i64)
             .unwrap_or(1);
-        if group != 1 {
-            skipped.push(skip(format!(
-                "Conv group={group}; v1 runner requires group=1"
-            )));
-            continue;
-        }
         let inputs = match node
             .inputs
             .iter()
@@ -1683,23 +1844,17 @@ pub fn inventory_model(
             skipped.push(skip("v1 runner supports only fp32 Conv tensors".into()));
             continue;
         }
-        let (x, weight, output) = (&inputs[0].dims, &inputs[1].dims, &outputs[0].dims);
+        let (x, weight, output) = (
+            inputs[0].dims.clone(),
+            inputs[1].dims.clone(),
+            outputs[0].dims.clone(),
+        );
         if x.len() != 4 || weight.len() != 4 || output.len() != 4 {
             skipped.push(skip("v1 runner requires rank-4 NCHW Conv".into()));
             continue;
         }
         if x[0] != 1 || output[0] != 1 {
             skipped.push(skip("v1 runner requires batch=1".into()));
-            continue;
-        }
-        if x[2] != x[3] || output[2] != output[3] || weight[2] != weight[3] {
-            skipped.push(skip(
-                "v1 runner requires square spatial and kernel dimensions".into(),
-            ));
-            continue;
-        }
-        if weight[0] != output[1] || weight[1] != x[1] {
-            skipped.push(skip("Conv channel dimensions are inconsistent".into()));
             continue;
         }
         let ints = |name: &str, default: Vec<i64>| {
@@ -1717,14 +1872,14 @@ pub fn inventory_model(
             .and_then(AttrValue::as_str)
             .unwrap_or("NOTSET");
         if strides.len() != 2
-            || strides[0] != strides[1]
             || pads.len() != 4
-            || !pads.iter().all(|pad| *pad == pads[0])
-            || dilations != [1, 1]
+            || dilations.len() != 2
             || auto_pad != "NOTSET"
+            || pads[0] != pads[2]
+            || pads[1] != pads[3]
         {
             skipped.push(skip(
-                "v1 runner requires equal strides, symmetric equal pads, dilation=1, auto_pad=NOTSET"
+                "Conv runner requires 2D strides, symmetric padding, dilation, and auto_pad=NOTSET"
                     .into(),
             ));
             continue;
@@ -1735,25 +1890,61 @@ pub fn inventory_model(
                 .filter(|value| *value > 0)
                 .ok_or_else(|| format!("{name} must be positive"))
         };
-        let stride = match positive("stride", strides[0]) {
+        let group = match positive("group", group) {
             Ok(value) => value,
             Err(reason) => {
                 skipped.push(skip(reason));
                 continue;
             }
         };
-        let pad = match u64::try_from(pads[0]) {
+        if x[1] % group != 0
+            || output[1] % group != 0
+            || weight[0] != output[1]
+            || weight[1] != x[1] / group
+        {
+            skipped.push(skip(
+                "Conv channel dimensions are inconsistent with group".into(),
+            ));
+            continue;
+        }
+        let strides = match strides
+            .iter()
+            .enumerate()
+            .map(|(index, value)| positive(&format!("stride_{index}"), *value))
+            .collect::<Result<Vec<_>, _>>()
+        {
             Ok(value) => value,
-            Err(_) => {
-                skipped.push(skip("pad must be non-negative".into()));
+            Err(reason) => {
+                skipped.push(skip(reason));
                 continue;
             }
         };
-        let c_in = x[1];
-        let c_out = output[1];
-        let kernel = weight[2];
-        let h_in = x[2];
-        let h_out = output[2];
+        let pads = match pads
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                u64::try_from(*value).map_err(|_| format!("pad_{index} must be non-negative"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(value) => value,
+            Err(reason) => {
+                skipped.push(skip(reason));
+                continue;
+            }
+        };
+        let dilations = match dilations
+            .iter()
+            .enumerate()
+            .map(|(index, value)| positive(&format!("dilation_{index}"), *value))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(value) => value,
+            Err(reason) => {
+                skipped.push(skip(reason));
+                continue;
+            }
+        };
         workloads.push(InventoryWorkload {
             node: node_name,
             workload: Workload {
@@ -1766,16 +1957,26 @@ pub fn inventory_model(
             implementation_digest: encode_bytes(
                 onnx_vulkan_core::shaders::conv::implementation_fingerprint().as_bytes(),
             ),
-            runner: ConvRunnerGeometry {
+            runner: RunnerGeometry::Conv(ConvRunnerGeometry {
                 family: "conv-f32".into(),
-                c_in,
-                c_out,
-                kernel,
-                h_in,
-                h_out,
-                stride,
-                pad,
-            },
+                c_in: x[1],
+                c_out: output[1],
+                group,
+                kernel_h: weight[2],
+                kernel_w: weight[3],
+                h_in: x[2],
+                w_in: x[3],
+                h_out: output[2],
+                w_out: output[3],
+                stride_h: strides[0],
+                stride_w: strides[1],
+                pad_top: pads[0],
+                pad_bottom: pads[2],
+                pad_left: pads[1],
+                pad_right: pads[3],
+                dilation_h: dilations[0],
+                dilation_w: dilations[1],
+            }),
         });
     }
     workloads.sort_unstable();
@@ -1790,6 +1991,113 @@ pub fn inventory_model(
         model_digest,
         workloads,
         skipped,
+    })
+}
+
+/// Produces the complete GPU-free compatibility report for a model.
+///
+/// The execution issues come from the same checks used by
+/// [`onnx_vulkan_core::Executor`]. The inventory is then built with the same
+/// symbol values so tuning coverage cannot silently drift from the model
+/// checker. Incomplete static shapes are retained as `shape` issues while
+/// leaving `compatible` true; they are a limitation of model-level tuning,
+/// not of runtime execution.
+pub fn model_check(
+    path: &Path,
+    symbol_values: BTreeMap<String, u64>,
+) -> Result<ModelCheckReport, ArtifactError> {
+    use std::collections::BTreeSet;
+
+    let mut model = onnx_vulkan_frontend::load(path).map_err(|error| {
+        ArtifactError::Invalid(format!("load model {}: {error}", path.display()))
+    })?;
+    onnx_vulkan_core::prepare_graph(&mut model.graph);
+    let execution = onnx_vulkan_core::compatibility_report(&model.graph);
+    let mut issues = execution
+        .issues
+        .iter()
+        .map(|issue| ModelCheckIssue {
+            node: issue.node.clone(),
+            op: issue.op.clone(),
+            kind: issue.kind.clone(),
+            reason: issue.reason.clone(),
+            blocking: true,
+        })
+        .collect::<Vec<_>>();
+
+    // Shape inference is deliberately partial. Report every unresolved value
+    // on the node that reads or writes it, but do not turn it into an
+    // execution failure. A supplied --dim resolves symbolic dimensions for
+    // this report and for the subsequent inventory pass.
+    let mut reported_shapes = BTreeSet::new();
+    for (index, node) in model.graph.nodes.iter().enumerate() {
+        let node_name = if node.name.is_empty() {
+            format!("{}#{index}", node.op)
+        } else {
+            node.name.clone()
+        };
+        for value_name in node.inputs.iter().chain(&node.outputs) {
+            if value_name.is_empty()
+                || !reported_shapes.insert((node_name.clone(), value_name.clone()))
+            {
+                continue;
+            }
+            let reason = match model.types.get(value_name) {
+                None => Some(format!(
+                    "shape/type inference has no value `{value_name}`; runtime resolves it from concrete tensors"
+                )),
+                Some(value) => match &value.shape {
+                    None => Some(format!(
+                        "shape of `{value_name}` is unresolved; runtime resolves it from concrete tensors"
+                    )),
+                    Some(shape) => {
+                        let unresolved = shape.iter().find_map(|dimension| match dimension {
+                            onnx_vulkan_frontend::Dim::Fixed(_) => None,
+                            onnx_vulkan_frontend::Dim::Unknown => {
+                                Some("an unnamed dimension".to_owned())
+                            }
+                            onnx_vulkan_frontend::Dim::Symbol(symbol)
+                                if !symbol_values.contains_key(symbol) =>
+                            {
+                                Some(format!("symbolic dimension `{symbol}` has no --dim value"))
+                            }
+                            onnx_vulkan_frontend::Dim::Symbol(_) => None,
+                        });
+                        unresolved.map(|detail| {
+                            format!(
+                                "shape of `{value_name}` is unresolved ({detail}); runtime resolves it from concrete tensors"
+                            )
+                        })
+                    }
+                },
+            };
+            if let Some(reason) = reason {
+                issues.push(ModelCheckIssue {
+                    node: node_name.clone(),
+                    op: node.op.clone(),
+                    kind: "shape".into(),
+                    reason,
+                    blocking: false,
+                });
+            }
+        }
+    }
+
+    let inventory = inventory_model(path, symbol_values)?;
+    Ok(ModelCheckReport {
+        schema_version: SCHEMA_VERSION,
+        compatible: execution.compatible,
+        issues,
+        execution: ExecutionCoverage {
+            total_nodes: execution.total_nodes,
+            supported_nodes: execution.supported_nodes,
+            unsupported_nodes: execution.total_nodes - execution.supported_nodes,
+        },
+        tuning: TuningCoverage {
+            inventory_workloads: inventory.workloads.len() + inventory.skipped.len(),
+            tunable_workloads: inventory.workloads.len(),
+            untunable_nodes: inventory.skipped.len(),
+        },
     })
 }
 

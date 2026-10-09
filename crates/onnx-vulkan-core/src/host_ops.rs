@@ -7,7 +7,9 @@
 //! implement ONNX semantics for the ops subset handled by the interpreter.
 //! runs host-side.
 
-use crate::{ElementType, Error, Result, broadcast, elem_size, element_count, storage_len};
+use crate::{
+    Broadcast, ElementType, Error, Result, broadcast, elem_size, element_count, storage_len,
+};
 
 macro_rules! bail {
     ($($argument:tt)*) => {
@@ -144,6 +146,10 @@ pub fn cast(x: &HostTensor, to: i32) -> Result<HostTensor> {
         BOOL => {
             let v = x.to_i64()?;
             HostTensor::new(BOOL, shape, v.iter().map(|&e| (e != 0) as u8).collect())
+        }
+        UINT8 => {
+            let v = x.to_i64()?;
+            HostTensor::new(UINT8, shape, v.iter().map(|&e| e as u8).collect())
         }
         d => bail!("host Cast: target dtype {d} not supported"),
     })
@@ -350,6 +356,45 @@ fn bc_offset(out_strides: &[u32], strides: &[u32], i: usize) -> usize {
     off
 }
 
+/// Calls `f(a_offset, b_offset)` for every output element in order: a run
+/// along the innermost axis, then the outer offsets step like an odometer,
+/// where [`bc_offset`] divides once per axis per element. SAM 3's detector
+/// broadcasts three attention-mask `And`s to 340k elements per prompt: 3.5 ms
+/// of host time with the divisions, while the GPU waited.
+fn bc_walk(bc: &Broadcast, mut f: impl FnMut(usize, usize)) {
+    let n: usize = bc.out_shape.iter().product::<i64>().max(0) as usize;
+    let Some((&inner, outer)) = bc.out_shape.split_last() else {
+        // a scalar: one element at offset 0 in both operands
+        f(0, 0);
+        return;
+    };
+    let inner = inner as usize;
+    if inner == 0 {
+        return;
+    }
+    let rank = outer.len();
+    let (ia, ib) = (bc.a_strides[rank] as usize, bc.b_strides[rank] as usize);
+    let (mut index, mut a, mut b) = (vec![0i64; rank], 0usize, 0usize);
+    for _ in 0..n / inner {
+        for j in 0..inner {
+            f(a + j * ia, b + j * ib);
+        }
+        for axis in (0..rank).rev() {
+            let (sa, sb) = (bc.a_strides[axis] as usize, bc.b_strides[axis] as usize);
+            index[axis] += 1;
+            a += sa;
+            b += sb;
+            if index[axis] < outer[axis] {
+                break;
+            }
+            let dim = outer[axis] as usize;
+            index[axis] = 0;
+            a -= sa * dim;
+            b -= sb * dim;
+        }
+    }
+}
+
 /// Elementwise comparison/logic → bool, with ONNX broadcasting (Equal/Less/And).
 #[derive(Clone, Copy)]
 pub enum CmpOp {
@@ -357,40 +402,41 @@ pub enum CmpOp {
     Less,
     LessOrEqual,
     Greater,
+    GreaterOrEqual,
     And,
 }
 
 pub fn compare(a: &HostTensor, b: &HostTensor, op: CmpOp) -> Result<HostTensor> {
     let bc = broadcast(&a.shape, &b.shape)?;
     let n: usize = bc.out_shape.iter().product::<i64>().max(0) as usize;
-    let mut out = vec![0u8; n];
+    let mut out = Vec::with_capacity(n);
     let use_int = is_int(a.dtype) && is_int(b.dtype);
     if use_int {
         let (av, bv) = (a.to_i64()?, b.to_i64()?);
-        for (i, o) in out.iter_mut().enumerate() {
-            let x = av[bc_offset(&bc.out_strides, &bc.a_strides, i)];
-            let y = bv[bc_offset(&bc.out_strides, &bc.b_strides, i)];
-            *o = match op {
+        bc_walk(&bc, |ia, ib| {
+            let (x, y) = (av[ia], bv[ib]);
+            out.push(match op {
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
                 CmpOp::LessOrEqual => x <= y,
                 CmpOp::Greater => x > y,
+                CmpOp::GreaterOrEqual => x >= y,
                 CmpOp::And => x != 0 && y != 0,
-            } as u8;
-        }
+            } as u8);
+        });
     } else {
         let (av, bv) = (a.to_f32()?, b.to_f32()?);
-        for (i, o) in out.iter_mut().enumerate() {
-            let x = av[bc_offset(&bc.out_strides, &bc.a_strides, i)];
-            let y = bv[bc_offset(&bc.out_strides, &bc.b_strides, i)];
-            *o = match op {
+        bc_walk(&bc, |ia, ib| {
+            let (x, y) = (av[ia], bv[ib]);
+            out.push(match op {
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
                 CmpOp::LessOrEqual => x <= y,
                 CmpOp::Greater => x > y,
+                CmpOp::GreaterOrEqual => x >= y,
                 CmpOp::And => x != 0.0 && y != 0.0,
-            } as u8;
-        }
+            } as u8);
+        });
     }
     Ok(HostTensor::new(BOOL, bc.out_shape, out))
 }
@@ -852,6 +898,120 @@ pub fn gather_nd(data: &HostTensor, indices: &HostTensor) -> Result<HostTensor> 
     Ok(HostTensor::new(data.dtype, out_shape, out))
 }
 
+/// `OneHot`: a new axis of size `depth` at `axis`, holding `values[1]` where
+/// the index points and `values[0]` elsewhere. Negative indices count from the
+/// end; indices outside `[-depth, depth)` give a row of `values[0]` (ONNX).
+pub fn one_hot(
+    indices: &HostTensor,
+    depth: &HostTensor,
+    values: &HostTensor,
+    axis: i64,
+) -> Result<HostTensor> {
+    indices.validate()?;
+    values.validate()?;
+    // to_i64 truncates a float depth or index, as the ONNX reference does
+    let depth = depth.to_i64()?;
+    ensure!(depth.len() == 1, "OneHot: depth must have one element");
+    let depth = depth[0];
+    ensure!(depth > 0, "OneHot: depth {depth} must be positive");
+    ensure!(
+        values.elem_count() == 2,
+        "OneHot: values must have two elements, got {}",
+        values.elem_count()
+    );
+    let es = elem_size(values.dtype);
+    ensure!(es > 0, "OneHot: dtype {} with unknown size", values.dtype);
+    let rank = indices.shape.len() as i64 + 1;
+    let ax = if axis < 0 { axis + rank } else { axis };
+    ensure!(
+        (0..rank).contains(&ax),
+        "OneHot: axis {axis} out of range (output rank {rank})"
+    );
+    let ax = ax as usize;
+    let outer: usize = indices.shape[..ax].iter().product::<i64>().max(1) as usize;
+    let inner: usize = indices.shape[ax..].iter().product::<i64>().max(1) as usize;
+    let idx = indices.to_i64()?;
+    let (off, on) = (&values.data[..es], &values.data[es..2 * es]);
+    let mut out_shape = indices.shape.clone();
+    out_shape.insert(ax, depth);
+    let n = idx.len() * depth as usize;
+    let mut out = Vec::with_capacity(n * es);
+    for o in 0..outer {
+        for d in 0..depth {
+            for i in 0..inner {
+                let mut k = idx[o * inner + i];
+                if k < 0 {
+                    k += depth;
+                }
+                out.extend_from_slice(if k == d { on } else { off });
+            }
+        }
+    }
+    Ok(HostTensor::new(values.dtype, out_shape, out))
+}
+
+/// `MatMulInteger` with per-tensor zero points: `A [.., M, K] × B [K, N]` →
+/// i32, `(a - a_zp) · (b - b_zp)`. u8 and i8 operands alike (`to_i64` keeps
+/// the sign of i8).
+pub fn matmul_integer(
+    a: &HostTensor,
+    b: &HostTensor,
+    a_zp: &HostTensor,
+    b_zp: &HostTensor,
+) -> Result<HostTensor> {
+    ensure!(
+        a.shape.len() >= 2,
+        "MatMulInteger: A rank {} < 2",
+        a.shape.len()
+    );
+    ensure!(
+        b.shape.len() == 2,
+        "MatMulInteger: B rank {} != 2",
+        b.shape.len()
+    );
+    let k = *a.shape.last().unwrap() as usize;
+    let (bk, n) = (b.shape[0] as usize, b.shape[1] as usize);
+    ensure!(bk == k, "MatMulInteger: K mismatch (A {k}, B {bk})");
+    let (av, bv) = (a.to_i64()?, b.to_i64()?);
+    let (azp, bzp) = (a_zp.to_i64()?, b_zp.to_i64()?);
+    ensure!(
+        azp.len() == 1 && bzp.len() == 1,
+        "MatMulInteger: only per-tensor zero points"
+    );
+    let m = av.len() / k.max(1);
+    let mut out = Vec::with_capacity(m * n);
+    for row in 0..m {
+        for col in 0..n {
+            let sum: i64 = (0..k)
+                .map(|i| (av[row * k + i] - azp[0]) * (bv[i * n + col] - bzp[0]))
+                .sum();
+            out.push(
+                i32::try_from(sum)
+                    .map_err(|_| Error::InvalidTensor("MatMulInteger: i32 overflow".into()))?,
+            );
+        }
+    }
+    let mut shape = a.shape[..a.shape.len() - 1].to_vec();
+    shape.push(n as i64);
+    let data = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Ok(HostTensor::new(INT32, shape, data))
+}
+
+/// Integer `Clip` (int64/int32): the dtype is kept; a missing bound does not
+/// constrain that side.
+pub fn clip_int(x: &HostTensor, lo: Option<i64>, hi: Option<i64>) -> Result<HostTensor> {
+    let values = x
+        .to_i64()?
+        .into_iter()
+        .map(|v| v.max(lo.unwrap_or(i64::MIN)).min(hi.unwrap_or(i64::MAX)));
+    let data = match x.dtype {
+        INT64 => values.flat_map(i64::to_le_bytes).collect(),
+        INT32 => values.flat_map(|v| (v as i32).to_le_bytes()).collect(),
+        d => bail!("Clip: integer dtype {d} not supported"),
+    };
+    Ok(HostTensor::new(x.dtype, x.shape.clone(), data))
+}
+
 /// IEEE-754 NaN classification used by ONNX `IsNaN`.
 pub fn is_nan(input: &HostTensor) -> Result<HostTensor> {
     ensure!(
@@ -1159,6 +1319,32 @@ mod tests {
 
         assert_eq!(result.shape, vec![2, 2]);
         assert_eq!(result.to_i64().expect("tensor int64"), vec![11, 22, 13, 24]);
+    }
+
+    #[test]
+    fn bc_walk_visits_the_offsets_bc_offset_computes() {
+        for (a, b) in [
+            (vec![1, 1, 7, 1], vec![1, 1, 1, 5]),
+            (vec![3, 1, 4], vec![2, 1]),
+            (vec![2, 3], vec![2, 3]),
+            (vec![], vec![4]),
+            (vec![], vec![]),
+            (vec![2, 0, 3], vec![1, 3]),
+        ] {
+            let bc = broadcast(&a, &b).unwrap();
+            let mut got = Vec::new();
+            bc_walk(&bc, |ia, ib| got.push((ia, ib)));
+            let n = bc.out_shape.iter().product::<i64>() as usize;
+            let want: Vec<_> = (0..n)
+                .map(|i| {
+                    (
+                        bc_offset(&bc.out_strides, &bc.a_strides, i),
+                        bc_offset(&bc.out_strides, &bc.b_strides, i),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{a:?} vs {b:?}");
+        }
     }
 
     #[test]

@@ -350,8 +350,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..runs {
         let ran = Instant::now();
         let run = session.run(inputs.iter().map(|(n, t)| (n.as_str(), t.clone())))?;
-        for info in session.outputs() {
-            let tensor = run.get(&info.name)?;
+        let output_names: Vec<&str> = session
+            .outputs()
+            .iter()
+            .map(|info| info.name.as_str())
+            .collect();
+        let outputs = run.get_many(&output_names)?;
+        for (info, tensor) in session.outputs().iter().zip(outputs) {
             let sum: f64 = tensor.to_f32()?.iter().map(|v| *v as f64).sum();
             if i + 1 == runs {
                 println!(

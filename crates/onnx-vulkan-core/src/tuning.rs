@@ -299,6 +299,19 @@ pub fn attributes_digest(node: &NodeIr) -> [u8; 32] {
     if node.op == "Conv" && (node.domain.is_empty() || node.domain == "ai.onnx") {
         return conv_attributes_digest(node);
     }
+    if node.op == "Gemm" && (node.domain.is_empty() || node.domain == "ai.onnx") {
+        // ORT materializes schema defaults; the ONNX frontend preserves omissions.
+        let mut normalized = node.attrs.clone();
+        for (name, default) in [
+            ("transA", AttrValue::Int(0)),
+            ("transB", AttrValue::Int(0)),
+            ("alpha", AttrValue::Float(1.0)),
+            ("beta", AttrValue::Float(1.0)),
+        ] {
+            normalized.entry(name.into()).or_insert(default);
+        }
+        return canonical_attributes_digest(&normalized);
+    }
     canonical_attributes_digest(&node.attrs)
 }
 
@@ -926,6 +939,29 @@ mod tests {
         assert_eq!(attributes_digest(&left), attributes_digest(&right));
         left.attrs.insert("group".into(), AttrValue::Int(2));
         assert_ne!(attributes_digest(&left), attributes_digest(&right));
+    }
+
+    #[test]
+    fn gemm_attribute_digest_normalizes_ort_materialized_defaults() {
+        let compact = NodeIr {
+            op: "Gemm".into(),
+            domain: String::new(),
+            opset: 21,
+            name: String::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            attrs: HashMap::new(),
+        };
+        let mut explicit = compact.clone();
+        explicit.attrs = HashMap::from([
+            ("transA".into(), AttrValue::Int(0)),
+            ("transB".into(), AttrValue::Int(0)),
+            ("alpha".into(), AttrValue::Float(1.0)),
+            ("beta".into(), AttrValue::Float(1.0)),
+        ]);
+        assert_eq!(attributes_digest(&compact), attributes_digest(&explicit));
+        explicit.attrs.insert("transB".into(), AttrValue::Int(1));
+        assert_ne!(attributes_digest(&compact), attributes_digest(&explicit));
     }
 
     #[test]

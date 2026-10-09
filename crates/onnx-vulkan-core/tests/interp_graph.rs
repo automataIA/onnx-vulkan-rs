@@ -91,3 +91,41 @@ fn runs_a_synthetic_graph_without_ort() {
     );
     env.finish();
 }
+
+/// `Identity` copies a device tensor (after `Relu`) and a host tensor (the
+/// output of `Shape`) unchanged. `onnxscript`'s optimizer leaves it in place of
+/// no-op slices, so a node the runtime refused made optimized RF-DETR
+/// incompatible.
+#[test]
+fn identity_copies_device_and_host_tensors() {
+    let context = VkContext::new().expect("Vulkan context");
+    let x = [1.0f32, -2.0, 3.0, -4.0, 5.0, 6.0];
+    let ir = GraphIr {
+        nodes: vec![
+            node("Relu", &["x"], &["act"]),
+            node("Identity", &["act"], &["out"]),
+            node("Shape", &["x"], &["x_shape"]),
+            node("Identity", &["x_shape"], &["shape_out"]),
+        ],
+        inputs: vec!["x".to_string()],
+        outputs: vec!["out".to_string(), "shape_out".to_string()],
+        ..Default::default()
+    };
+    assert!(ir.nodes.iter().all(onnx_vulkan_core::is_implemented_node));
+
+    let cache = KernelCache::new(&context);
+    let mut env = ExecutionEnv::new(&cache, &ir.initializers);
+    env.set("x", Tensor::Host(HostTensor::from_f32(vec![2, 3], &x)));
+    execute(&ir, &mut env).expect("graph execution");
+
+    assert!(env.on_device("out"), "a device input stays on the device");
+    let out = env.host("out").expect("output on host");
+    assert_eq!(out.shape, vec![2, 3]);
+    assert_eq!(
+        out.to_f32().expect("output f32"),
+        x.iter().map(|v| v.max(0.0)).collect::<Vec<_>>()
+    );
+    let shape = env.host("shape_out").expect("host shape");
+    assert_eq!(shape.to_i64().expect("i64"), vec![2, 3]);
+    env.finish();
+}

@@ -11,8 +11,10 @@
 //! `VkContext` for as long as it lives, and each run borrows the executor for
 //! as long as its outputs are read.
 
+use crate::host_ops::FLOAT;
 use crate::{
-    ExecutionEnv, GraphIr, HostTensor, KernelCache, Result, Tensor, execute, is_implemented_node,
+    CompatibilityReport, DeviceTensor, ExecutionEnv, GraphIr, HostTensor, KernelCache, Result,
+    Tensor, compatibility_report, execute,
 };
 use std::sync::Arc;
 use vk_compute::{GpuBuffer, VkContext};
@@ -22,13 +24,45 @@ use vk_compute::{GpuBuffer, VkContext};
 /// every Vulkan allocation remain in [`Executor::with_tuning`].
 pub fn prepare_graph(ir: &mut GraphIr) {
     let fused = crate::rewrite::fuse_layernorm(ir);
+    let attention = crate::rewrite::fuse_attention(ir);
+    let epilogues = crate::rewrite::fuse_matmul_integer_epilogue(ir);
+    let conv_epilogues = crate::rewrite::fuse_conv_integer_epilogue(ir);
+    let gelus = crate::rewrite::fuse_decomposed_gelu(ir);
+    let quantized_gelus = crate::rewrite::fuse_gelu_quantize(ir);
+    let ropes = crate::rewrite::fuse_interleaved_rope(ir);
+    let packed = crate::rewrite::fuse_pack_positive_bits(ir);
+    let biases = crate::rewrite::fuse_add_transpose_pad(ir);
     let folded = crate::rewrite::fold_constants(ir);
-    if fused > 0 || folded > 0 {
+    let affines = crate::rewrite::fuse_mul_add_relu(ir);
+    let residuals = crate::rewrite::fuse_add_layernorm(ir);
+    if fused > 0
+        || attention > 0
+        || epilogues > 0
+        || conv_epilogues > 0
+        || gelus > 0
+        || quantized_gelus > 0
+        || ropes > 0
+        || packed > 0
+        || biases > 0
+        || folded > 0
+        || affines > 0
+        || residuals > 0
+    {
         let pruned = crate::rewrite::prune_dead_nodes(ir);
         let released = crate::rewrite::prune_dead_initializers(ir);
         log::info!(
             "rewrite: {fused} decomposed LayerNormalization fused, \
-             {folded} constant nodes folded, {pruned} orphaned nodes pruned, \
+             {attention} MatMul-Softmax-MatMul attentions fused, \
+             {epilogues} MatMulInteger-Cast-Mul-Add epilogues fused, \
+             {conv_epilogues} ConvInteger-Cast-Mul-Add epilogues fused, \
+             {gelus} Div-Erf-Add-Mul-Mul GELUs fused, \
+             {quantized_gelus} of them fused with their DynamicQuantizeLinear, \
+             {ropes} interleaved rotary embeddings fused, \
+             {packed} sign-bit packings fused, \
+             {biases} Add-Reshape-Transpose-Pad fused, \
+             {folded} constant nodes folded, \
+             {affines} Mul-Add-Relu fused, \
+             {residuals} Add-LayerNormalization fused, {pruned} orphaned nodes pruned, \
              {:.1} MB of initializers released, {} nodes left",
             released as f64 / 1e6,
             ir.nodes.len()
@@ -66,18 +100,24 @@ impl<'context> Executor<'context> {
         // Load-time rewrites live here and not in each host, so the standalone
         // path and the ORT plugin cannot end up running different graphs.
         prepare_graph(&mut ir);
-        // Every unsupported node, not the first: a caller deciding whether this
-        // engine can run their model needs the whole list, and discovering it
-        // one recompile at a time is not a report.
-        let unsupported: Vec<&crate::NodeIr> = ir
-            .nodes
+        let compatibility = compatibility_report(&ir);
+        // Keep the established grouped diagnostics while sourcing every
+        // refusal from the same GPU-free report exposed to tooling.
+        if compatibility
+            .issues
             .iter()
-            .filter(|n| !is_implemented_node(n))
-            .collect();
-        if !unsupported.is_empty() {
+            .any(|issue| issue.kind == "execution")
+        {
+            let unsupported = compatibility
+                .issues
+                .iter()
+                .filter(|issue| issue.kind == "execution")
+                .collect::<Vec<_>>();
             let mut by_op: std::collections::BTreeMap<&str, (usize, &str)> = Default::default();
             for node in &unsupported {
-                let entry = by_op.entry(&node.op).or_insert((0, node.name.as_str()));
+                let entry = by_op
+                    .entry(node.op.as_str())
+                    .or_insert((0, node.node.as_str()));
                 entry.0 += 1;
             }
             let detail = by_op
@@ -96,11 +136,15 @@ impl<'context> Executor<'context> {
         // every offender, at load time — and a distinct message, because the op
         // *is* implemented and it is this node's parameters that are not.
         let mut reasons: std::collections::BTreeMap<String, (usize, &str)> = Default::default();
-        for node in &ir.nodes {
-            if let Some(reason) = crate::interp::unsupported_quantization(node, &ir.initializers) {
-                let entry = reasons.entry(reason).or_insert((0, node.name.as_str()));
-                entry.0 += 1;
-            }
+        for issue in compatibility
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == "quantization")
+        {
+            let entry = reasons
+                .entry(issue.reason.clone())
+                .or_insert((0, issue.node.as_str()));
+            entry.0 += 1;
         }
         if !reasons.is_empty() {
             let total: usize = reasons.values().map(|(count, _)| count).sum();
@@ -120,11 +164,15 @@ impl<'context> Executor<'context> {
         // was claimed by the float kernel and answered with reinterpreted
         // bytes. Same rule again — every offender, grouped, at load time.
         let mut wrong_types: std::collections::BTreeMap<String, (usize, &str)> = Default::default();
-        for node in &ir.nodes {
-            if let Some(reason) = crate::interp::unsupported_dtype(node, &ir.value_types) {
-                let entry = wrong_types.entry(reason).or_insert((0, node.name.as_str()));
-                entry.0 += 1;
-            }
+        for issue in compatibility
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == "dtype")
+        {
+            let entry = wrong_types
+                .entry(issue.reason.clone())
+                .or_insert((0, issue.node.as_str()));
+            entry.0 += 1;
         }
         if !wrong_types.is_empty() {
             let total: usize = wrong_types.values().map(|(count, _)| count).sum();
@@ -142,6 +190,12 @@ impl<'context> Executor<'context> {
             cache: KernelCache::with_tuning(context, tuning),
             ir,
         })
+    }
+
+    /// Runs the same GPU-free checks used during construction, after applying
+    /// the executor's load-time rewrites.
+    pub fn compatibility(&self) -> CompatibilityReport {
+        compatibility_report(&self.ir)
     }
 
     pub fn graph(&self) -> &GraphIr {
@@ -192,13 +246,16 @@ impl<'context> Executor<'context> {
             env.retain_buffers();
             self.context().reset_pool_order();
         }
-        for (name, tensor) in inputs {
-            env.set(name, tensor);
-        }
+        bind_inputs(&mut env, inputs)?;
         for (name, buffer, capacity) in bound {
             env.bind_output(name, buffer, capacity);
         }
         execute(&self.ir, &mut env)?;
+        // the GPU starts on this run's tail now, and the next run (which may
+        // read its outputs on the device) submits after a few dispatches
+        self.context()
+            .stream_break()
+            .map_err(|error| crate::Error::Backend(error.to_string()))?;
         Ok(Outputs { env })
     }
 
@@ -307,6 +364,12 @@ impl<'a> Outputs<'a> {
         self.env.host_many(names)
     }
 
+    /// [`Self::host_many`] into tensors the caller keeps across runs, reusing
+    /// their allocations. On error their contents are unspecified.
+    pub fn host_many_into(&self, names: &[&str], outputs: &mut [HostTensor]) -> Result<()> {
+        self.env.host_many_into(names, outputs)
+    }
+
     /// Index of the largest element along the last axis of a value this run
     /// produced, reduced **on the device**: the dispatches join the command
     /// buffer the run is still holding, and only the indices are downloaded.
@@ -319,6 +382,13 @@ impl<'a> Outputs<'a> {
 
     pub fn on_device(&self, name: &str) -> bool {
         self.env.on_device(name)
+    }
+
+    /// Takes a value out of the run as a device tensor the caller owns, see
+    /// `ExecutionEnv::take_owned_device`. The run's dispatches need not have
+    /// been flushed: every later dispatch on the context is ordered after them.
+    pub fn take_device(&mut self, name: &str) -> Result<DeviceTensor<'static>> {
+        self.env.take_owned_device(name)
     }
 
     /// The run's environment, for a caller that keeps it alive across steps.
@@ -336,4 +406,26 @@ impl<'a> Outputs<'a> {
     pub fn finish(self) {
         self.env.finish();
     }
+}
+
+/// Binds a run's inputs, uploading every f32 host input above
+/// `SMALL_HOST_BYTES`. The EP receives such inputs already in VRAM (ORT copies
+/// them before calling the kernel); left on host here, each op reading one
+/// directly would run on the CPU (SAM 3's decoder: 21 MB of image embeddings
+/// through a host `Transpose`, `Unsqueeze`, `Add` and `Tile`, standalone 4×
+/// the EP). Traced and replayed steps keep their inputs as given: a plan
+/// replays the commands of the run it was captured on.
+fn bind_inputs<'values>(
+    env: &mut ExecutionEnv<'_, 'values>,
+    inputs: Vec<(&str, Tensor<'values>)>,
+) -> Result<()> {
+    for (name, tensor) in inputs {
+        let upload = matches!(&tensor, Tensor::Host(host)
+            if host.dtype == FLOAT && host.data.len() > ExecutionEnv::SMALL_HOST_BYTES);
+        env.set(name, tensor);
+        if upload {
+            env.ensure_device(name)?;
+        }
+    }
+    Ok(())
 }

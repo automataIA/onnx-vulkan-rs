@@ -271,6 +271,18 @@ deterministic and lead the wall clock.
   tensor's extreme shifts its whole scale. The correctness contract is per-node,
   ±1 LSB on the first quantized tensor, plus the expected transcript / argmax.
 
+## Published models
+
+Model files built with this project are published on Hugging Face, not in
+this repository.
+
+| Model | Files | Weights license |
+|---|---|---|
+| SAM 3 int8 image segmentation, ONNX: text prompts (vision encoder, text encoder, detector) and point/box prompts (tracker vision encoder, prompt decoder); no video | [`Autognosi/sam3-int8-onnx`](https://huggingface.co/Autognosi/sam3-int8-onnx) | [SAM License](https://huggingface.co/facebook/sam3) |
+
+The weights keep the license of their base model. The license below covers
+the code of this repository and not the weights.
+
 ## License
 
 Licensed under either of

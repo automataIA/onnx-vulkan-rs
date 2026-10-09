@@ -50,12 +50,17 @@ Users must comply with each model's license when downloading and using them.
 │                                 │                                              │ https://huggingface.co/            │
 │                                 │                                              │   onnx-community/rfdetr_base-ONNX  │
 ├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
-│ SAM 2 / SAM 3 Tracker           │ Apache-2.0                                   │ Meta / facebookresearch             │
-│ (vision encoder int8,           │                                              │ https://huggingface.co/            │
+│ SAM 3 Tracker                   │ SAM License (base model facebook/sam3)       │ Meta / facebookresearch            │
+│ (vision encoder int8,           │ https://huggingface.co/facebook/sam3         │ https://huggingface.co/            │
 │  prompt encoder/decoder int8)   │                                              │   onnx-community/sam3-tracker-ONNX │
 ├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
-│ SAM 3 ViT-H (fp32)             │ Apache-2.0                                   │ Meta / facebookresearch             │
+│ SAM 3 ViT-H (fp32)              │ SAM License                                  │ Meta / facebookresearch            │
 │ (sam3_image_encoder.onnx)       │                                              │                                    │
+├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
+│ SAM 3 int8 image segmentation   │ SAM License (LICENSE in the repository)      │ This project, from facebook/sam3   │
+│ (vision and text encoders,      │                                              │ https://huggingface.co/            │
+│  detector, tracker vision       │                                              │   Autognosi/sam3-int8-onnx         │
+│  encoder, prompt decoder)       │                                              │                                    │
 ├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
 │ MobileNetV2-12                  │ Apache-2.0                                   │ ONNX Model Zoo                     │
 │                                 │                                              │ https://huggingface.co/            │

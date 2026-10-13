@@ -259,8 +259,12 @@ minutes in parallel. On lavapipe the default threading works.
 ```bash
 RUST_LOG=info ./target/release/stt-app models/en-sample.wav [model_dir]
 cargo run -p model-runner --release -- model.onnx --dim height=560 --dim width=560
-scripts/testsuite.sh --baseline runs/baseline.json    # the regression gate
+scripts/testsuite.sh                              # run the suite
 ```
+
+To compare against a local reference, pass `--baseline FILE`. The project
+baseline at `runs/baseline.json` is intentionally excluded from version
+control, so each checkout must supply its own reference file.
 
 For your own model, use the `uv run onnx-vulkan` flow of the
 [Quickstart](#quickstart-your-onnx-model-on-the-gpu); `optimize` drives the
@@ -419,10 +423,10 @@ Read honestly:
   `perf_valid: false`. They are still a valid *correctness* gate, because
   integer arithmetic is exact on any device.
 
-The regression gate (`scripts/testsuite.sh --baseline runs/baseline.json`) fails
-on accuracy outside tolerance, median wall past `perf_tol`, more flushes or MB
-transferred, or **more convex blocks / fewer claimed nodes** — the last two are
-deterministic and lead the wall clock.
+When `--baseline FILE` is supplied, the regression gate fails on accuracy
+outside tolerance, median wall past `perf_tol`, more flushes or MB transferred,
+or **more convex blocks / fewer claimed nodes** — the last two are deterministic
+and lead the wall clock.
 
 ## Technical notes
 
@@ -456,7 +460,7 @@ this repository.
 
 | Model | Files | Weights license |
 |---|---|---|
-| SAM 3 int8 image segmentation, ONNX: text prompts (vision encoder, text encoder, detector) and point/box prompts (tracker vision encoder, prompt decoder); no video | [`Autognosi/sam3-int8-onnx`](https://huggingface.co/Autognosi/sam3-int8-onnx) | [SAM License](https://huggingface.co/facebook/sam3) |
+| SAM 3 int8 image segmentation, ONNX: text prompts (vision encoder, text encoder, detector) and point/box prompts (tracker vision encoder, prompt decoder); no video | [`Autognosi/sam3-onnx-vulkan`](https://huggingface.co/Autognosi/sam3-onnx-vulkan) | [SAM License](https://huggingface.co/facebook/sam3) |
 
 The weights keep the license of their base model. The license below covers
 the code of this repository and not the weights.

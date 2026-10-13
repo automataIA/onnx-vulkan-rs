@@ -1,12 +1,10 @@
 /target
 /info
-/docs/*
-docs/
+/docs/
 /repo-reference
 /models
 /third_party
 /runs/*
-!/runs/baseline.json
 __pycache__/
 *.pyc
 *.md
@@ -15,8 +13,8 @@ __pycache__/
 
 # Local recipes and notes (not distributed with the repository).
 /recipes
-
-# Local LLM instructions and skills (not distributed with the repository).
-/AGENTS.md
-/.agents/
-/CLAUDE.md
+hooks/
+# Local development environments and caches.
+/.venv/
+/.pytest_cache/
+/.ruff_cache/

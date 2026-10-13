@@ -59,7 +59,7 @@ Users must comply with each model's license when downloading and using them.
 ├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
 │ SAM 3 int8 image segmentation   │ SAM License (LICENSE in the repository)      │ This project, from facebook/sam3   │
 │ (vision and text encoders,      │                                              │ https://huggingface.co/            │
-│  detector, tracker vision       │                                              │   Autognosi/sam3-int8-onnx         │
+│  detector, tracker vision       │                                              │   Autognosi/sam3-onnx-vulkan       │
 │  encoder, prompt decoder)       │                                              │                                    │
 ├─────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────┤
 │ MobileNetV2-12                  │ Apache-2.0                                   │ ONNX Model Zoo                     │

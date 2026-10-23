@@ -96,7 +96,7 @@ use crate::shaders::matmul_integer::{
     ANY_K_PUSH_BYTES as MMI_ANY_K_PUSH_BYTES, COOP_BINDINGS as MMI_COOP_BINDINGS,
     COOP_EPILOGUE_BINDINGS as MMI_COOP_EPILOGUE_BINDINGS,
     COOP_EPILOGUE_PUSH_BYTES as MMI_COOP_EPILOGUE_PUSH_BYTES,
-    COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
+    COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES, COOP_TILE as MMI_COOP_TILE, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
     FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY, FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES,
     MATMUL_BINDINGS as MMI_BINDINGS, MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B,
     PACK_BINDINGS as MMI_PACK_BINDINGS, PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES,
@@ -1439,7 +1439,9 @@ fn meta_reshape_out(env: &mut Env, node: &NodeIr, new_shape: Vec<i64>) -> Result
         let d = env.device(src)?;
         let nbytes = d.elem_count * elem_size(d.dtype);
         let (dtype, elem_count) = (d.dtype, d.elem_count);
-        let out = ctx.create_storage_buffer(nbytes.max(1) as u64)?;
+        // whole words, as every tensor: kernels read bytes through `array<u32>`,
+        // and a robust driver returns 0 past a 1-byte int8 scalar
+        let out = ctx.create_storage_buffer(device_storage_bytes(dtype, elem_count)?)?;
         if nbytes > 0 {
             ctx.stream_copy(d.buffer(), &out, nbytes as u64)?;
         }
@@ -2417,6 +2419,8 @@ fn matmul_integer_scale_bias(env: &mut Env, node: &NodeIr) -> Result<()> {
         bias_step,
         flags,
         product_step,
+        0,
+        n as u32,
     ] {
         push.extend_from_slice(&value.to_le_bytes());
     }
@@ -3310,6 +3314,12 @@ impl ConvGeom {
             push.extend_from_slice(&v.to_le_bytes());
         }
         push
+    }
+
+    /// Channels and planes that start on a word: `conv_im2col_coop` goes
+    /// through HWC (see `conv_im2col_hwc`).
+    fn hwc(&self) -> bool {
+        self.gsi % 4 == 0 && (self.h_in * self.w_in) % 4 == 0
     }
 }
 
@@ -4385,7 +4395,12 @@ fn conv_integer_with(env: &mut Env, node: &NodeIr, fused: bool) -> Result<bool> 
     };
 
     env.ensure_device_dtype(&x_name)?;
-    env.ensure_device_dtype(&w_name)?;
+    // The HWC route reads a constant weight from the host and keeps only its
+    // permuted copy (`hwc_weight`): uploading it as well would keep a second
+    // resident copy nothing binds — 10 MB on Piper's quantized vocoder.
+    if pointwise || coop.is_none() || !g.hwc() || !env.is_initializer(&w_name) {
+        env.ensure_device_dtype(&w_name)?;
+    }
     // ONNX allows both uint8 and int8 for X and W, independently
     let x_signed = u32::from(env.dtype_of(&x_name)? == INT8);
     let w_signed = u32::from(env.dtype_of(&w_name)? == INT8);
@@ -5132,13 +5147,16 @@ fn conv_pointwise_matmul(
     let w: &GpuBuffer = unsafe { &*w_ptr };
     let zp_xor = [w_signed, x_signed].map(|s| if s != 0 { MMI_SIGN_FLIP_BYTE } else { 0 });
     let (out, dtype) = if let Some((variant, steps)) = epilogue {
-        let out = conv_coop_epilogue(
+        let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, c_out * nmat)?)?;
+        conv_coop_epilogue(
             env,
             node,
             variant,
             w,
             &packed,
+            &out,
             [c_out, c_in, nmat],
+            [0, nmat],
             zp_xor,
             steps,
         )?;
@@ -5217,61 +5235,10 @@ fn conv_im2col_coop(
 ) -> Result<()> {
     let c_out = g.c_out as usize;
     let total = c_out * pixels;
-    let words = pixels * kdepth / 4;
 
     // Channels and planes that start on a word go through HWC (see
     // `shaders::conv_integer::TO_HWC`), with K reordered to (kh, kw, c)
-    let hwc = g.gsi % 4 == 0 && (g.h_in * g.w_in) % 4 == 0;
-    let ctx = env.context();
-    // Back to the pool when the product is recorded, like a tensor: destroyed,
-    // the next run allocates it again — 8 ms for the 191 MB of SAM 3's
-    // 3×3 convolution at 288², more than its GPU time.
-    let col = ctx.create_storage_buffer((words * 4) as u64)?;
-    if hwc {
-        conv_im2col_hwc(env, node, x_name, g, &col, words, x_signed)?;
-    } else {
-        let x = env.device(x_name)?;
-        let azp = zp_ref(env, node.inputs.get(2))?;
-        let mut push = Vec::with_capacity(CONV_I_IM2COL_PUSH_BYTES as usize);
-        for value in [
-            words as u32,
-            kdepth as u32,
-            (g.kh * g.kw) as u32,
-            g.h_in as u32,
-            g.w_in as u32,
-            g.w_out as u32,
-            g.kw as u32,
-            g.sh as u32,
-            g.sw as u32,
-            g.phb as u32,
-            g.pwb as u32,
-            g.dh as u32,
-            g.dw as u32,
-            if x_signed != 0 { MMI_SIGN_FLIP_WORD } else { 0 },
-        ] {
-            push.extend_from_slice(&value.to_le_bytes());
-        }
-        with_pipeline(
-            env.cache(),
-            "ConvInteger_im2col",
-            || {
-                ctx.create_pipeline(
-                    &compile_wgsl(CONV_I_IM2COL)?,
-                    CONV_I_IM2COL_BINDINGS,
-                    CONV_I_IM2COL_PUSH_BYTES,
-                )
-            },
-            |pipe| {
-                ctx.stream_dispatch(
-                    pipe,
-                    &[x.buffer(), azp, &col],
-                    &push,
-                    [(words as u32).div_ceil(256), 1, 1],
-                )
-            },
-        )?;
-    }
-
+    let hwc = g.hwc();
     let w_ptr = if hwc {
         hwc_weight(env, w_name, g, w_signed != 0)?
     } else if w_signed != 0 {
@@ -5279,24 +5246,54 @@ fn conv_im2col_coop(
     } else {
         env.device(w_name)?.buffer() as *const GpuBuffer
     };
-    let ctx = env.context();
     // SAFETY: the flipped weight lives in the cache, which never removes
     // entries and keeps them boxed; an unflipped one is the tensor's own
     // buffer, alive for the whole execution.
     let w: &GpuBuffer = unsafe { &*w_ptr };
     let zp_xor = [w_signed, x_signed].map(|s| if s != 0 { MMI_SIGN_FLIP_BYTE } else { 0 });
+    let xt = if hwc {
+        Some(conv_to_hwc(env, x_name, g)?)
+    } else {
+        None
+    };
+    let ctx = env.context();
+    // The epilogue stores its columns straight into the output, so the matrix
+    // is built and multiplied one slice of output pixels at a time.
+    let slices = if epilogue.is_some() {
+        im2col_slices(pixels, kdepth)
+    } else {
+        vec![[0, pixels]]
+    };
+    // Back to the pool when the product is recorded, like a tensor: destroyed,
+    // the next run allocates it again — 8 ms for the 191 MB of SAM 3's
+    // 3×3 convolution at 288², more than its GPU time. The pool's scratch and
+    // not an exact-size buffer: every geometry has its own size, and Piper's
+    // 36 quantized resblock convolutions kept six of them, 120 MB, where the
+    // largest is 50 MB. The kernels below read `words`, not the buffer length.
+    let col = ctx.take_scratch_buffer((slices[0][1] * kdepth) as u64)?;
     if let Some(steps) = epilogue {
-        let out = conv_coop_epilogue(
-            env,
-            node,
-            variant,
-            w,
-            &col,
-            [c_out, kdepth, pixels],
-            zp_xor,
-            steps,
-        )?;
-        ctx.recycle_storage_buffer(col);
+        let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, total)?)?;
+        for [p0, len] in slices {
+            conv_im2col(env, node, x_name, xt.as_ref(), g, &col, [p0, len, kdepth], x_signed)?;
+            conv_coop_epilogue(
+                env,
+                node,
+                variant,
+                w,
+                &col,
+                &out,
+                [c_out, kdepth, len],
+                [p0, pixels],
+                zp_xor,
+                steps,
+            )?;
+        }
+        ctx.recycle_scratch_buffer(col);
+        // Back to the pool, like `col`: destroyed, every copy stays allocated
+        // until the next flush — 36 of them, 103 MB, on Piper's quantized vocoder.
+        if let Some(xt) = xt {
+            ctx.recycle_storage_buffer(xt);
+        }
         env.set(
             &node.outputs[0],
             Tensor::Device(DevTensor {
@@ -5307,6 +5304,10 @@ fn conv_im2col_coop(
             }),
         );
         return Ok(());
+    }
+    conv_im2col(env, node, x_name, xt.as_ref(), g, &col, [0, pixels, kdepth], x_signed)?;
+    if let Some(xt) = xt {
+        ctx.recycle_storage_buffer(xt);
     }
     let out = ctx.create_storage_buffer(device_storage_bytes(INT32, total)?)?;
     let azp = zp_ref(env, node.inputs.get(3))?; // A = W → weight zero point
@@ -5339,7 +5340,7 @@ fn conv_im2col_coop(
             )
         },
     )?;
-    ctx.recycle_storage_buffer(col);
+    ctx.recycle_scratch_buffer(col);
     env.set(
         &node.outputs[0],
         Tensor::Device(DevTensor {
@@ -5352,11 +5353,141 @@ fn conv_im2col_coop(
     Ok(())
 }
 
+/// Largest im2col slice of `conv_im2col_coop`'s epilogue route, in bytes.
+/// Piper's quantized vocoder needed a 50 MB matrix for its widest
+/// convolution (128 channels, kernel 11, 35 840 pixels); in slices the
+/// largest is 12.6 MB, a 256-channel one that fits whole.
+const IM2COL_SLICE_BYTES: usize = 16 << 20;
+
+/// `[p0, len]` of each im2col slice, the first the longest: the matrix split
+/// evenly into as few slices as fit [`IM2COL_SLICE_BYTES`], each rounded up
+/// to whole 128-pixel blocks of the cooperative kernels. A short last slice
+/// moves back to a whole tile, which those kernels need: the overlap stores
+/// the same values again.
+fn im2col_slices(pixels: usize, kdepth: usize) -> Vec<[usize; 2]> {
+    let slices = (pixels * kdepth).div_ceil(IM2COL_SLICE_BYTES).max(1);
+    let slice = pixels.div_ceil(slices).next_multiple_of(128);
+    if slice >= pixels {
+        return vec![[0, pixels]];
+    }
+    (0..pixels)
+        .step_by(slice)
+        .map(|start| {
+            let len = slice.min(pixels - start).max(MMI_COOP_TILE as usize);
+            [start.min(pixels - len), len]
+        })
+        .collect()
+}
+
+/// Rows `p0 .. p0 + len` of the im2col matrix of `conv_im2col_coop` into
+/// `col`: from the HWC copy `xt` when there is one (see
+/// `shaders::conv_integer::IM2COL_HWC`), otherwise straight from X.
+#[allow(clippy::too_many_arguments)]
+fn conv_im2col(
+    env: &Env,
+    node: &NodeIr,
+    x_name: &str,
+    xt: Option<&GpuBuffer>,
+    g: &ConvGeom,
+    col: &GpuBuffer,
+    [p0, len, kdepth]: [usize; 3],
+    x_signed: u32,
+) -> Result<()> {
+    let ctx = env.context();
+    let words = len * kdepth / 4;
+    let azp = zp_ref(env, node.inputs.get(2))?;
+    let flip = if x_signed != 0 { MMI_SIGN_FLIP_WORD } else { 0 };
+    let mut push = Vec::with_capacity(CONV_I_IM2COL_PUSH_BYTES as usize);
+    if let Some(xt) = xt {
+        let channel_words = g.gsi as u32 / 4;
+        for value in [
+            words as u32,
+            channel_words * (g.kh * g.kw) as u32,
+            channel_words,
+            g.h_in as u32,
+            g.w_in as u32,
+            g.w_out as u32,
+            g.kw as u32,
+            g.sh as u32,
+            g.sw as u32,
+            g.phb as u32,
+            g.pwb as u32,
+            g.dh as u32,
+            g.dw as u32,
+            flip,
+            p0 as u32,
+        ] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        let max_groups = ctx.compute_limits().max_workgroup_count[0];
+        return with_pipeline(
+            env.cache(),
+            CONV_I_IM2COL_HWC_KEY,
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(CONV_I_IM2COL_HWC)?,
+                    CONV_I_IM2COL_HWC_BINDINGS,
+                    CONV_I_IM2COL_HWC_PUSH_BYTES,
+                )
+            },
+            |pipe| {
+                ctx.stream_dispatch(
+                    pipe,
+                    &[xt, azp, col],
+                    &push,
+                    [(words as u32).div_ceil(256).min(max_groups), 1, 1],
+                )
+            },
+        );
+    }
+    let x = env.device(x_name)?;
+    for value in [
+        words as u32,
+        kdepth as u32,
+        (g.kh * g.kw) as u32,
+        g.h_in as u32,
+        g.w_in as u32,
+        g.w_out as u32,
+        g.kw as u32,
+        g.sh as u32,
+        g.sw as u32,
+        g.phb as u32,
+        g.pwb as u32,
+        g.dh as u32,
+        g.dw as u32,
+        flip,
+        p0 as u32,
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    with_pipeline(
+        env.cache(),
+        "ConvInteger_im2col",
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(CONV_I_IM2COL)?,
+                CONV_I_IM2COL_BINDINGS,
+                CONV_I_IM2COL_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[x.buffer(), azp, col],
+                &push,
+                [(words as u32).div_ceil(256), 1, 1],
+            )
+        },
+    )
+}
+
 /// The cooperative product `W [C_out, K] × B [P, K]ᵀ` of a
 /// `ConvIntegerScaleBias` with the dequantizing epilogue: the f32
 /// `float(acc) · scale + bias` of its inputs 4 and 5 (the scale times input
 /// 6 when there is one), NCHW at `n == 1`, with `steps` from `conv_epilogue`. `zp_xor` is the zero-point shift of W and of
-/// X, as in `conv_im2col_coop`.
+/// X, as in `conv_im2col_coop`. The `n` columns of B land in `out` from
+/// column `col0` of rows `ldo` wide: a slice of the im2col matrix, or all of
+/// it at `col0 = 0, ldo = n`.
 #[allow(clippy::too_many_arguments)]
 fn conv_coop_epilogue(
     env: &Env,
@@ -5364,12 +5495,13 @@ fn conv_coop_epilogue(
     variant: &'static CoopVariant,
     w: &GpuBuffer,
     b: &GpuBuffer,
+    out: &GpuBuffer,
     [m, k, n]: [usize; 3],
+    [col0, ldo]: [usize; 2],
     zp_xor: [u32; 2],
     steps: [u32; 3],
-) -> Result<GpuBuffer> {
+) -> Result<()> {
     let ctx = env.context();
-    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, m * n)?)?;
     let azp = zp_ref(env, node.inputs.get(3))?; // A = W → weight zero point
     let bzp = zp_ref(env, node.inputs.get(2))?; // B = X → activation zero point
     let (scale, bias) = (env.device(&node.inputs[4])?, env.device(&node.inputs[5])?);
@@ -5381,7 +5513,17 @@ fn conv_coop_epilogue(
     let flags = u32::from(node.inputs.len() == 7) << 2;
     let mut push = Vec::with_capacity(MMI_COOP_EPILOGUE_PUSH_BYTES as usize);
     for value in [
-        m as u32, k as u32, n as u32, zp_xor[0], zp_xor[1], steps[0], steps[1], flags, steps[2],
+        m as u32,
+        k as u32,
+        n as u32,
+        zp_xor[0],
+        zp_xor[1],
+        steps[0],
+        steps[1],
+        flags,
+        steps[2],
+        col0 as u32,
+        ldo as u32,
     ] {
         push.extend_from_slice(&value.to_le_bytes());
     }
@@ -5404,33 +5546,23 @@ fn conv_coop_epilogue(
                     b,
                     azp,
                     bzp,
-                    &out,
+                    out,
                     scale.buffer(),
                     bias.buffer(),
-                    &out,
+                    out,
                     product,
                 ],
                 &push,
                 variant.grid(m, n),
             )
         },
-    )?;
-    Ok(out)
+    )
 }
 
-/// The im2col matrix of `conv_im2col_coop` with K ordered `(kh, kw, c)`:
-/// X to HWC, then whole words of it to `col` (see
-/// `shaders::conv_integer::IM2COL_HWC`). Needs `C_in` and `H·W` multiples of
-/// four.
-fn conv_im2col_hwc(
-    env: &mut Env,
-    node: &NodeIr,
-    x_name: &str,
-    g: &ConvGeom,
-    col: &GpuBuffer,
-    words: usize,
-    x_signed: u32,
-) -> Result<()> {
+/// X to HWC for the im2col of `conv_im2col_coop` with K ordered
+/// `(kh, kw, c)` (see `shaders::conv_integer::TO_HWC`). Needs `C_in` and
+/// `H·W` multiples of four.
+fn conv_to_hwc(env: &Env, x_name: &str, g: &ConvGeom) -> Result<GpuBuffer> {
     let ctx = env.context();
     let channels = g.gsi as u32;
     let plane = (g.h_in * g.w_in) as u32;
@@ -5463,49 +5595,7 @@ fn conv_im2col_hwc(
             )
         },
     )?;
-    let azp = zp_ref(env, node.inputs.get(2))?;
-    let channel_words = channels / 4;
-    let mut push = Vec::with_capacity(CONV_I_IM2COL_HWC_PUSH_BYTES as usize);
-    for value in [
-        words as u32,
-        channel_words * (g.kh * g.kw) as u32,
-        channel_words,
-        g.h_in as u32,
-        g.w_in as u32,
-        g.w_out as u32,
-        g.kw as u32,
-        g.sh as u32,
-        g.sw as u32,
-        g.phb as u32,
-        g.pwb as u32,
-        g.dh as u32,
-        g.dw as u32,
-        if x_signed != 0 { MMI_SIGN_FLIP_WORD } else { 0 },
-    ] {
-        push.extend_from_slice(&value.to_le_bytes());
-    }
-    let max_groups = ctx.compute_limits().max_workgroup_count[0];
-    with_pipeline(
-        env.cache(),
-        CONV_I_IM2COL_HWC_KEY,
-        || {
-            ctx.create_pipeline(
-                &compile_wgsl(CONV_I_IM2COL_HWC)?,
-                CONV_I_IM2COL_HWC_BINDINGS,
-                CONV_I_IM2COL_HWC_PUSH_BYTES,
-            )
-        },
-        |pipe| {
-            ctx.stream_dispatch(
-                pipe,
-                &[&xt, azp, col],
-                &push,
-                [(words as u32).div_ceil(256).min(max_groups), 1, 1],
-            )
-        },
-    )?;
-    ctx.defer_destroy(xt);
-    Ok(())
+    Ok(xt)
 }
 
 /// The constant weight `[C_out, C_in, KH, KW]` permuted to
@@ -9598,7 +9688,23 @@ fn unary_with_helpers(
 
 #[cfg(test)]
 mod tests {
-    use super::collapse_permutation;
+    use super::{collapse_permutation, im2col_slices};
+
+    #[test]
+    fn im2col_slices_split_piper_widest_convolution_and_keep_whole_tiles() {
+        // 128 channels, kernel 11, 35 840 pixels: 50.5 MB in four slices
+        assert_eq!(
+            im2col_slices(35840, 128 * 11),
+            [[0, 8960], [8960, 8960], [17920, 8960], [26880, 8960]]
+        );
+        assert_eq!(im2col_slices(35840, 128 * 7), [[0, 17920], [17920, 17920]]);
+        // 12.6 MB fits whole
+        assert_eq!(im2col_slices(4480, 256 * 11), [[0, 4480]]);
+        // two pixels left over: the last slice moves back to a 16-pixel tile
+        assert_eq!(im2col_slices(130, 4096 * 49), [[0, 128], [114, 16]]);
+        // too few pixels to split
+        assert_eq!(im2col_slices(100, 1 << 20), [[0, 100]]);
+    }
 
     #[test]
     fn window_partition_collapses_to_rows() {

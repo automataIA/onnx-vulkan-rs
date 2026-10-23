@@ -27,9 +27,14 @@ pub(crate) struct StagingPool {
 /// period two and a descriptor set recorded on one step points at the wrong
 /// memory on the next. Taking from the front reproduces the previous step's
 /// assignment exactly.
+///
+/// Beside them, one **scratch** buffer (see `take_scratch_buffer`): a
+/// temporary that has a different size at every node — an `im2col` — would
+/// otherwise leave one buffer per distinct size in the exact-size lists.
 #[derive(Default)]
 pub(crate) struct StoragePool {
     free: std::collections::HashMap<u64, std::collections::VecDeque<GpuBuffer>>,
+    scratch: Option<GpuBuffer>,
 }
 
 impl StoragePool {
@@ -48,7 +53,12 @@ impl StoragePool {
     }
 
     fn drain(&mut self) -> Vec<GpuBuffer> {
-        self.free.drain().flat_map(|(_, list)| list).collect()
+        let scratch = self.scratch.take();
+        self.free
+            .drain()
+            .flat_map(|(_, list)| list)
+            .chain(scratch)
+            .collect()
     }
 
     /// Keeps the smallest buffers whose sizes add up to at most `budget` and
@@ -57,8 +67,18 @@ impl StoragePool {
     /// Smallest first because what the pool saves is a call per allocation,
     /// and a byte of budget kept as small buffers saves more of them. The
     /// buffers kept are queued by identity, as `canonicalize` would leave them.
-    fn trim(&mut self, budget: u64) -> Vec<GpuBuffer> {
+    /// The scratch is kept first, when it fits, and its size comes out of the
+    /// budget.
+    fn trim(&mut self, mut budget: u64) -> Vec<GpuBuffer> {
+        let scratch = self.scratch.take();
         let mut buffers = self.drain();
+        match scratch {
+            Some(scratch) if scratch.size <= budget => {
+                budget -= scratch.size;
+                self.scratch = Some(scratch);
+            }
+            scratch => buffers.extend(scratch),
+        }
         buffers.sort_by_key(|buffer| (buffer.size, buffer.id));
         let mut kept = 0u64;
         let keep = buffers
@@ -73,6 +93,31 @@ impl StoragePool {
             self.put(buffer);
         }
         evicted
+    }
+
+    /// Takes the scratch when it holds at least `size` bytes; a smaller one is
+    /// returned as `Err` for the caller to destroy.
+    fn take_scratch(&mut self, size: u64) -> Result<Option<GpuBuffer>, GpuBuffer> {
+        match self.scratch.take() {
+            Some(scratch) if scratch.size >= size => Ok(Some(scratch)),
+            Some(smaller) => Err(smaller),
+            None => Ok(None),
+        }
+    }
+
+    /// Keeps the larger of `buffer` and the current scratch, returning the
+    /// other.
+    fn put_scratch(&mut self, buffer: GpuBuffer) -> Option<GpuBuffer> {
+        match self.scratch.take() {
+            Some(current) if current.size >= buffer.size => {
+                self.scratch = Some(current);
+                Some(buffer)
+            }
+            current => {
+                self.scratch = Some(buffer);
+                current
+            }
+        }
     }
 }
 
@@ -257,6 +302,47 @@ impl VkContext {
     /// at a `VkBuffer` that the next allocation is free to overwrite.
     pub fn recycle_storage_buffer(&self, buffer: GpuBuffer) {
         self.storage_pool.lock().unwrap().put(buffer);
+    }
+
+    /// A storage buffer of **at least** `size` bytes, for a temporary written
+    /// and consumed by the same kernel sequence: the pool's scratch when it is
+    /// large enough, otherwise a new buffer of `size` bytes, the smaller
+    /// scratch destroyed after a flush. Return it with
+    /// `recycle_scratch_buffer`.
+    ///
+    /// The kernels that use it must take their extent from push constants, not
+    /// from the buffer's length. The scratch is part of the pool for
+    /// `take_storage_pool`, `trim_storage_pool` and the out-of-memory retry, so
+    /// a replay plan holds it like any pooled buffer it binds.
+    pub fn take_scratch_buffer(&self, size: u64) -> Result<GpuBuffer> {
+        let taken = self.storage_pool.lock().unwrap().take_scratch(size);
+        match taken {
+            Ok(Some(scratch)) => {
+                crate::stats::record_storage_pool_hit();
+                Ok(scratch)
+            }
+            Ok(None) => self.create_storage_buffer(size),
+            Err(smaller) => {
+                // the smaller one may still be bound by recorded commands; left
+                // to the next flush it stays allocated next to its successor,
+                // and a run that grows the scratch node after node without a
+                // flush stacks them all (70 MB on Piper's first run). Growth
+                // stops once the largest request has been seen.
+                let flushed = self.flush();
+                self.defer_destroy(smaller);
+                flushed?;
+                self.create_storage_buffer(size)
+            }
+        }
+    }
+
+    /// Returns a buffer from `take_scratch_buffer`. Same safety contract as
+    /// `recycle_storage_buffer`.
+    pub fn recycle_scratch_buffer(&self, buffer: GpuBuffer) {
+        let displaced = self.storage_pool.lock().unwrap().put_scratch(buffer);
+        if let Some(buffer) = displaced {
+            self.defer_destroy(buffer);
+        }
     }
 
     /// Called at the end of a run: keeps the smallest pooled buffers within
@@ -483,5 +569,35 @@ mod tests {
 
         pool.put(fake(64, 5));
         assert_eq!(pool.trim(0).len(), 1, "a zero budget keeps nothing");
+    }
+
+    #[test]
+    fn the_scratch_grows_to_the_largest_request_and_belongs_to_the_pool() {
+        let mut pool = StoragePool::default();
+        assert!(matches!(pool.take_scratch(100), Ok(None)));
+        assert!(pool.put_scratch(fake(100, 0)).is_none());
+        // a larger request hands back the smaller scratch for destruction
+        assert_eq!(pool.take_scratch(200).map_err(|b| b.id).err(), Some(0));
+        assert!(pool.put_scratch(fake(200, 1)).is_none());
+        // a smaller request is served by the larger buffer
+        let scratch = pool.take_scratch(50).ok().flatten().expect("scratch");
+        assert_eq!(scratch.id, 1);
+        // of two scratches the larger stays
+        assert!(pool.put_scratch(fake(64, 2)).is_none());
+        assert_eq!(pool.put_scratch(scratch).map(|b| b.id), Some(2));
+        assert!(pool.take(200).is_none(), "not an exact-size buffer");
+
+        // the scratch counts against the trim budget first
+        pool.put(fake(64, 3));
+        assert_eq!(pool.trim(220).iter().map(|b| b.id).collect::<Vec<_>>(), [3]);
+        assert_eq!(pool.trim(100).iter().map(|b| b.id).collect::<Vec<_>>(), [1]);
+        assert!(matches!(pool.take_scratch(1), Ok(None)));
+
+        // and drains with the rest, for plans and the out-of-memory retry
+        assert!(pool.put_scratch(fake(32, 4)).is_none());
+        pool.put(fake(16, 5));
+        let mut drained: Vec<u64> = pool.drain().iter().map(|b| b.id).collect();
+        drained.sort_unstable();
+        assert_eq!(drained, [4, 5]);
     }
 }

@@ -308,3 +308,41 @@ fn one_output_channel_falls_back_to_four_steps() {
     }
     .check(false);
 }
+
+#[test]
+fn im2col_past_the_slice_budget_runs_in_slices() {
+    // 17.8 MB of HWC im2col: two slices of the 16 MiB budget, each one written
+    // into its columns of the output
+    Layer {
+        c_in: 256,
+        c_out: 32,
+        hw: [88, 88],
+        kernel: 3,
+        stride: 1,
+        pad: 1,
+        weight_signed: true,
+        input_signed: false,
+        scale_shape: None,
+        bias_shape: vec![1, 32, 1, 1],
+    }
+    .check(true);
+}
+
+#[test]
+fn a_short_last_slice_moves_back_to_a_whole_tile() {
+    // 130 pixels of CHW im2col (a 10×13 plane is off word boundaries), 26 MB:
+    // slices [0, 128) and [114, 130), the overlap stored twice
+    Layer {
+        c_in: 4096,
+        c_out: 16,
+        hw: [10, 13],
+        kernel: 7,
+        stride: 1,
+        pad: 3,
+        weight_signed: false,
+        input_signed: false,
+        scale_shape: Some(vec![16, 1, 1]),
+        bias_shape: vec![16, 1, 1],
+    }
+    .check(true);
+}

@@ -119,6 +119,9 @@ layout(push_constant) uniform Push {
     // scale * product (see matmul_integer_coop.comp)
     uint flags;
     uint product_step;
+    // the columns of a wider output (see matmul_integer_coop.comp)
+    uint col0;
+    uint ldo;
 #endif
 } pc;
 
@@ -319,15 +322,16 @@ void main() {
                 if (grow < pc.m && gcol < pc.n) {
 #ifdef EPILOGUE
                     // int() keeps the bits of an unsigned accumulator
+                    uint ocol = pc.col0 + gcol;
                     precise float x = float(int(res));
-                    precise float s = scale[gcol * (pc.scale_step & 1u) + grow * (pc.scale_step >> 1u)];
+                    precise float s = scale[ocol * (pc.scale_step & 1u) + grow * (pc.scale_step >> 1u)];
                     if ((pc.flags & 4u) != 0u) {
-                        s = s * product[gcol * (pc.product_step & 1u) + grow * (pc.product_step >> 1u)];
+                        s = s * product[ocol * (pc.product_step & 1u) + grow * (pc.product_step >> 1u)];
                     }
                     precise float y = x * s;
-                    precise float z = y + bias[gcol * (pc.bias_step & 1u) + grow * (pc.bias_step >> 1u)];
+                    precise float z = y + bias[ocol * (pc.bias_step & 1u) + grow * (pc.bias_step >> 1u)];
                     float v = (pc.flags & 1u) != 0u ? max(z, 0.0) : z;
-                    o[grow * pc.n + gcol] = v;
+                    o[grow * pc.ldo + ocol] = v;
                     run_max = max(run_max, v);
                     run_neg = max(run_neg, -v);
 #else

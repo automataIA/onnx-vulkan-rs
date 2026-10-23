@@ -279,9 +279,9 @@ pub const COOP_PUSH_BYTES: u32 = 20;
 /// and 6, the range slot at 7 and the second factor of the scale at 8, f32
 /// out; push constants telling how scale and bias broadcast, the flags (a
 /// following `Relu`, the range, the scale product) and how the product
-/// broadcasts.
+/// broadcasts, then the first output column and the output row length.
 pub const COOP_EPILOGUE_BINDINGS: u32 = 9;
-pub const COOP_EPILOGUE_PUSH_BYTES: u32 = 36;
+pub const COOP_EPILOGUE_PUSH_BYTES: u32 = 44;
 /// Tile of the output block, fixed by the 16×16×K cooperative matrix shapes.
 pub const COOP_TILE: u32 = 16;
 

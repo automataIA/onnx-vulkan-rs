@@ -344,8 +344,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 pub const IM2COL_BINDINGS: u32 = 3;
-/// 14 u32 fields, all geometry plus the sign flip.
-pub const IM2COL_PUSH_BYTES: u32 = 56;
+/// 15 u32 fields, all geometry, the sign flip and the first output pixel.
+pub const IM2COL_PUSH_BYTES: u32 = 60;
 
 /// The materialization every other kernel in this module exists to avoid.
 ///
@@ -368,6 +368,9 @@ pub const IM2COL_PUSH_BYTES: u32 = 56;
 /// `int8`: the cooperative combination is `u8 × u8` and this pass is already
 /// touching every byte, so the sign flip the matmul cannot do costs nothing
 /// here.
+///
+/// `p0` is the output pixel of row 0: `conv_im2col_coop` writes the matrix one
+/// slice of pixels at a time.
 pub const IM2COL: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<u32>;    // u8 packed [C_in, H, W]
 @group(0) @binding(1) var<storage, read> azp: array<u32>;
@@ -377,7 +380,7 @@ struct Push {
     words: u32, kdepth: u32, khkw: u32,
     h_in: u32, w_in: u32, w_out: u32, kw: u32,
     sh: u32, sw: u32, phb: u32, pwb: u32, dh: u32, dw: u32,
-    flip: u32,
+    flip: u32, p0: u32,
 }
 var<immediate> pc: Push;
 
@@ -386,7 +389,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= pc.words) { return; }
     let k4 = pc.kdepth / 4u;
-    let p = i / k4;
+    let p = pc.p0 + i / k4;
     let k0 = (i % k4) * 4u;
     let oh = p / pc.w_out;
     let ow = p % pc.w_out;
@@ -476,8 +479,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
 pub const IM2COL_HWC_KEY: &str = "ConvInteger_im2col_hwc";
 pub const IM2COL_HWC_BINDINGS: u32 = 3;
-/// 14 u32 fields, all geometry plus the sign flip.
-pub const IM2COL_HWC_PUSH_BYTES: u32 = 56;
+/// 15 u32 fields, all geometry, the sign flip and the first output pixel.
+pub const IM2COL_HWC_PUSH_BYTES: u32 = 60;
 
 /// [`IM2COL`] from an HWC activation ([`TO_HWC`]), with K ordered
 /// `(kh, kw, c)` instead of ONNX's `(c, kh, kw)`: every word of a row is four
@@ -498,7 +501,7 @@ struct Push {
     words: u32, row_words: u32, channel_words: u32,
     h_in: u32, w_in: u32, w_out: u32, kw: u32,
     sh: u32, sw: u32, phb: u32, pwb: u32, dh: u32, dw: u32,
-    flip: u32,
+    flip: u32, p0: u32,
 }
 var<immediate> pc: Push;
 
@@ -506,7 +509,7 @@ var<immediate> pc: Push;
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let padding = (azp[0] & 0xffu) * 0x01010101u;
     for (var i = gid.x; i < pc.words; i = i + groups.x * 256u) {
-        let p = i / pc.row_words;
+        let p = pc.p0 + i / pc.row_words;
         let w = i % pc.row_words;
         let tap = w / pc.channel_words;
         let cw = w % pc.channel_words;

@@ -53,6 +53,11 @@
 // With flag 4 set the scale is scale * product, rounded once as the Mul that
 // computed it ahead of the kernel did: the activation scale times the weight
 // scale, which then needs no dispatch of its own.
+// col0 and ldo place the n columns of B among the columns of a wider output
+// (ldo of them per row, the dispatch starting at col0): a convolution whose
+// im2col is materialized one slice of output pixels at a time. scale, bias
+// and product broadcast per column over that wider output. A whole product
+// passes col0 = 0, ldo = n.
 
 #version 450 core
 
@@ -138,6 +143,9 @@ layout(push_constant) uniform Push {
     uint flags;
     // how product broadcasts, as scale_step
     uint product_step;
+    // where the n columns land in a row of ldo (see the epilogue above)
+    uint col0;
+    uint ldo;
 #endif
 } pc;
 
@@ -153,7 +161,7 @@ float run_neg = 0.0;
 // float(acc) * scale + bias for one 16x16 tile at (row, col), row major.
 void finish_tile(uint row, uint col) {
     for (uint e = gl_LocalInvocationID.x; e < TILE * TILE; e += SUBGROUP_SIZE) {
-        uint c = col + e % TILE;
+        uint c = pc.col0 + col + e % TILE;
         uint r = row + e / TILE;
         // int() keeps the bits of an unsigned accumulator: the value is the
         // signed one either way (see the algebra above)
@@ -165,7 +173,7 @@ void finish_tile(uint row, uint col) {
         precise float y = x * s;
         precise float z = y + bias[c * (pc.bias_step & 1u) + r * (pc.bias_step >> 1u)];
         float v = (pc.flags & 1u) != 0u ? max(z, 0.0) : z;
-        o[r * pc.n + c] = v;
+        o[r * pc.ldo + c] = v;
         run_max = max(run_max, v);
         run_neg = max(run_neg, -v);
     }

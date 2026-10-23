@@ -645,13 +645,17 @@ pub fn implementation_fingerprint() -> crate::tuning::ImplementationFingerprint 
                 name: "split_reduce",
                 contents: SPLIT_REDUCE.as_bytes(),
             },
+            NamedShaderSource {
+                name: "wide_1d",
+                contents: WIDE_1D.as_bytes(),
+            },
         ];
         ImplementationFingerprint::compute(&ImplementationFingerprintInputs {
             schema_version: 1,
             shader_sources: &sources,
             specialization_constants: &BTreeMap::new(),
             generator_logic: include_bytes!("conv.rs"),
-            dispatch_logic: b"interp::conv_f32:v1",
+            dispatch_logic: b"interp::conv_f32:v2",
             compiler_settings: b"naga=30;wgsl-in;spv-out;entry=main",
             runtime_abi: b"bindings=4;push=68;split-reduce-bindings=3",
         })
@@ -1127,6 +1131,249 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         acc = acc + bias[(o / (pc.h_out * pc.w_out)) % pc.c_out];
     }
     out[o] = acc;
+}
+"#;
+
+// ------------------------------------------------------------- wide 1D
+
+/// Output tile of [`WIDE_1D`] on both axes.
+pub const WIDE_1D_TILE: u32 = 128;
+/// 8 u32 fields: `c_out, kdepth, l_out, taps, dil, pad, has_bias, l_in`.
+pub const WIDE_1D_PUSH_BYTES: u32 = 32;
+/// `@workgroup_size` of [`WIDE_1D`].
+pub const WIDE_1D_WORKGROUP: [u32; 3] = [16, 16, 1];
+/// Workgroup memory of [`WIDE_1D`]: `w_t` and `x_t`, 512 `vec4<f32>` each.
+pub const WIDE_1D_SHARED_BYTES: u32 = 2 * 512 * 16;
+
+/// Sizes [`wide_1d_route`] decides on, taken from the node, not the tactic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wide1dGeometry {
+    /// Spatial rank of `X` (1 for `[N, C, L]`).
+    pub spatial: usize,
+    pub batch: usize,
+    pub group: usize,
+    pub stride: usize,
+    pub c_in: usize,
+    pub c_out: usize,
+    pub taps: usize,
+    pub dil: usize,
+    /// Begin padding; the end padding only shows through `l_out`.
+    pub pad: usize,
+    pub l_in: usize,
+    pub l_out: usize,
+}
+
+/// Whether a `Conv` that resolved to the 128 blocked tactic runs [`WIDE_1D`]
+/// instead.
+///
+/// Only the conditions measured on Piper's HiFi-GAN resblocks qualify: a true
+/// 1D conv, batch 1, group 1, stride 1, `C_in` a non-zero multiple of 16 (so
+/// `K` is a whole number of `KSTEP` blocks, which the `W` staging relies on),
+/// index arithmetic proven free of overflow ([`wide_1d_indices_fit`]) and a
+/// device that can run the shader ([`wide_1d_fits_device`]). Gating on the
+/// resolved tactic keeps both the committed predicate (`C_out ≥ 128`,
+/// `K ≥ 256`, the workgroup floor) and any tuning override in charge: a
+/// geometry the tuner sent elsewhere stays there.
+pub fn wide_1d_route(tactic: Tactic, g: Wide1dGeometry, limits: TacticLimits) -> bool {
+    tactic
+        == (Tactic::Blocked {
+            output_tile: WIDE_1D_TILE,
+            k_step: BLOCKED_K_STEP,
+            micro_tile: BLOCKED_MICRO_TILE_SIZE,
+        })
+        && g.spatial == 1
+        && g.batch == 1
+        && g.group == 1
+        && g.stride == 1
+        && g.c_in > 0
+        && g.c_in.is_multiple_of(BLOCKED_K_STEP as usize)
+        && wide_1d_indices_fit(g)
+        && wide_1d_fits_device(g, limits)
+}
+
+/// Every push constant and every intermediate of [`WIDE_1D`]'s index
+/// arithmetic, in `u32` and in `i32`, stays within `i32::MAX`:
+/// - `W`: `row·K + k < C_out·K`;
+/// - `X`: the tap offset `(taps − 1)·dil`, the column `col0 + 4·cq + 3` (below
+///   `L_out` rounded up to the tile), their sum `p` and `ic·L_in + p` are all
+///   below `C_in·L_in + L_out↑128 + (taps − 1)·dil`; the padding only lowers
+///   them, by at most `pad`;
+/// - output: `row·L_out + col < C_out·L_out`, plus at most a tile of columns
+///   past it, which the store guard drops.
+///
+/// A wrapped `p` could pass the bounds guard and read the wrong element, so a
+/// geometry that cannot be shown safe keeps the blocked kernel.
+pub fn wide_1d_indices_fit(g: Wide1dGeometry) -> bool {
+    let max = i32::MAX as usize;
+    let tile = WIDE_1D_TILE as usize;
+    let fit = || -> Option<bool> {
+        let k = g.c_in.checked_mul(g.taps)?;
+        let span = g.taps.checked_sub(1)?.checked_mul(g.dil)?;
+        let columns = g.l_out.div_ceil(tile).checked_mul(tile)?;
+        let x_reach = g
+            .c_in
+            .checked_mul(g.l_in)?
+            .checked_add(columns)?
+            .checked_add(span)?;
+        let out_reach = g.c_out.checked_mul(g.l_out)?.checked_add(tile)?;
+        Some(
+            g.c_out.checked_mul(k)? <= max
+                && x_reach <= max
+                && out_reach <= max
+                && g.dil <= max
+                && g.pad <= max,
+        )
+    };
+    g.l_in > 0 && g.l_out > 0 && fit().unwrap_or(false)
+}
+
+/// The device runs [`WIDE_1D`]'s workgroup (256 invocations, 16 KiB of
+/// workgroup memory, both above or at Vulkan's guaranteed minimums of 128 and
+/// 16 KiB) and its `[L_out/128, C_out/128, 1]` grid.
+pub fn wide_1d_fits_device(g: Wide1dGeometry, limits: TacticLimits) -> bool {
+    let tile = WIDE_1D_TILE as usize;
+    let grid = [g.l_out.div_ceil(tile), g.c_out.div_ceil(tile), 1];
+    WIDE_1D_WORKGROUP.iter().product::<u32>() <= limits.max_workgroup_invocations
+        && WIDE_1D_WORKGROUP
+            .iter()
+            .zip(limits.max_workgroup_size)
+            .all(|(&size, max)| size <= max)
+        && WIDE_1D_SHARED_BYTES <= limits.max_shared_memory_bytes
+        && grid
+            .iter()
+            .zip(limits.max_workgroup_count)
+            .all(|(&groups, max)| groups <= max as usize)
+}
+
+/// 1D stride-1 `Conv` as an implicit GEMM on a 128×128 output tile, 8×8
+/// outputs per thread, both operands staged as `vec4`.
+///
+/// `out[C_out, L_out] = W[C_out, K] × im2col(X)[K, L_out]` with `K = C_in·taps`
+/// walked ic-major then tap, in steps of 16, one `fma` per term, bias added
+/// after the loop: the same order per output as [`blocked`], whose 4×4
+/// micro-tile and scalar `W` reads it replaces. `W` is staged transposed
+/// (`[KSTEP][128/4]`), so 4 rows of one `k` arrive in one shared read; the inner
+/// loop does 4 `vec4` reads per 64 FMAs instead of 5 reads per 16.
+///
+/// Padding is the blocked kernel's: an im2col entry outside `X` is staged as
+/// zero and multiplied, so a non-finite weight reaches the border outputs of
+/// its row as it does there. Rows past `C_out` and columns past `L_out` are
+/// computed and dropped. No `K` guard: [`wide_1d_route`] requires
+/// `C_in % 16 == 0`.
+pub const WIDE_1D: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+struct Push {
+    m: u32, k: u32, n: u32, taps: u32, dil: u32, pad: u32, has_bias: u32, l_in: u32,
+}
+var<immediate> pc: Push;
+
+const KSTEP = 16u;
+var<workgroup> w_t: array<vec4<f32>, 512>;
+var<workgroup> x_t: array<vec4<f32>, 512>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.y * 16u + lid.x;
+    let row0 = wid.y * 128u;
+    let col0 = wid.x * 128u;
+    var c00 = vec4<f32>(0.0); var c01 = vec4<f32>(0.0);
+    var c10 = vec4<f32>(0.0); var c11 = vec4<f32>(0.0);
+    var c20 = vec4<f32>(0.0); var c21 = vec4<f32>(0.0);
+    var c30 = vec4<f32>(0.0); var c31 = vec4<f32>(0.0);
+    var c40 = vec4<f32>(0.0); var c41 = vec4<f32>(0.0);
+    var c50 = vec4<f32>(0.0); var c51 = vec4<f32>(0.0);
+    var c60 = vec4<f32>(0.0); var c61 = vec4<f32>(0.0);
+    var c70 = vec4<f32>(0.0); var c71 = vec4<f32>(0.0);
+    for (var k0 = 0u; k0 < pc.k; k0 = k0 + KSTEP) {
+        for (var s = 0u; s < 2u; s = s + 1u) {
+            let idx = tid + s * 256u;
+            // --- W: rows rq*4 .. rq*4+3 of one k, one vec4
+            let kk = idx % KSTEP;
+            let rq = idx / KSTEP;
+            let r = row0 + rq * 4u;
+            let g = k0 + kk;
+            var v = vec4<f32>(0.0);
+            if (r < pc.m) { v.x = w[r * pc.k + g]; }
+            if (r + 1u < pc.m) { v.y = w[(r + 1u) * pc.k + g]; }
+            if (r + 2u < pc.m) { v.z = w[(r + 2u) * pc.k + g]; }
+            if (r + 3u < pc.m) { v.w = w[(r + 3u) * pc.k + g]; }
+            w_t[kk * 32u + rq] = v;
+            // --- im2col: 4 columns of one k, rebuilt from the index
+            let bk = idx / 32u;
+            let cq = idx % 32u;
+            let gk = k0 + bk;
+            let ic = gk / pc.taps;
+            let shift = i32((gk % pc.taps) * pc.dil) - i32(pc.pad);
+            let p = i32(col0 + cq * 4u) + shift;
+            let base = i32(ic * pc.l_in) + p;
+            let l = i32(pc.l_in);
+            // out of bounds = zero: the conv's implicit padding
+            var xv = vec4<f32>(0.0);
+            if (p >= 0 && p < l) { xv.x = x[base]; }
+            if (p + 1 >= 0 && p + 1 < l) { xv.y = x[base + 1]; }
+            if (p + 2 >= 0 && p + 2 < l) { xv.z = x[base + 2]; }
+            if (p + 3 >= 0 && p + 3 < l) { xv.w = x[base + 3]; }
+            x_t[bk * 32u + cq] = xv;
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < KSTEP; kk = kk + 1u) {
+            let a0 = w_t[kk * 32u + lid.y];
+            let a1 = w_t[kk * 32u + 16u + lid.y];
+            let b0 = x_t[kk * 32u + lid.x];
+            let b1 = x_t[kk * 32u + 16u + lid.x];
+            c00 = fma(vec4(a0.x), b0, c00); c01 = fma(vec4(a0.x), b1, c01);
+            c10 = fma(vec4(a0.y), b0, c10); c11 = fma(vec4(a0.y), b1, c11);
+            c20 = fma(vec4(a0.z), b0, c20); c21 = fma(vec4(a0.z), b1, c21);
+            c30 = fma(vec4(a0.w), b0, c30); c31 = fma(vec4(a0.w), b1, c31);
+            c40 = fma(vec4(a1.x), b0, c40); c41 = fma(vec4(a1.x), b1, c41);
+            c50 = fma(vec4(a1.y), b0, c50); c51 = fma(vec4(a1.y), b1, c51);
+            c60 = fma(vec4(a1.z), b0, c60); c61 = fma(vec4(a1.z), b1, c61);
+            c70 = fma(vec4(a1.w), b0, c70); c71 = fma(vec4(a1.w), b1, c71);
+        }
+        workgroupBarrier();
+    }
+    let ra = row0 + lid.y * 4u;
+    let rb = row0 + 64u + lid.y * 4u;
+    let q0 = col0 / 4u + lid.x;
+    let q1 = q0 + 16u;
+    if (pc.has_bias != 0u) {
+        // rows past C_out read a valid bias and are dropped at the store
+        let mm = pc.m - 1u;
+        c00 += bias[min(ra, mm)]; c01 += bias[min(ra, mm)];
+        c10 += bias[min(ra + 1u, mm)]; c11 += bias[min(ra + 1u, mm)];
+        c20 += bias[min(ra + 2u, mm)]; c21 += bias[min(ra + 2u, mm)];
+        c30 += bias[min(ra + 3u, mm)]; c31 += bias[min(ra + 3u, mm)];
+        c40 += bias[min(rb, mm)]; c41 += bias[min(rb, mm)];
+        c50 += bias[min(rb + 1u, mm)]; c51 += bias[min(rb + 1u, mm)];
+        c60 += bias[min(rb + 2u, mm)]; c61 += bias[min(rb + 2u, mm)];
+        c70 += bias[min(rb + 3u, mm)]; c71 += bias[min(rb + 3u, mm)];
+    }
+    st(ra, q0, c00); st(ra, q1, c01);
+    st(ra + 1u, q0, c10); st(ra + 1u, q1, c11);
+    st(ra + 2u, q0, c20); st(ra + 2u, q1, c21);
+    st(ra + 3u, q0, c30); st(ra + 3u, q1, c31);
+    st(rb, q0, c40); st(rb, q1, c41);
+    st(rb + 1u, q0, c50); st(rb + 1u, q1, c51);
+    st(rb + 2u, q0, c60); st(rb + 2u, q1, c61);
+    st(rb + 3u, q0, c70); st(rb + 3u, q1, c71);
+}
+
+// Rows past C_out and columns past L_out are dropped, so L_out need not be a
+// multiple of the tile or of 4.
+fn st(r: u32, q: u32, v: vec4<f32>) {
+    if (r >= pc.m) { return; }
+    let c0 = q * 4u;
+    let base = r * pc.n + c0;
+    if (c0 + 3u < pc.n) {
+        out[base] = v.x; out[base + 1u] = v.y; out[base + 2u] = v.z; out[base + 3u] = v.w;
+        return;
+    }
+    for (var e = 0u; e < 4u; e = e + 1u) {
+        if (c0 + e < pc.n) { out[base + e] = v[e]; }
+    }
 }
 "#;
 
@@ -1616,5 +1863,175 @@ mod tests {
             tuned_tactic(1, 196, 256, 2304),
             control_tactic(1, 196, 256, 2304)
         );
+    }
+
+    fn piper_resblock() -> super::Wide1dGeometry {
+        super::Wide1dGeometry {
+            spatial: 1,
+            batch: 1,
+            group: 1,
+            stride: 1,
+            c_in: 128,
+            c_out: 128,
+            taps: 11,
+            dil: 5,
+            pad: 25,
+            l_in: 36_032,
+            l_out: 36_032,
+        }
+    }
+
+    const WIDE: Tactic = Tactic::Blocked {
+        output_tile: 128,
+        k_step: BLOCKED_K_STEP,
+        micro_tile: BLOCKED_MICRO_TILE_SIZE,
+    };
+
+    #[test]
+    fn wide_1d_resources_match_the_shader() {
+        let source = super::WIDE_1D;
+        vk_compute::compile_wgsl(source).expect("wide 1D shader");
+        let [x, y, z] = super::WIDE_1D_WORKGROUP;
+        assert_eq!(z, 1);
+        assert!(source.contains(&format!("@workgroup_size({x}, {y})")));
+        // two workgroup arrays of 512 vec4<f32>
+        assert_eq!(source.matches("array<vec4<f32>, 512>").count(), 2);
+        assert_eq!(super::WIDE_1D_SHARED_BYTES, 2 * 512 * 16);
+    }
+
+    /// The `X` reach is crossed by the smallest step, so the bound itself is
+    /// tested, not just a far value; every other geometry breaks one condition.
+    #[test]
+    fn wide_1d_route_rejects_index_overflow_at_the_bound() {
+        let limits = representative_limits();
+        let max = i32::MAX as usize;
+        let ok = piper_resblock();
+        assert!(super::wide_1d_route(WIDE, ok, limits));
+
+        // the X reach: C_in·L_in + L_out↑128 + (taps − 1)·dil
+        let span = |g: super::Wide1dGeometry| (g.taps - 1) * g.dil;
+        let reach = |g: super::Wide1dGeometry| g.c_in * g.l_in + g.l_out.div_ceil(128) * 128;
+        let at = super::Wide1dGeometry {
+            dil: (max - reach(ok)) / (ok.taps - 1),
+            ..ok
+        };
+        assert!(reach(at) + span(at) <= max);
+        assert!(super::wide_1d_indices_fit(at));
+        let past = super::Wide1dGeometry {
+            dil: at.dil + 1,
+            ..at
+        };
+        assert!(reach(past) + span(past) > max);
+        assert!(!super::wide_1d_indices_fit(past));
+
+        for (name, g) in [
+            ("C_in 0", super::Wide1dGeometry { c_in: 0, ..ok }),
+            ("taps 0", super::Wide1dGeometry { taps: 0, ..ok }),
+            ("L_in 0", super::Wide1dGeometry { l_in: 0, ..ok }),
+            ("L_out 0", super::Wide1dGeometry { l_out: 0, ..ok }),
+            ("pad past i32", super::Wide1dGeometry { pad: max + 1, ..ok }),
+            (
+                "dilation past i32 with one tap",
+                super::Wide1dGeometry {
+                    taps: 1,
+                    dil: max + 1,
+                    ..ok
+                },
+            ),
+            (
+                "(taps − 1)·dil overflowing usize",
+                super::Wide1dGeometry {
+                    dil: usize::MAX / 2,
+                    ..ok
+                },
+            ),
+            (
+                "C_out·L_out + tile past i32",
+                super::Wide1dGeometry {
+                    c_out: 1 << 16,
+                    l_out: (max - 127) / (1 << 16) + 1,
+                    ..ok
+                },
+            ),
+            (
+                "C_out·K past i32",
+                super::Wide1dGeometry {
+                    c_out: max / (128 * 11) + 1,
+                    l_in: 1,
+                    l_out: 1,
+                    ..ok
+                },
+            ),
+        ] {
+            assert!(!super::wide_1d_route(WIDE, g, limits), "{name}");
+        }
+        // padding alone, the dilation of a single tap, pad at the bound
+        for g in [
+            super::Wide1dGeometry { pad: max, ..ok },
+            super::Wide1dGeometry {
+                taps: 1,
+                dil: max,
+                ..ok
+            },
+        ] {
+            assert!(super::wide_1d_indices_fit(g), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn wide_1d_route_needs_the_device_to_run_the_shader() {
+        let ok = representative_limits();
+        let g = piper_resblock();
+        assert!(super::wide_1d_fits_device(g, ok));
+        // Vulkan's guaranteed minimums: 128 invocations, 128×128×64, 16 KiB
+        let minimum = TacticLimits {
+            max_workgroup_count: [65_535; 3],
+            max_workgroup_invocations: 128,
+            max_workgroup_size: [128, 128, 64],
+            max_shared_memory_bytes: 16 * 1024,
+            ..ok
+        };
+        assert!(!super::wide_1d_route(WIDE, g, minimum), "128 invocations");
+        for (name, limits) in [
+            (
+                "invocations",
+                TacticLimits {
+                    max_workgroup_invocations: 255,
+                    ..ok
+                },
+            ),
+            (
+                "workgroup size",
+                TacticLimits {
+                    max_workgroup_size: [15, 1024, 64],
+                    ..ok
+                },
+            ),
+            (
+                "shared memory",
+                TacticLimits {
+                    max_shared_memory_bytes: 16 * 1024 - 4,
+                    ..ok
+                },
+            ),
+            (
+                "grid x",
+                TacticLimits {
+                    max_workgroup_count: [281, 65_535, 65_535],
+                    ..ok
+                },
+            ),
+        ] {
+            assert!(!super::wide_1d_route(WIDE, g, limits), "{name}");
+        }
+        // 36032 columns need exactly 282 workgroups along x
+        let exact = TacticLimits {
+            max_workgroup_count: [282, 1, 1],
+            max_workgroup_invocations: 256,
+            max_workgroup_size: [16, 16, 1],
+            max_shared_memory_bytes: 16 * 1024,
+            ..ok
+        };
+        assert!(super::wide_1d_route(WIDE, g, exact));
     }
 }

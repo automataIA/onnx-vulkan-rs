@@ -26,9 +26,11 @@ use crate::shaders::conv::{
     BINDINGS as CONV_F32_BINDINGS, PUSH_BYTES as CONV_F32_PUSH_BYTES,
     SPLIT_REDUCE as CONV_SPLIT_REDUCE, SPLIT_REDUCE_BINDINGS as CONV_SPLIT_REDUCE_BINDINGS,
     Tactic as ConvTactic, TacticGeometry as ConvTacticGeometry, TacticLimits as ConvTacticLimits,
+    WIDE_1D as CONV_WIDE_1D, WIDE_1D_PUSH_BYTES as CONV_WIDE_1D_PUSH_BYTES,
+    WIDE_1D_TILE as CONV_WIDE_1D_TILE, Wide1dGeometry as ConvWide1dGeometry,
     generated_source as conv_generated_source, implementation_fingerprint as conv_fingerprint,
     prefer_blocked as conv_prefer_blocked, split_k as conv_split_k,
-    tuned_tactic as conv_tuned_tactic,
+    tuned_tactic as conv_tuned_tactic, wide_1d_route as conv_wide_1d_route,
 };
 use crate::shaders::conv_integer::{
     BINDINGS as CONV_INTEGER_BINDINGS, BLOCKED_TILE_SIZE as CONV_I_BLOCKED_TILE_SIZE,
@@ -44,12 +46,19 @@ use crate::shaders::conv_integer::{
     direct as conv_i_direct_source, implicit_gemm as conv_i_gemm_source,
 };
 use crate::shaders::conv_transpose::{
-    BINDINGS as CONV_T_BINDINGS, FILL as CONV_T_FILL, FILL_BINDINGS as CONV_T_FILL_BINDINGS,
+    BINDINGS as CONV_T_BINDINGS, DIRECT_WORKGROUP as CONV_T_DIRECT_WORKGROUP,
+    DirectDims as ConvTDirectDims, FILL as CONV_T_FILL, FILL_BINDINGS as CONV_T_FILL_BINDINGS,
     FILL_PUSH_BYTES as CONV_T_FILL_PUSH_BYTES, INTERLEAVE as CONV_T_INTERLEAVE,
     INTERLEAVE_BINDINGS as CONV_T_INTERLEAVE_BINDINGS,
     INTERLEAVE_PUSH_BYTES as CONV_T_INTERLEAVE_PUSH_BYTES, PACK_BINDINGS as CONV_T_PACK_BINDINGS,
     PACK_PHASE as CONV_T_PACK_PHASE, PACK_PUSH_BYTES as CONV_T_PACK_PUSH_BYTES,
-    PUSH_BYTES as CONV_T_PUSH_BYTES, PhaseGeom, direct as conv_t_source, phase_gemm_applies,
+    POLYPHASE_1D as CONV_T_POLYPHASE, POLYPHASE_BINDINGS as CONV_T_POLYPHASE_BINDINGS,
+    POLYPHASE_PUSH_BYTES as CONV_T_POLYPHASE_PUSH_BYTES, PUSH_BYTES as CONV_T_PUSH_BYTES,
+    PhaseGeom, PolyphaseDims as ConvTPolyphaseDims, Route as ConvTRoute, direct as conv_t_source,
+    direct_fits_device as conv_t_direct_fits_device,
+    direct_indices_fit as conv_t_direct_indices_fit,
+    polyphase_fits_device as conv_t_polyphase_fits_device,
+    polyphase_indices_fit as conv_t_polyphase_indices_fit, route as conv_t_route,
 };
 use crate::shaders::elementwise::{
     ADD_TRANSPOSE_PAD, ADD_TRANSPOSE_PAD_BINDINGS, ADD_TRANSPOSE_PAD_PUSH_BYTES,
@@ -3528,77 +3537,104 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
         let split = tactic.split();
         push.extend_from_slice(&split.to_le_bytes());
         let bias: &GpuBuffer = unsafe { &*bias };
-        // Every tactic runs the source generated from all of its parameters, the
-        // one the tuner measured: a family-wide committed source with this
-        // tactic's dispatch grid leaves outputs unwritten when the sizes differ.
-        let operation = match tactic {
-            ConvTactic::Direct { .. } => "Conv_grouped",
-            ConvTactic::ImplicitGemm { .. } => "Conv16",
-            ConvTactic::Blocked {
-                output_tile: 32, ..
-            } => "Conv32",
-            ConvTactic::Blocked {
-                output_tile: 128, ..
-            } => "Conv128",
-            ConvTactic::Blocked { .. } => "Conv",
-            ConvTactic::SplitK { .. } => "Conv_split",
+        let wide = ConvWide1dGeometry {
+            spatial: g.out_shape.len() - 2,
+            batch: g.n as usize,
+            group: g.group as usize,
+            stride: g.sh as usize,
+            c_in: g.c_in as usize,
+            c_out: g.c_out as usize,
+            taps: g.kh as usize,
+            dil: g.dh as usize,
+            pad: g.phb as usize,
+            l_in: g.h_in as usize,
+            l_out: g.h_out as usize,
         };
-        let source = conv_generated_source(tactic)
-            .ok_or_else(|| anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}"))?;
-        let key = PipelineKey::tactic(operation, format!("{tactic:?}"));
-        let groups = tactic.dispatch_grid(g.total as u32, pixels, g.c_out as u32, g.n as u32);
-        // With a split the kernel writes one partial image per slice and the
-        // reduction pass below folds them onto `out`, bias included.
-        let partials = (split > 1)
-            .then(|| {
-                ctx.create_storage_buffer(device_storage_bytes(FLOAT, split as usize * g.total)?)
-            })
-            .transpose()?;
-        with_pipeline(
-            env.cache(),
-            key,
-            || {
-                ctx.create_pipeline(
-                    &compile_wgsl(&source)?,
-                    CONV_F32_BINDINGS,
-                    CONV_F32_PUSH_BYTES,
-                )
-            },
-            |pipe| {
-                ctx.stream_dispatch(
-                    pipe,
-                    &[
-                        x.buffer(),
-                        w.buffer(),
-                        bias,
-                        partials.as_ref().unwrap_or(&out),
-                    ],
-                    &push,
-                    groups,
-                )
-            },
-        )?;
-        if let Some(partials) = partials {
+        if conv_wide_1d_route(tactic, wide, limits) {
+            conv_wide_1d(
+                ctx,
+                env.cache(),
+                &g,
+                [x.buffer(), w.buffer(), bias],
+                &out,
+                bias_name.is_some(),
+            )?;
+        } else {
+            // Every tactic runs the source generated from all of its parameters, the
+            // one the tuner measured: a family-wide committed source with this
+            // tactic's dispatch grid leaves outputs unwritten when the sizes differ.
+            let operation = match tactic {
+                ConvTactic::Direct { .. } => "Conv_grouped",
+                ConvTactic::ImplicitGemm { .. } => "Conv16",
+                ConvTactic::Blocked {
+                    output_tile: 32, ..
+                } => "Conv32",
+                ConvTactic::Blocked {
+                    output_tile: 128, ..
+                } => "Conv128",
+                ConvTactic::Blocked { .. } => "Conv",
+                ConvTactic::SplitK { .. } => "Conv_split",
+            };
+            let source = conv_generated_source(tactic)
+                .ok_or_else(|| anyhow::anyhow!("unsupported generated Conv tactic {tactic:?}"))?;
+            let key = PipelineKey::tactic(operation, format!("{tactic:?}"));
+            let groups = tactic.dispatch_grid(g.total as u32, pixels, g.c_out as u32, g.n as u32);
+            // With a split the kernel writes one partial image per slice and the
+            // reduction pass below folds them onto `out`, bias included.
+            let partials = (split > 1)
+                .then(|| {
+                    ctx.create_storage_buffer(device_storage_bytes(
+                        FLOAT,
+                        split as usize * g.total,
+                    )?)
+                })
+                .transpose()?;
             with_pipeline(
                 env.cache(),
-                "Conv_split_reduce",
+                key,
                 || {
                     ctx.create_pipeline(
-                        &compile_wgsl(CONV_SPLIT_REDUCE)?,
-                        CONV_SPLIT_REDUCE_BINDINGS,
+                        &compile_wgsl(&source)?,
+                        CONV_F32_BINDINGS,
                         CONV_F32_PUSH_BYTES,
                     )
                 },
                 |pipe| {
                     ctx.stream_dispatch(
                         pipe,
-                        &[&partials, bias, &out],
+                        &[
+                            x.buffer(),
+                            w.buffer(),
+                            bias,
+                            partials.as_ref().unwrap_or(&out),
+                        ],
                         &push,
-                        [(g.total as u32).div_ceil(256), 1, 1],
+                        groups,
                     )
                 },
             )?;
-            ctx.defer_destroy(partials);
+            if let Some(partials) = partials {
+                with_pipeline(
+                    env.cache(),
+                    "Conv_split_reduce",
+                    || {
+                        ctx.create_pipeline(
+                            &compile_wgsl(CONV_SPLIT_REDUCE)?,
+                            CONV_SPLIT_REDUCE_BINDINGS,
+                            CONV_F32_PUSH_BYTES,
+                        )
+                    },
+                    |pipe| {
+                        ctx.stream_dispatch(
+                            pipe,
+                            &[&partials, bias, &out],
+                            &push,
+                            [(g.total as u32).div_ceil(256), 1, 1],
+                        )
+                    },
+                )?;
+                ctx.defer_destroy(partials);
+            }
         }
     }
     env.set(
@@ -3613,6 +3649,56 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+/// 1D `Conv` on the wide 128×128 / 8×8 tile, for the geometries
+/// [`crate::shaders::conv::wide_1d_route`] accepts; `[x, w, bias]` in binding
+/// order.
+fn conv_wide_1d(
+    ctx: &VkContext,
+    cache: &KernelCache<'_>,
+    g: &ConvGeom,
+    [x, w, bias]: [&GpuBuffer; 3],
+    out: &GpuBuffer,
+    has_bias: bool,
+) -> Result<()> {
+    let mut push = Vec::with_capacity(CONV_WIDE_1D_PUSH_BYTES as usize);
+    // the route admits only fields within i32 (`wide_1d_indices_fit`)
+    for v in [
+        g.c_out,
+        g.c_in * g.kh,
+        g.h_out,
+        g.kh,
+        g.dh,
+        g.phb,
+        i64::from(has_bias),
+        g.h_in,
+    ] {
+        push.extend_from_slice(&(v as u32).to_le_bytes());
+    }
+    with_pipeline(
+        cache,
+        "Conv_wide1d",
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(CONV_WIDE_1D)?,
+                CONV_F32_BINDINGS,
+                CONV_WIDE_1D_PUSH_BYTES,
+            )
+        },
+        |pipe| {
+            ctx.stream_dispatch(
+                pipe,
+                &[x, w, bias, out],
+                &push,
+                [
+                    (g.h_out as u32).div_ceil(CONV_WIDE_1D_TILE),
+                    (g.c_out as u32).div_ceil(CONV_WIDE_1D_TILE),
+                    1,
+                ],
+            )
+        },
+    )
+}
+
 /// Sizes the phase-GEMM route works from, all already normalized to 2D.
 struct PhaseDims {
     c_in: usize,
@@ -3625,6 +3711,23 @@ struct PhaseDims {
     kw: usize,
     sh: usize,
     sw: usize,
+    /// Leading pad along H; only the polyphase route reads it, the phase route has none.
+    phb: usize,
+}
+
+impl PhaseDims {
+    /// The node as [`CONV_T_POLYPHASE`] reads it, 1D along H.
+    fn polyphase(&self) -> ConvTPolyphaseDims {
+        ConvTPolyphaseDims {
+            c_in: self.c_in,
+            c_out: self.c_out,
+            l_in: self.h_in,
+            l_out: self.h_out,
+            kernel: self.kh,
+            stride: self.sh,
+            pad: self.phb,
+        }
+    }
 }
 
 /// Buffers of one phase-GEMM dispatch. `x` and `bias` are raw because they
@@ -3808,6 +3911,54 @@ fn conv_transpose_phase_gemm(env: &mut Env, w_name: &str, run: &PhaseRun) -> Res
     Ok(())
 }
 
+/// 1D `ConvTranspose` as one GEMM per output phase in a single dispatch; see
+/// [`crate::shaders::conv_transpose`] for the decomposition.
+///
+/// `W`, `X` and the output are all addressed in place, so there is nothing to
+/// pack, no transient buffer, and `W` need not be a constant.
+fn conv_transpose_polyphase(
+    ctx: &VkContext,
+    cache: &KernelCache<'_>,
+    w: &GpuBuffer,
+    run: &PhaseRun,
+) -> Result<()> {
+    let d = &run.d;
+    // SAFETY: both point into the environment's buffers, alive for the run.
+    let (x, bias) = unsafe { (&*run.x, &*run.bias) };
+    // The route checked both, and that every push field and the grid fit in
+    // u32 (`polyphase_indices_fit`, `polyphase_fits_device`).
+    let p = d.polyphase();
+    let (Some(nq), Some(grid)) = (p.nq(), p.grid()) else {
+        bail!("ConvTranspose: polyphase geometry {p:?} has no grid");
+    };
+    let mut push = Vec::with_capacity(CONV_T_POLYPHASE_PUSH_BYTES as usize);
+    for v in [
+        d.c_in,
+        d.c_out,
+        d.h_in,
+        d.h_out,
+        d.kh,
+        d.sh,
+        d.phb,
+        nq,
+        usize::from(run.has_bias),
+    ] {
+        push.extend_from_slice(&(v as u32).to_le_bytes());
+    }
+    with_pipeline(
+        cache,
+        "ConvTranspose_polyphase",
+        || {
+            ctx.create_pipeline(
+                &compile_wgsl(CONV_T_POLYPHASE)?,
+                CONV_T_POLYPHASE_BINDINGS,
+                CONV_T_POLYPHASE_PUSH_BYTES,
+            )
+        },
+        |pipe| ctx.stream_dispatch(pipe, &[w, x, bias, run.out], &push, grid.map(|n| n as u32)),
+    )
+}
+
 /// `ConvTranspose` f32 1D/2D.
 ///
 /// Geometry is not `conv_geometry` with different numbers: `W` is
@@ -3847,6 +3998,12 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
         .and_then(AttrValue::as_i64)
         .unwrap_or(1);
     ensure!(group >= 1, "ConvTranspose: group {group} is invalid");
+    ensure!(
+        w_shape.len() == x_shape.len(),
+        "ConvTranspose: W rank {} differs from X rank {}",
+        w_shape.len(),
+        x_shape.len()
+    );
     let ks = ints("kernel_shape").unwrap_or_else(|| w_shape[2..].to_vec());
     let strides = ints("strides").unwrap_or_else(|| vec![1; spatial]);
     let dils = ints("dilations").unwrap_or_else(|| vec![1; spatial]);
@@ -3861,9 +4018,24 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
         "ConvTranspose: attributi incoerenti con rank spaziale {spatial}"
     );
 
+    // Invalid attributes are the model's error on every route: nothing below
+    // divides by a stride or casts a pad before these hold.
+    ensure!(
+        ks.iter().chain(&strides).chain(&dils).all(|&v| v >= 1)
+            && pads.iter().chain(&outpad).all(|&v| v >= 0),
+        "ConvTranspose: kernel_shape {ks:?}, strides {strides:?} and dilations {dils:?} \
+         must be positive, pads {pads:?} and output_padding {outpad:?} non-negative"
+    );
+
     let (n, c_in) = (x_shape[0], x_shape[1]);
     let gso = w_shape[1]; // C_out / group
-    let c_out = gso * group;
+    ensure!(
+        w_shape[0] == c_in && c_in % group == 0 && w_shape[2..] == ks[..],
+        "ConvTranspose: W {w_shape:?} does not match X {x_shape:?}, group {group} \
+         and kernel_shape {ks:?}"
+    );
+    let overflow = || anyhow::anyhow!("ConvTranspose: output size of X {x_shape:?} overflows");
+    let c_out = gso.checked_mul(group).ok_or_else(overflow)?;
     let (h_in, w_in, kh, kw, sh, sw, dh, dw) = if spatial == 1 {
         (x_shape[2], 1, ks[0], 1, strides[0], 1, dils[0], 1)
     } else {
@@ -3876,8 +4048,18 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
     } else {
         (pads[0], pads[2], pads[1], pads[3], outpad[0], outpad[1])
     };
-    let h_out = (h_in - 1) * sh - phb - phe + dh * (kh - 1) + 1 + oph;
-    let w_out = (w_in - 1) * sw - pwb - pwe + dw * (kw - 1) + 1 + opw;
+    // see the formula above; every operand is non-negative
+    let out_len = |len: i64, s: i64, d: i64, k: i64, pb: i64, pe: i64, op: i64| {
+        (len - 1)
+            .checked_mul(s)?
+            .checked_add(d.checked_mul(k - 1)?)?
+            .checked_add(op)?
+            .checked_add(1)?
+            .checked_sub(pb)?
+            .checked_sub(pe)
+    };
+    let h_out = out_len(h_in, sh, dh, kh, phb, phe, oph).ok_or_else(overflow)?;
+    let w_out = out_len(w_in, sw, dw, kw, pwb, pwe, opw).ok_or_else(overflow)?;
     ensure!(
         h_out > 0 && w_out > 0,
         "ConvTranspose: shape di output degenere"
@@ -3887,7 +4069,12 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
     } else {
         vec![n, c_out, h_out, w_out]
     };
-    let total = (n * c_out * h_out * w_out).max(0) as usize;
+    let total = n
+        .checked_mul(c_out)
+        .and_then(|v| v.checked_mul(h_out))
+        .and_then(|v| v.checked_mul(w_out))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(overflow)?;
 
     env.ensure_device(&x_name)?;
     env.ensure_device(&w_name)?;
@@ -3900,12 +4087,18 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
         }
         None => env.cache().zero_scalar()?,
     };
+    if let Some(b) = &bias_name {
+        let shape = env.shape_of(b)?;
+        ensure!(
+            shape == [c_out],
+            "ConvTranspose: B {shape:?} is not [{c_out}]"
+        );
+    }
     let x = env.device(&x_name)?;
     let w = env.device(&w_name)?;
-    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, total)?)?;
 
     // The phase decomposition needs a constant `W` (its packed slices are cached
-    // by name across runs) on top of the geometric conditions.
+    // by name across runs) on top of the geometric conditions; see `route`.
     let geom = PhaseGeom {
         batch: n,
         group,
@@ -3914,32 +4107,72 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
         dilation: (dh, dw),
         zero_pads: pads.iter().all(|&p| p == 0),
         zero_output_padding: outpad.iter().all(|&p| p == 0),
+        one_d: spatial == 1,
         macs: c_in
             .saturating_mul(c_out)
             .saturating_mul(h_out)
             .saturating_mul(w_out),
     };
-    if total > 0 && phase_gemm_applies(&geom) && env.is_initializer(&w_name) {
+    // Every dimension is non-negative after validation: the casts are exact.
+    let dims = PhaseDims {
+        c_in: c_in as usize,
+        c_out: c_out as usize,
+        h_in: h_in as usize,
+        w_in: w_in as usize,
+        h_out: h_out as usize,
+        w_out: w_out as usize,
+        kh: kh as usize,
+        kw: kw as usize,
+        sh: sh as usize,
+        sw: sw as usize,
+        phb: phb as usize,
+    };
+    let limits = ctx.compute_limits().max_workgroup_count;
+    let mut route = conv_t_route(&geom, env.is_initializer(&w_name));
+    // A valid node the polyphase shader cannot address, or the device cannot
+    // launch, takes the gather kernel, which checks its own limits below.
+    if route == ConvTRoute::Polyphase {
+        let p = dims.polyphase();
+        if !(conv_t_polyphase_indices_fit(&p) && conv_t_polyphase_fits_device(&p, limits)) {
+            route = ConvTRoute::Gather;
+        }
+    }
+    let direct = ConvTDirectDims {
+        batch: n as usize,
+        c_in: dims.c_in,
+        c_out: dims.c_out,
+        group: group as usize,
+        input: (dims.h_in, dims.w_in),
+        output: (dims.h_out, dims.w_out),
+        kernel: (dims.kh, dims.kw),
+        stride: (dims.sh, dims.sw),
+        pad: (dims.phb, pwb as usize),
+        dilation: (dh as usize, dw as usize),
+    };
+    // Valid, but past what the fallback addresses: refused, never run partially.
+    ensure!(
+        total == 0
+            || route != ConvTRoute::Gather
+            || conv_t_direct_indices_fit(&direct) && conv_t_direct_fits_device(&direct, limits),
+        "ConvTranspose: unsupported geometry {direct:?}: past the gather kernel's \
+         index or dispatch range"
+    );
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, total)?)?;
+    if total > 0 && route != ConvTRoute::Gather {
         let run = PhaseRun {
             x: x.buffer() as *const GpuBuffer,
             bias,
             has_bias: bias_name.is_some(),
             out: &out,
-            d: PhaseDims {
-                c_in: c_in as usize,
-                c_out: c_out as usize,
-                h_in: h_in as usize,
-                w_in: w_in as usize,
-                h_out: h_out as usize,
-                w_out: w_out as usize,
-                kh: kh as usize,
-                kw: kw as usize,
-                sh: sh as usize,
-                sw: sw as usize,
-            },
+            d: dims,
         };
-        conv_transpose_phase_gemm(env, &w_name, &run)?;
+        if route == ConvTRoute::Phase {
+            conv_transpose_phase_gemm(env, &w_name, &run)?;
+        } else {
+            conv_transpose_polyphase(ctx, env.cache(), w.buffer(), &run)?;
+        }
     } else if total > 0 {
+        // all in range, checked above (`direct_indices_fit`)
         let fields = [
             total as u32,
             c_in as u32,
@@ -3980,7 +4213,7 @@ fn conv_transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
                     pipe,
                     &[x.buffer(), w.buffer(), bias, &out],
                     &push,
-                    [(total as u32).div_ceil(256), 1, 1],
+                    [(total as u32).div_ceil(CONV_T_DIRECT_WORKGROUP), 1, 1],
                 )
             },
         )?;

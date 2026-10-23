@@ -330,6 +330,7 @@ fn infer_node(
         | "Sign"
         | "Floor"
         | "Ceil"
+        | "Softplus"
         | "Round"
         | "Reciprocal"
         | "Sin"
@@ -474,11 +475,17 @@ fn infer_node(
                 .or_else(|| ctx.constant_ints(node, 1));
             vec![TensorType {
                 dtype,
-                shape: reduce(
-                    &first.shape,
-                    axes.as_deref(),
-                    attr_i64(node, "keepdims", 1) != 0,
-                ),
+                shape: if axes.as_ref().is_none_or(Vec::is_empty)
+                    && attr_i64(node, "noop_with_empty_axes", 0) == 1
+                {
+                    first.shape.clone()
+                } else {
+                    reduce(
+                        &first.shape,
+                        axes.as_deref().filter(|a| !a.is_empty()),
+                        attr_i64(node, "keepdims", 1) != 0,
+                    )
+                },
             }]
         }
 
@@ -626,6 +633,15 @@ fn infer_node(
                 },
             ]
         }
+        "RandomNormalLike" => vec![TensorType {
+            dtype: node
+                .attrs
+                .get("dtype")
+                .and_then(AttrValue::as_i64)
+                .map(|v| v as i32)
+                .or(first.dtype),
+            shape: first.shape.clone(),
+        }],
         "NonZero" => vec![TensorType::dtype_only(INT64)],
         "Split" => split(node, &ctx, &first),
 
@@ -1171,5 +1187,127 @@ fn split(node: &NodeIr, ctx: &Ctx, first: &TensorType) -> Vec<TensorType> {
             };
             count
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dim, TensorType, infer};
+    use onnx_vulkan_core::host_ops::{FLOAT, INT64};
+    use onnx_vulkan_core::{AttrValue, GraphIr, NodeIr};
+    use std::collections::HashMap;
+
+    fn node(op: &str, input: &str, output: &str, attrs: &[(&str, AttrValue)]) -> NodeIr {
+        NodeIr {
+            domain: String::new(),
+            op: op.into(),
+            opset: 18,
+            name: op.into(),
+            inputs: vec![input.into()],
+            outputs: vec![output.into()],
+            attrs: attrs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        }
+    }
+
+    fn infer_nodes(dtype: i32, shape: &[i64], nodes: Vec<NodeIr>) -> TensorType {
+        let graph = GraphIr {
+            nodes,
+            inputs: vec!["x".into()],
+            outputs: vec!["y".into()],
+            ..Default::default()
+        };
+        let declared = HashMap::from([(
+            "x".to_owned(),
+            TensorType {
+                dtype: Some(dtype),
+                shape: Some(shape.iter().copied().map(Dim::Fixed).collect()),
+            },
+        )]);
+        let (types, conflicts) = infer(&graph, &declared);
+        assert!(conflicts.is_empty());
+        types.get("y").expect("inferred output type").clone()
+    }
+
+    #[test]
+    fn random_normal_like_respects_explicit_and_inferred_dtype() {
+        let explicit = node(
+            "RandomNormalLike",
+            "x",
+            "y",
+            &[("dtype", AttrValue::Int(i64::from(FLOAT)))],
+        );
+        let output = infer_nodes(INT64, &[2, 3], vec![explicit]);
+        assert_eq!(output.dtype, Some(FLOAT));
+        assert_eq!(output.concrete(), Some(vec![2, 3]));
+
+        let inferred = node("RandomNormalLike", "x", "y", &[]);
+        let output = infer_nodes(FLOAT, &[2, 3], vec![inferred]);
+        assert_eq!(output.dtype, Some(FLOAT));
+        assert_eq!(output.concrete(), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn softplus_and_ceil_preserve_shape_and_dtype() {
+        let nodes = vec![
+            node("Softplus", "x", "soft", &[]),
+            node("Ceil", "soft", "y", &[]),
+        ];
+        let output = infer_nodes(FLOAT, &[2, 3, 5], nodes);
+        assert_eq!(output.dtype, Some(FLOAT));
+        assert_eq!(output.concrete(), Some(vec![2, 3, 5]));
+    }
+
+    #[test]
+    fn reductions_cover_multi_axis_all_axes_and_empty_axes_noop() {
+        let multi = node(
+            "ReduceSum",
+            "x",
+            "y",
+            &[
+                ("axes", AttrValue::Ints(vec![0, 2])),
+                ("keepdims", AttrValue::Int(0)),
+            ],
+        );
+        assert_eq!(
+            infer_nodes(FLOAT, &[2, 3, 4], vec![multi]).concrete(),
+            Some(vec![3])
+        );
+
+        let all_absent = node("ReduceSum", "x", "y", &[]);
+        assert_eq!(
+            infer_nodes(FLOAT, &[2, 3, 4], vec![all_absent]).concrete(),
+            Some(vec![1, 1, 1])
+        );
+
+        let all_empty = node(
+            "ReduceSum",
+            "x",
+            "y",
+            &[
+                ("axes", AttrValue::Ints(vec![])),
+                ("keepdims", AttrValue::Int(0)),
+            ],
+        );
+        assert_eq!(
+            infer_nodes(FLOAT, &[2, 3, 4], vec![all_empty]).concrete(),
+            Some(vec![])
+        );
+
+        let noop = node(
+            "ReduceSum",
+            "x",
+            "y",
+            &[
+                ("axes", AttrValue::Ints(vec![])),
+                ("noop_with_empty_axes", AttrValue::Int(1)),
+            ],
+        );
+        assert_eq!(
+            infer_nodes(FLOAT, &[2, 3, 4], vec![noop]).concrete(),
+            Some(vec![2, 3, 4])
+        );
     }
 }

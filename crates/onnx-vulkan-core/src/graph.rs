@@ -361,7 +361,12 @@ fn attribute(digest: &mut Sha256, value: &AttrValue) {
 /// ONNX moved `axes` to inputs at different times: `ReduceSum` from
 /// opset 13, the other reductions from opset 18. The two forms describe the
 /// same node.
-const AXES_AS_INPUT: [(&str, usize); 3] = [("ReduceSum", 1), ("ReduceMean", 1), ("ReduceMax", 1)];
+const AXES_AS_INPUT: [(&str, usize); 4] = [
+    ("ReduceSum", 1),
+    ("ReduceMean", 1),
+    ("ReduceMax", 1),
+    ("ReduceMin", 1),
+];
 
 /// Values produced by `Constant` nodes, indexed by output name.
 ///

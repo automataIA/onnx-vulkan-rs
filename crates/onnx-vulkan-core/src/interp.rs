@@ -206,6 +206,10 @@ pub fn is_implemented(op: &str) -> bool {
             | "Pad"
             | "Split"
             | "Floor"
+            | "Ceil"
+            | "Softplus"
+            | "NonZero"
+            | "RandomNormalLike"
             | "Not"
             | "And"
             | "Equal"
@@ -468,13 +472,34 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 && present(2)
                 && present(3)
         }
-        // only the form with `axes` as an attribute and a single axis: with axes
-        // as input the value is not known when looking at the node
-        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" => node
-            .attrs
-            .get("axes")
-            .and_then(AttrValue::as_ints)
-            .is_some_and(|a| a.len() == 1),
+        // Constant axes inputs are canonicalized before capability checks.
+        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" => {
+            !node.inputs.get(1).is_some_and(|n| !n.is_empty())
+                && matches!(int_attr("noop_with_empty_axes", 0), 0 | 1)
+                && matches!(int_attr("keepdims", 1), 0 | 1)
+        }
+        "RandomNormalLike" => {
+            let float_attr_ok = |name: &str, nonnegative: bool| match node.attrs.get(name) {
+                None => true,
+                Some(AttrValue::Float(value)) => {
+                    value.is_finite() && (!nonnegative || *value >= 0.0)
+                }
+                Some(_) => false,
+            };
+            let dtype_ok = match node.attrs.get("dtype") {
+                None => true,
+                Some(AttrValue::Int(dtype)) => *dtype == 1,
+                Some(_) => false,
+            };
+            dtype_ok
+                && float_attr_ok("mean", false)
+                && float_attr_ok("scale", true)
+                && float_attr_ok("seed", false)
+                && node.inputs.len() == 1
+                && !node.inputs[0].is_empty()
+                && node.outputs.len() == 1
+                && !node.outputs[0].is_empty()
+        }
         // `select_last_index = 1` reverses the tie-break, and the kernel keeps
         // the first occurrence; a graph that asks for the last one is refused
         // rather than answered with the other index
@@ -649,6 +674,8 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
 /// producer could not resolve is allowed: this refuses what is known to be
 /// wrong, never what is merely unknown.
 const FLOAT_ONLY_INPUT0: &[&str] = &[
+    "Ceil",
+    "Softplus",
     "Softmax",
     "LayerNormalization",
     "SimplifiedLayerNormalization",
@@ -678,6 +705,39 @@ pub fn unsupported_dtype(
     node: &NodeIr,
     types: &std::collections::HashMap<String, i32>,
 ) -> Option<String> {
+    if node.op == "NonZero" {
+        let dtype = *types.get(node.inputs.first()?)?;
+        return (!crate::nonzero::supported_dtype(dtype))
+            .then(|| format!("NonZero unsupported element type {dtype}"));
+    }
+    if node.op == "RandomNormalLike" && !node.attrs.contains_key("dtype") {
+        let dtype = *types.get(node.inputs.first()?)?;
+        return (dtype != FLOAT).then(|| {
+            format!("RandomNormalLike inferred output type {dtype}; only float32 is supported")
+        });
+    }
+    if matches!(
+        node.op.as_str(),
+        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin"
+    ) {
+        let name = node.inputs.first().filter(|n| !n.is_empty())?;
+        let dtype = *types.get(name.as_str())?;
+        let supported = [
+            FLOAT,
+            crate::host_ops::BOOL,
+            crate::host_ops::UINT8,
+            crate::host_ops::INT8,
+            crate::host_ops::INT32,
+            crate::host_ops::INT64,
+        ]
+        .contains(&dtype);
+        return (!supported).then(|| {
+            format!(
+                "{} unsupported input element type {dtype}; supported types are float32, bool, uint8, int8, int32, and int64",
+                node.op
+            )
+        });
+    }
     if !FLOAT_ONLY_INPUT0.contains(&node.op.as_str()) {
         return None;
     }
@@ -781,7 +841,7 @@ pub fn unsupported_quantization(
 }
 
 /// Runs a closure with the pipeline (cached in the session) for an op key.
-fn with_pipeline<R>(
+pub(crate) fn with_pipeline<R>(
     cache: &KernelCache<'_>,
     key: impl Into<PipelineKey>,
     build: impl FnOnce() -> Result<ComputePipeline>,
@@ -1045,6 +1105,24 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "DequantizeLinear" => dequantize_linear(env, node),
         "Pad" => pad(env, node),
         "Split" => split(env, node),
+        "NonZero" => crate::nonzero::execute(env, node),
+        "RandomNormalLike" => crate::random_normal::execute(env, node),
+        "Ceil" => unary(env, node, "Ceil", "ceil(v)"),
+        "Softplus" => unary_with_helpers(
+            env,
+            node,
+            "Softplus",
+            "softplus_stable(v)",
+            r#"
+fn softplus_stable(v: f32) -> f32 {
+    let z = exp(-abs(v));
+    var tail = log(1.0 + z);
+    // log(1 + z) loses the positive tail when 1 + z rounds to 1.
+    if (z < 0.0001) { tail = z * (1.0 - 0.5 * z); }
+    return max(v, 0.0) + tail;
+}
+"#,
+        ),
         "Floor" => host_unary(env, node, host_ops::floor),
         "Not" => host_unary(env, node, host_ops::not),
         "And" => host_cmp(env, node, host_ops::CmpOp::And),
@@ -1242,9 +1320,8 @@ fn cumsum(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
-/// `LeakyRelu`: `x` if positive, `alpha·x` otherwise. `alpha` is an attribute,
-/// so it ends up in the source and every distinct value is a distinct pipeline —
-/// as for the other unary ops, which are parameterized by the expression.
+/// `LeakyRelu`: `x` if positive, `alpha·x` otherwise. `alpha` is an attribute
+/// embedded in the shader source, so the generated source identifies the pipeline.
 fn leaky_relu(env: &mut Env, node: &NodeIr) -> Result<()> {
     let alpha = node
         .attrs
@@ -8198,7 +8275,7 @@ enum ReduceKind {
     Min,
 }
 
-/// `ReduceMean` / `ReduceSum` / `ReduceMax` on **a single axis**.
+/// `ReduceMean` / `ReduceSum` / `ReduceMax` / `ReduceMin` over one or more axes.
 ///
 /// Axes come from the `axes` attribute, where `fold_constant_params` already
 /// promoted them if they were a constant input (Sum from opset 13, Mean/Max from 18).
@@ -8213,30 +8290,58 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
     let x_name = node.inputs[0].clone();
     let x_shape = env.shape_of(&x_name)?;
     let rank = x_shape.len() as i64;
-
-    let axes = node
-        .attrs
-        .get("axes")
-        .and_then(|a| a.as_ints())
-        .with_context(|| format!("{}: attributo 'axes' assente", node.op))?;
-    ensure!(
-        axes.len() == 1,
-        "{}: only one axis (axes = {axes:?})",
-        node.op
-    );
-    let axis = if axes[0] < 0 { axes[0] + rank } else { axes[0] };
-    ensure!(
-        (0..rank).contains(&axis),
-        "{}: axis {axis} out of rank {rank}",
-        node.op
-    );
-    let axis = axis as usize;
+    let axes = node.attrs.get("axes").and_then(AttrValue::as_ints);
     let keepdims = node
         .attrs
         .get("keepdims")
         .and_then(AttrValue::as_i64)
         .unwrap_or(1)
         != 0;
+    let noop_with_empty_axes = node
+        .attrs
+        .get("noop_with_empty_axes")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0)
+        != 0;
+
+    // An omitted axes argument reduces all dimensions. An explicitly empty
+    // axes list is a no-op only when requested; otherwise it also means all.
+    let axes = match axes {
+        Some([]) | None if noop_with_empty_axes => {
+            return meta_reshape_out(env, node, x_shape);
+        }
+        Some(axes) if !axes.is_empty() => axes.to_vec(),
+        Some(_) | None => (0..rank).collect(),
+    };
+
+    let mut normalized = Vec::with_capacity(axes.len());
+    for raw_axis in axes {
+        let axis = if raw_axis < 0 {
+            raw_axis + rank
+        } else {
+            raw_axis
+        };
+        ensure!(
+            (0..rank).contains(&axis),
+            "{}: axis {raw_axis} out of rank {rank}",
+            node.op
+        );
+        ensure!(
+            !normalized.contains(&(axis as usize)),
+            "{}: duplicate axis {raw_axis} in axes list",
+            node.op
+        );
+        normalized.push(axis as usize);
+    }
+
+    // Reducing in descending order preserves the original axis indices when
+    // keepdims=0. It is also valid when keepdims=1, where rank is unchanged.
+    normalized.sort_unstable_by(|a, b| b.cmp(a));
+    if normalized.is_empty() {
+        // A scalar reduced over all axes has no axis to dispatch. Preserve its
+        // value and scalar shape through the same metadata copy as Identity.
+        return meta_reshape_out(env, node, x_shape);
+    }
 
     if env.dtype_of(&x_name)? != FLOAT {
         let op = match kind {
@@ -8245,19 +8350,52 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
             ReduceKind::Max => host_ops::RedOp::Max,
             ReduceKind::Min => host_ops::RedOp::Min,
         };
-        let x = env.host(&x_name)?;
-        let out = host_ops::reduce(&x, axis, op, keepdims)?;
+        let out = host_ops::reduce_axes(&env.host(&x_name)?, &normalized, op, keepdims)?;
         env.set(&node.outputs[0], Tensor::Host(out));
         return Ok(());
     }
 
+    let output_name = node.outputs[0].clone();
+    let mut current_name = x_name;
+    let mut current_is_temporary = false;
+    for (step, axis) in normalized.iter().copied().enumerate() {
+        let is_last = step + 1 == normalized.len();
+        let next_name = if is_last {
+            output_name.clone()
+        } else {
+            // Internal values are released as soon as their successor is recorded.
+            let mut name = format!("\0reduce:{}:{step}", output_name);
+            while env.value(&name).is_some() || env.is_initializer(&name) || name == output_name {
+                name.push('_');
+            }
+            name
+        };
+        reduce_axis(env, &current_name, &next_name, axis, kind, keepdims)?;
+        if current_is_temporary {
+            env.release(&current_name);
+        }
+        current_name = next_name;
+        current_is_temporary = !is_last;
+    }
+    Ok(())
+}
+
+/// Runs one axis of a multi-axis reduction and stores the result under
+/// `output_name`. Intermediate outputs are released by `reduce` once consumed.
+fn reduce_axis(
+    env: &mut Env,
+    input_name: &str,
+    output_name: &str,
+    axis: usize,
+    kind: ReduceKind,
+    keepdims: bool,
+) -> Result<()> {
+    let x_shape = env.shape_of(input_name)?;
     let ctx = env.context();
-    env.ensure_device(&x_name)?;
-    let x = env.device(&x_name)?;
-    let elem_count = x.elem_count;
-    let c = x_shape[axis] as usize;
-    let inner: usize = x_shape[axis + 1..].iter().product::<i64>().max(1) as usize;
-    let rows = elem_count.checked_div(c).unwrap_or(0);
+    env.ensure_device(input_name)?;
+    let x = env.device(input_name)?;
+    let c = usize::try_from(x_shape[axis])?;
+    let inner = crate::element_count(&x_shape[axis + 1..])?;
 
     let mut out_shape = x_shape;
     if keepdims {
@@ -8266,6 +8404,11 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
         out_shape.remove(axis);
     }
 
+    let rows = crate::element_count(&out_shape)?;
+    ensure!(
+        rows <= u32::MAX as usize && c <= u32::MAX as usize && inner <= u32::MAX as usize,
+        "reduction shape exceeds shader indexing limits"
+    );
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, rows)?)?;
     if rows > 0 {
         // griglia 2D: `rows` supera spesso il limite di 65535 workgroup per asse
@@ -8293,7 +8436,7 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
         )?;
     }
     env.set(
-        &node.outputs[0],
+        output_name,
         Tensor::Device(DevTensor {
             dtype: FLOAT,
             shape: out_shape,
@@ -9657,9 +9800,11 @@ fn unary_with_helpers(
     let out = ctx.create_storage_buffer((elem_count.max(1) * 4) as u64)?;
     if elem_count > 0 {
         let src = format!("{helpers}{}", UNARY_TEMPLATE.replace("OP", op_expr));
+        // Unary expressions and helper sets specialize the generated shader.
+        let pipeline_key = PipelineKey::tactic(key, src.clone());
         with_pipeline(
             env.cache(),
-            key,
+            pipeline_key,
             || {
                 let spirv = compile_wgsl(&src)?;
                 ctx.create_pipeline(&spirv, 2, 4)

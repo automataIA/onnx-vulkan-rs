@@ -177,44 +177,139 @@ pub enum RedOp {
     Min,
 }
 
-/// Single-axis reduction for **non-f32** tensors not handled by GPU kernels.
-///
-/// Necessary because support checks inspect node types rather than dtypes:
-/// `ReduceSum` on an int64 mask is claimed like all the others, and must have
-/// a working path. Math stays in i64 and the result returns to the input
-/// dtype; the mean truncates, as a cast from float would.
+/// Integer reduction over one axis for compatibility with existing callers.
 pub fn reduce(x: &HostTensor, axis: usize, op: RedOp, keepdims: bool) -> Result<HostTensor> {
+    reduce_axes(x, &[axis], op, keepdims)
+}
+
+/// Integer reduction over several axes, performed directly into output bins.
+///
+/// Summation uses i64 wrapping arithmetic, matching the host's fixed-width
+/// integer behavior. Mean divides the accumulated value by the product of all
+/// reduced dimensions once, avoiding truncation at each intermediate axis.
+pub fn reduce_axes(
+    x: &HostTensor,
+    axes: &[usize],
+    op: RedOp,
+    keepdims: bool,
+) -> Result<HostTensor> {
+    x.validate()?;
+    ensure!(
+        matches!(x.dtype, BOOL | UINT8 | INT8 | INT32 | INT64),
+        "integer reduce does not support dtype {}",
+        x.dtype
+    );
+
     let rank = x.shape.len();
-    if axis >= rank {
-        return Err(Error::InvalidTensor(format!(
-            "reduce: axis {axis} out of rank {rank}"
-        )));
+    let mut reduced = vec![false; rank];
+    for &axis in axes {
+        ensure!(axis < rank, "reduce: axis {axis} out of rank {rank}");
+        ensure!(!reduced[axis], "reduce: duplicate axis {axis}");
+        reduced[axis] = true;
     }
+
+    let mut output_shape = Vec::with_capacity(rank);
+    for (axis, &dim) in x.shape.iter().enumerate() {
+        if reduced[axis] {
+            if keepdims {
+                output_shape.push(1);
+            }
+        } else {
+            output_shape.push(dim);
+        }
+    }
+    let output_count = element_count(&output_shape)?;
+    let reduction_volume = axes
+        .iter()
+        .try_fold(1usize, |volume, &axis| {
+            volume.checked_mul(x.shape[axis] as usize)
+        })
+        .ok_or_else(|| Error::InvalidTensor("reduce: reduction volume overflow".into()))?;
+    if op == RedOp::Mean {
+        ensure!(
+            reduction_volume != 0,
+            "ReduceMean over an empty reduction axis"
+        );
+    }
+
     let values = x.to_i64()?;
-    let c = x.shape[axis].max(0) as usize;
-    let inner: usize = x.shape[axis + 1..].iter().product::<i64>().max(1) as usize;
-    let rows = values.len().checked_div(c.max(1)).unwrap_or(0);
+    let identity = match op {
+        RedOp::Sum | RedOp::Mean => 0,
+        RedOp::Max => match x.dtype {
+            BOOL | UINT8 => 0,
+            INT8 => i8::MIN as i64,
+            INT32 => i32::MIN as i64,
+            _ => i64::MIN,
+        },
+        RedOp::Min => match x.dtype {
+            BOOL => 1,
+            UINT8 => u8::MAX as i64,
+            INT8 => i8::MAX as i64,
+            INT32 => i32::MAX as i64,
+            _ => i64::MAX,
+        },
+    };
+    let mut bins = vec![identity; output_count];
+    let mut mean_sums = (op == RedOp::Mean).then(|| vec![0i128; output_count]);
+    let mut strides = vec![1usize; rank];
+    for axis in (0..rank.saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1]
+            .checked_mul(x.shape[axis + 1] as usize)
+            .ok_or_else(|| Error::InvalidTensor("reduce: input stride overflow".into()))?;
+    }
+    let mut output_strides = vec![1usize; output_shape.len()];
+    for axis in (0..output_shape.len().saturating_sub(1)).rev() {
+        output_strides[axis] = output_strides[axis + 1]
+            .checked_mul(output_shape[axis + 1] as usize)
+            .ok_or_else(|| Error::InvalidTensor("reduce: output stride overflow".into()))?;
+    }
 
-    let mut out = Vec::with_capacity(rows * 8);
-    for r in 0..rows {
-        let base = (r / inner) * c * inner + r % inner;
-        let it = (0..c).map(|k| values[base + k * inner]);
-        let acc = match op {
-            RedOp::Max => it.fold(i64::MIN, i64::max),
-            RedOp::Min => it.fold(i64::MAX, i64::min),
-            RedOp::Sum => it.sum(),
-            RedOp::Mean => it.sum::<i64>() / c.max(1) as i64,
+    for (input_index, &value) in values.iter().enumerate() {
+        let mut output_index = 0usize;
+        let mut output_axis = 0usize;
+        for axis in 0..rank {
+            if reduced[axis] {
+                if keepdims {
+                    output_axis += 1;
+                }
+            } else {
+                let coordinate = (input_index / strides[axis]) % x.shape[axis] as usize;
+                output_index += coordinate * output_strides[output_axis];
+                output_axis += 1;
+            }
+        }
+        bins[output_index] = match op {
+            RedOp::Sum => bins[output_index].wrapping_add(value),
+            RedOp::Mean => {
+                mean_sums.as_mut().expect("mean sums allocated")[output_index] += value as i128;
+                0
+            }
+            RedOp::Max => bins[output_index].max(value),
+            RedOp::Min => bins[output_index].min(value),
         };
-        out.extend_from_slice(&acc.to_le_bytes());
+    }
+    if op == RedOp::Mean {
+        let divisor = i128::try_from(reduction_volume)
+            .map_err(|_| Error::InvalidTensor("reduce: mean divisor exceeds i128".into()))?;
+        for (value, sum) in bins.iter_mut().zip(mean_sums.expect("mean sums allocated")) {
+            *value = (sum / divisor) as i64;
+        }
     }
 
-    let mut shape = x.shape.clone();
-    if keepdims {
-        shape[axis] = 1;
-    } else {
-        shape.remove(axis);
+    let mut data = Vec::with_capacity(storage_len(x.dtype, output_count).ok_or_else(|| {
+        Error::InvalidTensor(format!("reduce: dtype {} has no fixed storage", x.dtype))
+    })?);
+    for value in bins {
+        match x.dtype {
+            BOOL => data.push((value != 0) as u8),
+            UINT8 => data.push(value as u8),
+            INT8 => data.push(value as i8 as u8),
+            INT32 => data.extend_from_slice(&(value as i32).to_le_bytes()),
+            INT64 => data.extend_from_slice(&value.to_le_bytes()),
+            _ => unreachable!("dtype checked above"),
+        }
     }
-    cast(&HostTensor::new(INT64, shape, out), x.dtype)
+    Ok(HostTensor::new(x.dtype, output_shape, data))
 }
 
 /// `CumSum` along one axis, with `exclusive` and `reverse`.

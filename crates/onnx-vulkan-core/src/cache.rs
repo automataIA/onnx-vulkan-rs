@@ -15,6 +15,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use vk_compute::{ComputePipeline, GpuBuffer, VkContext};
 
 /// Stable identity of one compiled pipeline within a session.
@@ -88,6 +89,8 @@ pub struct KernelCache<'context> {
     zero_scalar: Mutex<Option<Box<GpuBuffer>>>,
     /// Small parameter payloads, keyed by their bytes — see `constant`.
     constants: Mutex<HashMap<Vec<u8>, Box<GpuBuffer>>>,
+    random_counters: Mutex<HashMap<String, u64>>,
+    random_session_seed: u64,
     pipeline_builds: AtomicUsize,
     packed_builds: AtomicUsize,
     upload_builds: AtomicUsize,
@@ -110,6 +113,8 @@ impl<'context> KernelCache<'context> {
             uploads: Mutex::new(HashMap::new()),
             zero_scalar: Mutex::new(None),
             constants: Mutex::new(HashMap::new()),
+            random_counters: Mutex::new(HashMap::new()),
+            random_session_seed: random_entropy_seed(),
             pipeline_builds: AtomicUsize::new(0),
             packed_builds: AtomicUsize::new(0),
             upload_builds: AtomicUsize::new(0),
@@ -122,6 +127,25 @@ impl<'context> KernelCache<'context> {
 
     pub fn tuning(&self) -> &crate::tuning::TacticResolver {
         &self.tuning
+    }
+
+    /// Returns the next per-node random stream seed. Explicit ONNX seeds are
+    /// stable across sessions; unseeded streams additionally use entropy
+    /// captured when this session cache is created. This is for simulation
+    /// randomness, not cryptographic use.
+    pub(crate) fn next_random_seed(&self, node_key: &str, seed: Option<f32>) -> u64 {
+        let mut counters = self.random_counters.lock().expect("poisoned random cache");
+        let counter = counters.entry(node_key.to_owned()).or_default();
+        let invocation = *counter;
+        *counter = counter.wrapping_add(1);
+        let base = seed
+            .map(f32::to_bits)
+            .map(u64::from)
+            .unwrap_or(self.random_session_seed);
+        stable_mix(
+            base ^ stable_hash(node_key.as_bytes())
+                ^ invocation.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        )
     }
 
     /// How many pipelines have been compiled and how many weights packed since
@@ -309,6 +333,27 @@ impl<'context> KernelCache<'context> {
         }
         Ok(&**slot.as_ref().expect("zero just inserted") as *const GpuBuffer)
     }
+}
+
+fn random_entropy_seed() -> u64 {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default();
+    stable_mix(time ^ NEXT.fetch_add(1, Ordering::Relaxed) as u64)
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+fn stable_mix(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 impl Drop for KernelCache<'_> {

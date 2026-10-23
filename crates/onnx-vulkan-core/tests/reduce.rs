@@ -1,14 +1,14 @@
-//! Reduction over one axis: `ReduceMean`, `ReduceSum`, `ReduceMax`.
+//! Reduction over one or more axes: `ReduceMean`, `ReduceSum`, `ReduceMax`.
 //!
 //! The case that matters is `axes = [1]`, `keepdims = 1` on NCHW — the form
 //! rfdetr uses to decompose the projector normalizations, which alone split
 //! the graph in 18 places. Each test compares the kernel against a CPU
 //! reference written here.
 
-use onnx_vulkan_core::host_ops::{HostTensor, INT64};
+use onnx_vulkan_core::host_ops::{BOOL, FLOAT, HostTensor, INT8, INT32, INT64, UINT8};
 use onnx_vulkan_core::{
-    AttrValue, ExecutionEnv, GraphIr, InitializerIr, KernelCache, NodeIr, Tensor, constant_outputs,
-    execute, fold_constant_params, is_implemented_node,
+    AttrValue, ElementType, ExecutionEnv, GraphIr, InitializerIr, KernelCache, NodeIr, Tensor,
+    constant_outputs, execute, fold_constant_params, is_implemented_node, unsupported_dtype,
 };
 use std::collections::HashMap;
 use vk_compute::VkContext;
@@ -80,11 +80,24 @@ fn reduce_ref(x: &[f32], shape: &[i64], axis: usize, kind: &str) -> Vec<f32> {
             let vals = (0..c).map(|k| x[base + k * inner]);
             match kind {
                 "max" => vals.fold(f32::NEG_INFINITY, f32::max),
+                "min" => vals.fold(f32::INFINITY, f32::min),
                 "sum" => vals.sum(),
                 _ => vals.sum::<f32>() / c as f32,
             }
         })
         .collect()
+}
+
+fn reduce_ref_axes(x: &[f32], shape: &[i64], axes: &[usize], kind: &str) -> (Vec<f32>, Vec<i64>) {
+    let mut values = x.to_vec();
+    let mut shape = shape.to_vec();
+    let mut axes = axes.to_vec();
+    axes.sort_unstable_by(|a, b| b.cmp(a));
+    for axis in axes {
+        values = reduce_ref(&values, &shape, axis, kind);
+        shape.remove(axis);
+    }
+    (values, shape)
 }
 
 /// The rfdetr case: [1, 8, 5, 5], channel axis, `keepdims = 1`.
@@ -154,11 +167,109 @@ fn reduce_sum_middle_axis_default_keepdims() {
     assert_close(&got, &reduce_ref(&x, &shape, 1, "sum"));
 }
 
-/// What the kernel **cannot** do must not be claimed: multiple axes, axes as
-/// input, missing `axes`. Claiming them would split the block at runtime
-/// instead of during capability resolution.
 #[test]
-fn unsupported_forms_are_not_claimed() {
+fn reductions_accept_multiple_axes() {
+    let shape = vec![2i64, 3, 4];
+    let x = pseudo(24, 29);
+    for (op, kind) in [
+        ("ReduceSum", "sum"),
+        ("ReduceMean", "mean"),
+        ("ReduceMax", "max"),
+        ("ReduceMin", "min"),
+    ] {
+        let ir = graph(
+            vec![node(
+                op,
+                &["x"],
+                &["out"],
+                &[
+                    ("axes", AttrValue::Ints(vec![0, -1])),
+                    ("keepdims", AttrValue::Int(0)),
+                ],
+            )],
+            "out",
+        );
+        let (got, out_shape) = run(&ir, HostTensor::from_f32(shape.clone(), &x), "out");
+        let (want, want_shape) = reduce_ref_axes(&x, &shape, &[0, 2], kind);
+        assert_eq!(out_shape, want_shape, "{op}");
+        assert_close(&got, &want);
+    }
+}
+
+#[test]
+fn omitted_axes_reduce_all_dimensions_to_a_scalar() {
+    let shape = vec![2i64, 3, 4];
+    let x = pseudo(24, 37);
+    let ir = graph(
+        vec![node(
+            "ReduceSum",
+            &["x"],
+            &["out"],
+            &[("keepdims", AttrValue::Int(0))],
+        )],
+        "out",
+    );
+    let (got, out_shape) = run(&ir, HostTensor::from_f32(shape.clone(), &x), "out");
+    let (want, want_shape) = reduce_ref_axes(&x, &shape, &[0, 1, 2], "sum");
+    assert!(
+        out_shape.is_empty(),
+        "expected scalar shape, got {out_shape:?}"
+    );
+    assert_eq!(out_shape, want_shape);
+    assert_close(&got, &want);
+}
+
+#[test]
+fn explicit_empty_axes_reduce_all_unless_noop_is_requested() {
+    let shape = vec![2i64, 3];
+    let x = pseudo(6, 41);
+
+    let reduce_all = graph(
+        vec![node(
+            "ReduceSum",
+            &["x"],
+            &["out"],
+            &[
+                ("axes", AttrValue::Ints(vec![])),
+                ("keepdims", AttrValue::Int(0)),
+            ],
+        )],
+        "out",
+    );
+    let (got, out_shape) = run(&reduce_all, HostTensor::from_f32(shape.clone(), &x), "out");
+    assert!(out_shape.is_empty());
+    assert_close(&got, &[x.iter().sum()]);
+
+    let noop = graph(
+        vec![node(
+            "ReduceSum",
+            &["x"],
+            &["out"],
+            &[
+                ("axes", AttrValue::Ints(vec![])),
+                ("noop_with_empty_axes", AttrValue::Int(1)),
+            ],
+        )],
+        "out",
+    );
+    let (got, out_shape) = run(&noop, HostTensor::from_f32(shape.clone(), &x), "out");
+    assert_eq!(out_shape, shape);
+    assert_eq!(got, x);
+}
+
+#[test]
+fn scalar_reduction_is_an_identity() {
+    let x = [2.5f32];
+    let ir = graph(vec![node("ReduceMean", &["x"], &["out"], &[])], "out");
+    let (got, out_shape) = run(&ir, HostTensor::from_f32(vec![], &x), "out");
+    assert!(out_shape.is_empty());
+    assert_eq!(got, x);
+}
+
+/// Constant axes are handled after canonicalization. A dynamic axes input is
+/// still unresolved and must stay outside the supported slice.
+#[test]
+fn supported_and_unresolved_forms_are_claimed_correctly() {
     let single = node(
         "ReduceMean",
         &["x"],
@@ -173,9 +284,26 @@ fn unsupported_forms_are_not_claimed() {
         &["out"],
         &[("axes", AttrValue::Ints(vec![2, 3]))],
     );
+    assert!(is_implemented_node(&multi), "multiple axes are implemented");
+
+    let all = node("ReduceSum", &["x"], &["out"], &[]);
     assert!(
-        !is_implemented_node(&multi),
-        "multiple axes not implemented"
+        is_implemented_node(&all),
+        "omitted axes reduce all dimensions"
+    );
+
+    let noop = node(
+        "ReduceMean",
+        &["x"],
+        &["out"],
+        &[
+            ("axes", AttrValue::Ints(vec![])),
+            ("noop_with_empty_axes", AttrValue::Int(1)),
+        ],
+    );
+    assert!(
+        is_implemented_node(&noop),
+        "empty-axis no-op is implemented"
     );
 
     let axes_input = node("ReduceSum", &["x", "axes"], &["out"], &[]);
@@ -284,6 +412,43 @@ fn integer_input_is_reduced_on_host() {
     env.finish();
 }
 
+#[test]
+fn integer_multi_axis_mean_divides_once_after_accumulating() {
+    use onnx_vulkan_core::host_ops::{RedOp, reduce_axes};
+
+    let input = HostTensor::from_i64(vec![2, 2], &[0, 1, 1, 2]);
+    let output = reduce_axes(&input, &[0, 1], RedOp::Mean, false).expect("integer ReduceMean");
+    assert_eq!(output.shape, Vec::<i64>::new());
+    assert_eq!(output.to_i64().expect("scalar mean"), vec![1]);
+}
+
+#[test]
+fn empty_integer_sum_returns_zero_bins_and_sum_wraps_without_panicking() {
+    use onnx_vulkan_core::host_ops::{RedOp, reduce_axes};
+
+    let empty = HostTensor::from_i64(vec![2, 0, 3], &[]);
+    let output = reduce_axes(&empty, &[1], RedOp::Sum, false).expect("empty ReduceSum");
+    assert_eq!(output.shape, vec![2, 3]);
+    assert_eq!(output.to_i64().expect("zero sums"), vec![0; 6]);
+
+    let overflow = HostTensor::from_i64(vec![2], &[i64::MAX, 1]);
+    let output = reduce_axes(&overflow, &[0], RedOp::Sum, false).expect("wrapping ReduceSum");
+    assert_eq!(output.to_i64().expect("wrapped sum"), vec![i64::MIN]);
+}
+
+#[test]
+fn empty_integer_extrema_use_dtype_specific_identities() {
+    use onnx_vulkan_core::host_ops::{INT8, RedOp, UINT8, reduce_axes};
+
+    let empty_i8 = HostTensor::new(INT8, vec![2, 0], vec![]);
+    let max = reduce_axes(&empty_i8, &[1], RedOp::Max, false).expect("empty int8 max");
+    assert_eq!(max.data, vec![i8::MIN as u8; 2]);
+
+    let empty_u8 = HostTensor::new(UINT8, vec![2, 0], vec![]);
+    let min = reduce_axes(&empty_u8, &[1], RedOp::Min, false).expect("empty uint8 min");
+    assert_eq!(min.data, vec![u8::MAX; 2]);
+}
+
 /// A non-constant input cannot be resolved: the node stays unclaimed, and
 /// the block splits there instead of failing at runtime.
 #[test]
@@ -292,4 +457,76 @@ fn non_constant_axes_input_stays_unclaimed() {
     fold_constant_params(&mut n, &HashMap::new());
     assert!(!n.attrs.contains_key("axes"));
     assert!(!is_implemented_node(&n));
+}
+
+#[test]
+fn reduction_load_time_dtype_guard_accepts_supported_and_refuses_float64_float16() {
+    let reductions = ["ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin"];
+    let supported = [FLOAT, BOOL, UINT8, INT8, INT32, INT64];
+    for op in reductions {
+        let n = node(op, &["x"], &["out"], &[]);
+        for dtype in supported {
+            let types = HashMap::from([(String::from("x"), dtype)]);
+            assert_eq!(
+                unsupported_dtype(&n, &types),
+                None,
+                "{op} should accept element type {dtype}"
+            );
+        }
+        for dtype in [ElementType::Float16 as i32, ElementType::Float64 as i32] {
+            let types = HashMap::from([(String::from("x"), dtype)]);
+            assert!(
+                unsupported_dtype(&n, &types).is_some(),
+                "{op} should refuse unsupported element type {dtype}"
+            );
+        }
+        assert_eq!(
+            unsupported_dtype(&n, &HashMap::new()),
+            None,
+            "unresolved dtype stays allowed for {op}"
+        );
+    }
+}
+
+#[test]
+fn absent_axes_noop_preserves_shape_and_default_keepdims_retains_rank() {
+    let x = HostTensor::from_f32(vec![2, 2], &[1., 2., 3., 4.]);
+    let ir = graph(
+        vec![node(
+            "ReduceSum",
+            &["x"],
+            &["out"],
+            &[("noop_with_empty_axes", AttrValue::Int(1))],
+        )],
+        "out",
+    );
+    let (got, shape) = run(&ir, x.clone(), "out");
+    assert_eq!(shape, vec![2, 2]);
+    assert_eq!(got, vec![1., 2., 3., 4.]);
+    let ir = graph(vec![node("ReduceSum", &["x"], &["out"], &[])], "out");
+    let (got, shape) = run(&ir, x, "out");
+    assert_eq!(shape, vec![1, 1]);
+    assert_eq!(got, vec![10.]);
+}
+
+#[test]
+fn empty_float_sum_and_mean_follow_empty_reduction_semantics() {
+    for (op, nan) in [("ReduceSum", false), ("ReduceMean", true)] {
+        let ir = graph(
+            vec![node(
+                op,
+                &["x"],
+                &["out"],
+                &[
+                    ("axes", AttrValue::Ints(vec![1])),
+                    ("keepdims", AttrValue::Int(0)),
+                ],
+            )],
+            "out",
+        );
+        let (got, shape) = run(&ir, HostTensor::from_f32(vec![2, 0, 3], &[]), "out");
+        assert_eq!(shape, vec![2, 3]);
+        assert_eq!(got.len(), 6);
+        assert!(got.iter().all(|v| if nan { v.is_nan() } else { *v == 0. }));
+    }
 }

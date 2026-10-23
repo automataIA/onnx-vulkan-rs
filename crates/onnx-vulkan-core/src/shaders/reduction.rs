@@ -48,15 +48,15 @@ pub const SUM_FIN: &str = "acc";
 /// Mean along the axis.
 pub const MEAN_INIT: &str = "0.0";
 pub const MEAN_ACC: &str = "acc + v";
-pub const MEAN_FIN: &str = "acc / f32(max(pc.c, 1u))";
+pub const MEAN_FIN: &str = "acc / f32(pc.c)";
 
 /// Maximum along the axis.
-pub const MAX_INIT: &str = "-3.4028235e38";
+pub const MAX_INIT: &str = "bitcast<f32>(0xff800000u)";
 pub const MAX_ACC: &str = "max(acc, v)";
 pub const MAX_FIN: &str = "acc";
 
 /// Minimum along the axis.
-pub const MIN_INIT: &str = "3.4028235e38";
+pub const MIN_INIT: &str = "bitcast<f32>(0x7f800000u)";
 pub const MIN_ACC: &str = "min(acc, v)";
 pub const MIN_FIN: &str = "acc";
 

@@ -28,6 +28,7 @@ adds or removes an arm in the Rust without updating `NODE_RULES`, the script
 
 from __future__ import annotations
 
+import math
 import re
 import sys
 from collections import Counter
@@ -70,13 +71,74 @@ def _attr(node, name: str, default):
     return default
 
 
-def _one_axis(node, consts) -> bool:
+def _reduction_axes(node, consts) -> bool:
     axes = _attr(node, "axes", None)
     if axes is None and len(node.input) > 1 and node.input[1]:
         # `fold_constant_params` canonicalization: axes passed as a constant
         # input are promoted to an attribute before the check
         axes = consts.get(node.input[1])
-    return axes is not None and len(axes) == 1
+    return (
+        (axes is not None or len(node.input) < 2 or not node.input[1])
+        and _attr(node, "keepdims", 1) in (0, 1)
+        and _attr(node, "noop_with_empty_axes", 0) in (0, 1)
+    )
+
+
+def _random_normal_like_ok(node, _consts) -> bool:
+    if len(node.input) != 1 or not node.input[0] or len(node.output) != 1 or not node.output[0]:
+        return False
+    dtype = _attr(node, "dtype", 1)
+    if type(dtype) is not int or dtype != 1:
+        return False
+    for name, nonnegative in (("mean", False), ("scale", True), ("seed", False)):
+        value = _attr(node, name, None)
+        if value is None:
+            continue
+        if type(value) is not float or not math.isfinite(value):
+            return False
+        if nonnegative and value < 0:
+            return False
+    return True
+
+
+REWRITE_DOMAIN = "onnx_vulkan.rewrite"
+
+
+def _rewrite_node(node, inputs, outputs) -> bool:
+    return node.domain == REWRITE_DOMAIN and inputs(node) and outputs(node)
+
+
+def _einsum_ok(node, _consts) -> bool:
+    if len(node.input) != 2:
+        return False
+    equation = _attr(node, "equation", None)
+    if not isinstance(equation, (str, bytes)):
+        return False
+    if isinstance(equation, bytes):
+        equation = equation.decode()
+    equation = "".join(equation.split())
+    if "->" not in equation:
+        return False
+    inputs, out = equation.split("->", 1)
+    if "," not in inputs:
+        return False
+    a, b = inputs.split(",", 1)
+    labels = (a, b, out)
+    if any(
+        not term.isascii() or not term.isalpha() or len(set(term)) != len(term)
+        for term in labels
+    ):
+        return False
+    batch = "".join(c for c in a if c in b and c in out)
+    m = "".join(c for c in a if c not in b and c in out)
+    k = "".join(c for c in a if c in b and c not in out)
+    n = "".join(c for c in b if c not in a and c in out)
+    return a == batch + m + k and b == batch + k + n and out == batch + m + n
+
+
+def _nonzero_dtype_ok(dtype: int) -> bool:
+    # ONNX: BOOL, FLOAT, INT8, UINT8, INT32, INT64.
+    return dtype in {1, 2, 3, 6, 7, 9}
 
 
 def _pool_ok(node, _consts) -> bool:
@@ -294,17 +356,52 @@ def _gather_block_quantized_ok(node, _consts) -> bool:
 
 #: Per-node constraints, mirroring the arms of `is_implemented_node`.
 NODE_RULES = {
+    "RandomNormalLike": _random_normal_like_ok,
+    "AddLayerNormalization": lambda node, _consts: _rewrite_node(
+        node, lambda n: 3 <= len(n.input) <= 4, lambda n: 1 <= len(n.output) <= 2
+    ),
+    "AddTransposePad": lambda node, _consts: _rewrite_node(
+        node, lambda n: 4 <= len(n.input) <= 5, lambda n: len(n.output) == 1
+    ),
     "Resize": _resize_ok,
     "MaxPool": _pool_ok,
     "AveragePool": _pool_ok,
     "Conv": _conv_ok,
     "ConvInteger": _conv_ok,
+    "ConvIntegerScaleBias": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) in (6, 7), lambda n: len(n.output) == 1
+    ) and _conv_ok(node, _consts),
     "ConvTranspose": _conv_transpose_ok,
-    "ReduceMean": _one_axis,
-    "ReduceSum": _one_axis,
-    "ReduceMax": _one_axis,
-    "ReduceMin": _one_axis,
+    "ReduceMean": _reduction_axes,
+    "ReduceSum": _reduction_axes,
+    "ReduceMax": _reduction_axes,
+    "ReduceMin": _reduction_axes,
     "ArgMax": _argmax_ok,
+    "ArgMin": _argmax_ok,
+    "GatherND": lambda node, _consts: _attr(node, "batch_dims", 0) == 0,
+    "InstanceNormalization": lambda node, _consts: len(node.input) == 3 and all(node.input) and len(node.output) == 1,
+    "Einsum": _einsum_ok,
+    "FlashAttention": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) in (3, 4), lambda n: len(n.output) == 1
+    ),
+    "MatMulIntegerScaleBias": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) in (6, 7), lambda n: len(n.output) == 1
+    ),
+    "DecomposedGelu": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) == 4, lambda n: len(n.output) == 1
+    ),
+    "DecomposedGeluQuantize": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) == 4, lambda n: 1 <= len(n.output) <= 3
+    ),
+    "InterleavedRope": lambda node, _consts: _rewrite_node(
+        node, lambda n: 3 <= len(n.input) <= 4, lambda n: len(n.output) == 1
+    ),
+    "PackPositiveBits": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) == 2, lambda n: len(n.output) == 1
+    ),
+    "MulAddRelu": lambda node, _consts: _rewrite_node(
+        node, lambda n: len(n.input) == 3, lambda n: len(n.output) == 1
+    ),
     "GridSample": _grid_sample_ok,
     "ScatterND": _scatter_nd_ok,
     "Gelu": _gelu_ok,
@@ -477,6 +574,19 @@ def graph_ops(path: Path, known: set[str]) -> tuple[Counter[str], Counter[str]]:
                 and dtypes[in0] != FLOAT
             ):
                 missing[f"{name} (element type {dtypes[in0]})"] += 1
+            elif (
+                node.op_type == "NonZero"
+                and in0 in dtypes
+                and not _nonzero_dtype_ok(dtypes[in0])
+            ):
+                missing[f"{name} (unsupported element type {dtypes[in0]})"] += 1
+            elif (
+                node.op_type == "RandomNormalLike"
+                and not any(a.name == "dtype" for a in node.attribute)
+                and in0 in dtypes
+                and dtypes[in0] != FLOAT
+            ):
+                missing[f"{name} (inferred element type {dtypes[in0]})"] += 1
             elif rule is not None and not rule(node, consts):
                 # known name but non-claimable node: counts as a gap, and is
                 # the distinction that the by-name count was missing

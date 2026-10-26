@@ -2,7 +2,7 @@
 from argparse import Namespace
 import subprocess
 
-from onnx_vulkan_pipeline import cli
+from onnx_vulkan_pipeline import cli, search
 from onnx_vulkan_pipeline.pipeline import write_json
 
 
@@ -122,14 +122,210 @@ def test_run_compares_vulkan_with_the_optimized_cpu_ep_when_it_was_timed(tmp_pat
         "vulkan-ep and standalone outputs are identical; the CPU EP differs by up to max|Δ|=16, ")
 
 
-def test_quantize_search_lists_every_candidate_with_its_outcome(tmp_path):
-    result = {"selected": "int8", "optimized": None, "candidates": [
-        {"name": "int8", "status": "passed", "median_wall_ms": 1.814, "vulkan_drop": 0.0},
-        {"name": "int4", "status": "rejected", "reason": "no operator was quantized: " + "x" * 200}]}
+def test_quantize_search_lists_candidates_confirmations_and_the_verdict(tmp_path):
+    result = {"status": "promoted", "selected": "int8", "optimized": {"bundle": "out/selected"}, "candidates": [
+        {"name": "int8", "status": "passed", "weighted_wall_ms": 1.814, "vulkan_drop": 0.0},
+        {"name": "int4", "status": "rejected", "reason": "no operator was quantized: " + "x" * 200}],
+        "confirmations": {"int8": {"status": "promoted", "weighted_ratio": 0.8123},
+                          "dyn": {"status": "guard_failed", "weighted_ratio": 0.9,
+                                  "guard_failures": ["long regressed 4.0% > 0%"]}}}
     lines = cli.success_summary("quantize-search", Namespace(output=tmp_path), result)
-    assert lines[0] == "  int8: passed — standalone 1.81 ms, Vulkan metric drop 0"
+    # screening times are labelled as a ranking, never as a speed result
+    assert lines[0] == "  int8: passed — screening 1.81 ms (ranking only), Vulkan metric drop 0"
     assert lines[1].startswith("  int4: rejected — no operator was quantized") and lines[1].endswith("…")
-    assert lines[2] == "selected candidate: int8"
+    assert lines[2] == "  confirmation int8: promoted, weighted candidate/baseline ratio 0.812"
+    assert lines[3] == "  confirmation dyn: guard_failed, weighted candidate/baseline ratio 0.900; long regressed 4.0% > 0%"
+    assert lines[4].startswith("selected candidate: int8 (acceleration demonstrated by its confirmation")
+    assert lines[-1] == f"details: {tmp_path / 'search.json'}"
+
+
+def test_quantize_search_says_when_nothing_was_promoted_or_the_budget_ended(tmp_path):
+    for status, expected in (("no_measured_gain", "nothing was promoted"), ("no_passing_candidate", "passed screening")):
+        lines = cli.success_summary("quantize-search", Namespace(output=tmp_path), {"status": status})
+        assert expected in lines[0]
+    lines = cli.success_summary("quantize-search", Namespace(output=tmp_path), {
+        "status": "budget_exhausted", "exhausted": "seconds", "resume": str(tmp_path),
+        "budget": {"attempts_used": 3, "seconds_used": 61.2}})
+    assert "budget exhausted (seconds; 3 attempts, 61 s used)" in lines[0] and "run the same command again" in lines[0]
+
+
+def _argv(monkeypatch, *argv):
+    monkeypatch.setattr("sys.argv", ["onnx-vulkan", *argv])
+
+
+def _workload_files(root):
+    import json
+
+    (root / "model.onnx").write_bytes(b"m")
+    (root / "adapter.py").write_text("def evaluate(session, samples): return 0\n")
+    (root / "ev").mkdir()
+    (root / "ev" / "0.npz").write_text("x")
+    (root / "quantization.json").write_text(json.dumps({
+        "evaluation": str(root / "ev"), "adapter": str(root / "adapter.py"), "metric": "m",
+        "max_drop": 0.1, "higher_is_better": True}))
+    path = root / "w.json"
+    path.write_text(json.dumps({
+        "schema_version": 1, "name": "demo", "source": "model.onnx", "adapter": "adapter.py",
+        "profiles": {"short": {"dimensions": {"batch": 1}, "weight": 3}, "long": {"dimensions": {"batch": 4}, "weight": 1}},
+        "quantization": {"config": "quantization.json", "grid": [{"mode": "dynamic"}]},
+        "budget": {"seconds": 600, "attempts": 4, "top_k": 1}}))
+    return path
+
+
+def test_plan_prints_a_bounded_plan_and_runs_nothing(tmp_path, monkeypatch, capsys):
+    path = _workload_files(tmp_path)
+    for name in ("prepare_bundle", "run_bundle", "optimize_bundle"):
+        monkeypatch.setattr(search, name, lambda *a, **k: (_ for _ in ()).throw(AssertionError("plan ran work")))
+    _argv(monkeypatch, "plan", str(path))
+    assert cli.main() == 0
+    out, err = capsys.readouterr()
+    assert '"ready": true' in out
+    assert "workload demo: ready" in err and "profile short: weight 0.75" in err
+    assert "candidates: dynamic" in err and "attempts needed" in err
+
+
+def test_plan_exits_2_and_lists_what_is_missing(tmp_path, monkeypatch, capsys):
+    path = _workload_files(tmp_path)
+    (tmp_path / "quantization.json").unlink()
+    _argv(monkeypatch, "plan", str(path))
+    assert cli.main() == 2
+    assert "NOT ready" in capsys.readouterr().err
+
+
+def test_plan_rejects_an_invalid_workload_with_exit_1(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "w.json"
+    path.write_text('{"schema_version": 1, "colour": 1}')
+    _argv(monkeypatch, "plan", str(path))
+    assert cli.main() == 1
+    assert "unknown keys" in capsys.readouterr().err
+
+
+def test_quantize_search_from_a_workload_forwards_its_arguments(tmp_path, monkeypatch, capsys):
+    path = _workload_files(tmp_path)
+    seen = {}
+
+    def fake(source, destination, base, **kwargs):
+        seen.update(source=source, destination=destination, base=base, **kwargs)
+        return {"status": "no_measured_gain", "candidates": [], "confirmations": {}}
+
+    monkeypatch.setattr(cli, "search_quantization", fake)
+    _argv(monkeypatch, "quantize-search", "--workload", str(path), "--output", str(tmp_path / "out"), "--no-tune")
+    assert cli.main() == 0
+    assert seen["source"] == tmp_path / "model.onnx" and seen["budget_seconds"] == 600.0
+    assert seen["attempts"] == 4 and seen["top_k"] == 1 and seen["tune"] is False
+    assert seen["profile_weights"] == {"short": 3.0, "long": 1.0}
+
+
+def test_quantize_search_refuses_a_workload_that_is_not_ready_before_any_work(tmp_path, monkeypatch, capsys):
+    path = _workload_files(tmp_path)
+    (tmp_path / "adapter.py").unlink()
+    monkeypatch.setattr(cli, "search_quantization", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran")))
+    _argv(monkeypatch, "quantize-search", "--workload", str(path), "--output", str(tmp_path / "out"))
+    assert cli.main() == 1
+    assert "not ready" in capsys.readouterr().err
+
+
+def test_a_workload_and_conflicting_flags_are_refused(tmp_path, monkeypatch, capsys):
+    path = _workload_files(tmp_path)
+    monkeypatch.setattr(cli, "search_quantization", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran")))
+    for extra in (["--samples", "30"], ["--budget-seconds", "5"], [str(tmp_path / "model.onnx")]):
+        _argv(monkeypatch, "quantize-search", *extra, "--workload", str(path), "--output", str(tmp_path / "out"))
+        assert cli.main() == 1
+        assert "--workload defines these already" in capsys.readouterr().err
+
+
+def test_quantize_search_from_flags_passes_only_what_was_given(tmp_path, monkeypatch, capsys):
+    import json
+
+    (tmp_path / "q.json").write_text(json.dumps({"metric": "m"}))
+    seen = {}
+    monkeypatch.setattr(cli, "search_quantization",
+                        lambda source, destination, base, **kwargs: seen.update(kwargs) or {"status": "no_passing_candidate"})
+    _argv(monkeypatch, "quantize-search", str(tmp_path / "m.onnx"), "--quantization", str(tmp_path / "q.json"),
+          "--output", str(tmp_path / "out"), "--attempts", "5", "--top-k", "2", "--budget-seconds", "90")
+    assert cli.main() == 0
+    assert (seen["attempts"], seen["top_k"], seen["budget_seconds"]) == (5, 2, 90.0)
+    # unset limits keep the function's own defaults instead of a second copy here
+    assert not {"samples", "timeout", "atol", "rtol", "screen_samples"} & set(seen)
+
+
+def test_a_search_that_ran_out_of_budget_exits_3(tmp_path, monkeypatch, capsys):
+    import json
+
+    (tmp_path / "q.json").write_text(json.dumps({"metric": "m"}))
+    monkeypatch.setattr(cli, "search_quantization", lambda *a, **k: {
+        "status": "budget_exhausted", "exhausted": "attempts", "resume": "out", "budget": {}, "candidates": []})
+    _argv(monkeypatch, "quantize-search", str(tmp_path / "m.onnx"), "--quantization", str(tmp_path / "q.json"),
+          "--output", str(tmp_path / "out"))
+    assert cli.main() == 3
+    assert "run the same command again" in capsys.readouterr().err
+
+
+def test_a_deadline_that_ends_a_worker_exits_3_with_a_resume_hint(tmp_path, monkeypatch, capsys):
+    def exhausted(*args, **kwargs):
+        raise cli.BudgetExhausted("the experiment deadline was spent")
+
+    monkeypatch.setattr(cli, "optimize_bundle", exhausted)
+    _argv(monkeypatch, "optimize", str(tmp_path / "b"), "--output", str(tmp_path / "o"))
+    assert cli.main() == 3
+    assert "resume" in capsys.readouterr().err
+
+
+def test_cpu_optimize_forwards_only_the_given_flags(tmp_path, monkeypatch, capsys):
+    import json
+
+    (tmp_path / "p.json").write_text(json.dumps({"short": {"batch": 1}}))
+    seen = {}
+    monkeypatch.setattr(cli.cpu, "optimize_cpu", lambda source, destination, **kwargs: seen.update(
+        source=source, destination=destination, **kwargs) or {
+            "status": "no_measured_gain", "selected": None, "claims": {"acceleration": "none", "cpu_correctness": "ok"}})
+    _argv(monkeypatch, "cpu-optimize", str(tmp_path / "m.onnx"), "--output", str(tmp_path / "out"),
+          "--profiles", str(tmp_path / "p.json"), "--threads", "1,2,4", "--attempts", "6", "--budget-seconds", "120",
+          "--samples", "30", "--timeout", "50")
+    assert cli.main() == 0
+    assert seen["profiles"] == {"short": {"batch": 1}} and seen["threads"] == [1, 2, 4]
+    assert (seen["attempts"], seen["budget_seconds"], seen["samples"], seen["timeout"]) == (6, 120.0, 30, 50.0)
+    assert not {"warmup", "min_gain", "atol", "adapter"} & set(seen)
+    assert "status: no_measured_gain" in capsys.readouterr().err
+
+
+def test_cpu_optimize_takes_the_cpu_workload_schema(tmp_path, monkeypatch, capsys):
+    import json
+
+    (tmp_path / "w.json").write_text(json.dumps({"schema_version": 1, "source": "model.onnx",
+                                                 "profiles": {"short": {"batch": 1}}, "samples": 25}))
+    seen = {}
+    monkeypatch.setattr(cli.cpu, "optimize_cpu", lambda source, destination, **kwargs: seen.update(
+        source=source, **kwargs) or {"status": "budget_exhausted", "claims": {}})
+    _argv(monkeypatch, "cpu-optimize", "--workload", str(tmp_path / "w.json"), "--output", str(tmp_path / "out"))
+    assert cli.main() == 3
+    assert seen["source"] == tmp_path / "model.onnx" and seen["samples"] == 25
+    _argv(monkeypatch, "cpu-optimize", "--workload", str(tmp_path / "w.json"), "--atol", "1", "--output", str(tmp_path / "o2"))
+    assert cli.main() == 1
+
+
+def test_cpu_budget_exhaustion_exits_3(tmp_path, monkeypatch, capsys):
+    def exhausted(*args, **kwargs):
+        raise cli.cpu.BudgetExhausted("deadline")
+
+    monkeypatch.setattr(cli.cpu, "optimize_cpu", exhausted)
+    _argv(monkeypatch, "cpu-optimize", str(tmp_path / "m.onnx"), "--output", str(tmp_path / "out"))
+    assert cli.main() == 3
+
+
+def test_prepare_passes_the_quality_config_only_when_given(tmp_path, monkeypatch, capsys):
+    import json
+
+    (tmp_path / "quality.json").write_text(json.dumps({"metric": "top1"}))
+    calls = []
+    monkeypatch.setattr(cli, "prepare_bundle", lambda *a, **k: calls.append(k) or {"compatibility_obtained": False, "profiles": {}})
+    monkeypatch.setattr(cli, "success_summary", lambda *a: [])
+    _argv(monkeypatch, "prepare", str(tmp_path / "m.onnx"), "--output", str(tmp_path / "o1"))
+    cli.main()
+    _argv(monkeypatch, "prepare", str(tmp_path / "m.onnx"), "--output", str(tmp_path / "o2"),
+          "--quality", str(tmp_path / "quality.json"))
+    cli.main()
+    assert "quality" not in calls[0] and calls[1]["quality"] == {"metric": "top1"}
 
 
 def test_inspect_folds_shapes_known_only_at_run_time_into_one_line(tmp_path):

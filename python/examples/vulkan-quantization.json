@@ -1,0 +1,8 @@
+{
+  "mode": "dynamic",
+  "evaluation": "quality/evaluation",
+  "adapter": "quality/adapter.py",
+  "metric": "top1_accuracy",
+  "max_drop": 0.01,
+  "higher_is_better": true
+}

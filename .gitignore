@@ -9,7 +9,9 @@ __pycache__/
 *.pyc
 *.md
 !README.md
+!/BENCHMARKS.md
 !/SECURITY.md
+!/python/AUTOMATION.md
 
 # Local recipes and notes (not distributed with the repository).
 /recipes

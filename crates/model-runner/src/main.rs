@@ -22,6 +22,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use vk_compute::stats::GpuSpan;
 
 struct Args {
     model: PathBuf,
@@ -759,6 +760,59 @@ fn argmax_changed(
     }
 }
 
+/// Per-inference GPU interval telemetry of `VULKAN_GPU_SPAN`.
+#[derive(Serialize)]
+struct SpanJson {
+    flushes: u32,
+    command_buffers: u32,
+    submits: u64,
+    busy_ms: f64,
+    span_ms: f64,
+    complete: bool,
+}
+
+impl From<GpuSpan> for SpanJson {
+    fn from(s: GpuSpan) -> Self {
+        Self {
+            flushes: s.flushes,
+            command_buffers: s.command_buffers,
+            submits: s.submits,
+            busy_ms: s.busy_ms,
+            span_ms: s.span_ms,
+            complete: s.complete,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct InstrumentationJson {
+    stats: bool,
+    gpu_span: bool,
+    node_probe: bool,
+    alloc_probe: bool,
+    pool_probe: bool,
+}
+
+impl InstrumentationJson {
+    fn observed() -> Self {
+        let i = vk_compute::stats::instrumentation();
+        Self {
+            stats: i.stats,
+            gpu_span: i.gpu_span,
+            node_probe: i.node_probe,
+            alloc_probe: i.alloc_probe,
+            pool_probe: i.pool_probe,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MeasurementJson {
+    instrumentation: InstrumentationJson,
+    candidate_gpu_span: Vec<Option<SpanJson>>,
+    standalone_gpu_span: Vec<Option<SpanJson>>,
+}
+
 /// Runs the model `iters` times, returning the outputs of the last iteration
 /// and the timings of each iteration. The first includes pipeline compilation:
 /// when measuring, use it only as a warm-up.
@@ -767,9 +821,11 @@ fn run(
     inputs: &[(String, Value)],
     iters: usize,
     budget_ms: Option<f64>,
-) -> Result<(Outputs, Vec<f64>)> {
+) -> Result<(Outputs, Vec<f64>, Vec<Option<GpuSpan>>)> {
     let mut times = Vec::new();
+    let mut spans = Vec::new();
     let mut last = None;
+    vk_compute::stats::reset_gpu_span();
     for _ in 0..iters {
         if times.len() >= 2 && budget_ms.is_some_and(|budget| times.iter().sum::<f64>() >= budget) {
             break;
@@ -781,9 +837,10 @@ fn run(
         let start = Instant::now();
         let outputs = session.run(feed)?;
         times.push(start.elapsed().as_secs_f64() * 1000.0);
+        spans.push(vk_compute::stats::take_gpu_span());
         last = Some(summarize(&outputs)?);
     }
-    Ok((last.expect("at least one iteration"), times))
+    Ok((last.expect("at least one iteration"), times, spans))
 }
 
 /// Runs the graph through the standalone facade on the same inputs.
@@ -795,7 +852,7 @@ fn run_standalone(
     model: &Path,
     inputs: &[(String, Value)],
     iters: usize,
-) -> Result<(Outputs, Vec<f64>)> {
+) -> Result<(Outputs, Vec<f64>, Vec<Option<GpuSpan>>)> {
     let session = onnx_vulkan::Session::load(model).map_err(|e| anyhow::anyhow!("{e}"))?;
     let feed: Vec<(String, onnx_vulkan::HostTensor)> = inputs
         .iter()
@@ -804,7 +861,9 @@ fn run_standalone(
     let names: Vec<String> = session.outputs().iter().map(|o| o.name.clone()).collect();
 
     let mut times = Vec::new();
+    let mut spans = Vec::new();
     let mut last = Vec::new();
+    vk_compute::stats::reset_gpu_span();
     // Kept across iterations, as an application reading every frame would:
     // a fresh 67 MB output buffer per run pays its page faults every time.
     let mut outputs = vec![onnx_vulkan::HostTensor::new(0, Vec::new(), Vec::new()); names.len()];
@@ -831,6 +890,7 @@ fn run_standalone(
         // them into the runner's typed copies is the harness's work on both
         // sides (`summarize` for the EP), outside the timer since 2026-10-06.
         times.push(start.elapsed().as_secs_f64() * 1000.0);
+        spans.push(vk_compute::stats::take_gpu_span());
         last = names
             .iter()
             .zip(&outputs)
@@ -847,7 +907,7 @@ fn run_standalone(
         // iteration, first one included, and put a total next to a median.
         vk_compute::stats::dump_and_reset();
     }
-    Ok((last, times))
+    Ok((last, times, spans))
 }
 
 /// The KV-cache pairing of a decoder export: output `present.N.key` feeds input
@@ -1183,14 +1243,14 @@ fn main() -> Result<()> {
             .collect::<Result<_>>()?,
     };
 
-    let (cpu_out, cpu_times) = run(&mut cpu, &inputs, args.iters, args.cpu_budget_ms)?;
+    let (cpu_out, cpu_times, _) = run(&mut cpu, &inputs, args.iters, args.cpu_budget_ms)?;
     let (cpu_ms, cpu_min, cpu_max) = steady(&cpu_times);
     println!("CPU EP:    {cpu_ms:8.1} ms (regime)  [min {cpu_min:.1} max {cpu_max:.1}]");
     let cpu_optimized_times = if args.time_optimized_cpu && args.no_opt {
         let mut session = Session::builder()?
             .with_memory_pattern(args.mem_pattern)?
             .commit_from_file(&args.model)?;
-        let (_, times) = run(&mut session, &inputs, args.iters, args.cpu_budget_ms)?;
+        let (_, times, _) = run(&mut session, &inputs, args.iters, args.cpu_budget_ms)?;
         let (ms, min, max) = steady(&times);
         println!("CPU EP optimized: {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
         times
@@ -1198,7 +1258,7 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
-    let (vk_out, vk_times) = run(&mut second, &inputs, args.iters, None)?;
+    let (vk_out, vk_times, vk_spans) = run(&mut second, &inputs, args.iters, None)?;
     let (vk_ms, vk_min, vk_max) = steady(&vk_times);
     println!("{label}: {vk_ms:8.1} ms (regime)  [min {vk_min:.1} max {vk_max:.1}]");
 
@@ -1238,11 +1298,13 @@ fn main() -> Result<()> {
     // to the standalone's (SAM 3's fp32 vision encoder peaks near 10 GB alone).
     drop(second);
     let mut standalone_times = Vec::new();
+    let mut standalone_spans = Vec::new();
     vk_compute::stats::reset_storage_peak();
     let standalone_out = if args.standalone {
-        let (out, times) = run_standalone(&args.model, &inputs, args.iters)?;
+        let (out, times, spans) = run_standalone(&args.model, &inputs, args.iters)?;
         let (ms, min, max) = steady(&times);
         standalone_times = times;
+        standalone_spans = spans;
         println!("standalone: {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
         let (rel_ep, mismatches) = compare("standalone vs EP  ", &vk_out, &out, 0.0, 0.0);
         let (rel_cpu, _) = compare("standalone vs CPU ", &cpu_out, &out, args.tol, args.rtol);
@@ -1277,7 +1339,7 @@ fn main() -> Result<()> {
         let devices = ep.append_to_session(&mut builder)?;
         println!("(WebGPU EP: {devices} device)");
         let mut session = builder.commit_from_file(&args.model)?;
-        let (out, times) = run(&mut session, &inputs, args.iters, None)?;
+        let (out, times, _) = run(&mut session, &inputs, args.iters, None)?;
         let (ms, min, max) = steady(&times);
         println!("webgpu:    {ms:8.1} ms (regime)  [min {min:.1} max {max:.1}]");
         let (rel_ep, _) = compare("webgpu vs EP      ", &vk_out, &out, args.tol, args.rtol);
@@ -1330,6 +1392,9 @@ fn main() -> Result<()> {
             passed: bool,
             cpu_fallback_disabled: bool,
             standalone_storage_peak_bytes: u64,
+            /// What the process ran with, as the runtime observed it, and the
+            /// per-inference GPU span of each timed backend (null = no evidence).
+            measurement: MeasurementJson,
             cpu_ms: &'a [f64],
             cpu_optimized_ms: &'a [f64],
             candidate_ms: &'a [f64],
@@ -1355,6 +1420,14 @@ fn main() -> Result<()> {
             passed: !failed,
             cpu_fallback_disabled: args.require_vulkan && !args.self_check,
             standalone_storage_peak_bytes: vk_compute::stats::storage_peak_bytes(),
+            measurement: MeasurementJson {
+                instrumentation: InstrumentationJson::observed(),
+                candidate_gpu_span: vk_spans.iter().map(|s| s.map(SpanJson::from)).collect(),
+                standalone_gpu_span: standalone_spans
+                    .iter()
+                    .map(|s| s.map(SpanJson::from))
+                    .collect(),
+            },
             cpu_ms: &cpu_times,
             cpu_optimized_ms: &cpu_optimized_times,
             candidate_ms: &vk_times,
@@ -1383,18 +1456,7 @@ fn main() -> Result<()> {
         vulkan_ep.unregister()?;
     }
 
-    if failed && args.parity_gate {
-        bail!(
-            "standalone and EP outputs differ, or the CPU EP misses the reference (--parity-gate)"
-        );
-    }
-    if failed {
-        bail!(
-            "divergent outputs: values beyond atol={:.1e} + rtol={:.1e}·|ref|, or a different argmax (see the lines above)",
-            args.tol,
-            args.rtol
-        );
-    }
+    // Preserve diagnostic output even when the numerical gate below fails.
     if let Some(path) = &args.output_data_json {
         let outputs = standalone_out.as_ref().unwrap_or(&vk_out);
         let mut tensors = Vec::new();
@@ -1426,6 +1488,18 @@ fn main() -> Result<()> {
                 "outputs": tensors
             }))?,
         )?;
+    }
+    if failed && args.parity_gate {
+        bail!(
+            "standalone and EP outputs differ, or the CPU EP misses the reference (--parity-gate)"
+        );
+    }
+    if failed {
+        bail!(
+            "divergent outputs: values beyond atol={:.1e} + rtol={:.1e}·|ref|, or a different argmax (see the lines above)",
+            args.tol,
+            args.rtol
+        );
     }
     if args.parity_gate {
         // The CPU EP tolerance is not the verdict here: saying "within atol"

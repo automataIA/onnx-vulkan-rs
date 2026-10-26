@@ -2,7 +2,9 @@
 
 The pipeline runs from a checkout of this repository on Linux and drives the
 release tools built there; `ONNX_VULKAN_ROOT` points an installed package at
-another checkout. The Rust runtime itself does not need Python.
+another checkout. The Rust runtime itself does not need Python. For versioned workload files,
+application-quality contracts, bounded searches and CPU deployment, see
+[AUTOMATION.md](AUTOMATION.md).
 
 ```bash
 SKIP_MODEL=1 ./scripts/fetch-deps.sh     # ONNX Runtime 1.29.0 (~11 MB)
@@ -20,7 +22,8 @@ runs to hundreds of lines (see the [glossary](#json-result-glossary)), so it
 goes to stdout only when stdout is redirected or piped (`> result.json`,
 `| jq`); on a terminal it is not printed.
 
-Exit status 0 means success, 1 failure. `inspect` and `prepare` exit 2 when
+Exit status 0 means success, 1 failure, and 3 a search stopped at its resumable
+time or attempt budget. `plan` exits 2 when its workload is not ready. `inspect` and `prepare` exit 2 when
 they worked but the model cannot run on Vulkan (`inspect`:
 `"compatible": false`; `prepare`: `"compatibility_obtained": false`), so a
 script chaining `inspect`, `prepare` and `run` stops there. `run` exits 1 when
@@ -161,9 +164,11 @@ coverage description makes no GPU performance claim.
 GPU operations are serialized across pipeline processes for the current user.
 An interrupted optimization retains `.OUTPUT.incomplete` next to the target;
 rerunning the same command resumes completed pairs and tuner state. Changed
-source content, binaries, device, profile or search parameters reject resume.
-Choose a new output directory to start a different experiment. Existing
-completed bundles are never overwritten.
+source content, binaries, device, profile, search parameters or
+[execution policy](#execution-policy) reject resume; the error names the
+setting that changed. An incomplete experiment from before policy identity
+also rejects resume. Choose a new output directory to start a different
+experiment. Existing completed bundles are never overwritten.
 
 ## PyTorch adapter
 
@@ -313,8 +318,10 @@ metric alone is not marked as Vulkan quality verification.
 
 Quality fixtures and `quantized-reference/` store the quantized model's CPU
 outputs; `reference/` keeps the fp32 outputs used when a profile runs
-`original.onnx`. If `optimize` falls back to the fp32 baseline, quality is not
-claimed. Quantized representations are not assumed to be faster.
+`original.onnx`. With an independent `--quality` contract, quality is recomputed
+on the deployed model, including fp32 fallback; without a contract, a fallback
+does not establish application quality. Quantized representations are not
+assumed to be faster. See [quality contracts](AUTOMATION.md#independent-quality-contract).
 
 ### Worked example: dynamic int8 in three files
 
@@ -423,11 +430,14 @@ A candidate passes when `prepare` accepts it (numerical tolerances and the CPU
 metric), the profile is compatible, at least one operator was quantized, and
 `run` (standalone) matches its quantized reference and keeps the metric on
 Vulkan outputs. Rejections are recorded with their reason in `search.json`.
-Passing candidates are ranked by their median standalone wall time, excluding
-the first iteration. Those runs are not interleaved, so the ranking is only an
-ordering: the fastest candidate is handed to `optimize` (output `selected/`),
-whose interleaved comparison against the fp32 `original.onnx` alone decides
-`acceleration_demonstrated`.
+Passing candidates are ranked by weighted per-profile median standalone wall
+time, excluding the first iteration. These short runs only order the candidates.
+The top-K shortlist then passes through `optimize`; a failed confirmation does
+not stop the next candidate. Only confirmed gains within every profile’s
+regression bound may reach `selected/`. `--budget-seconds` and `--attempts` bound
+an invocation; an unfinished experiment resumes with the same content identity.
+See [bounded automation](AUTOMATION.md) for weights, Pareto evidence, strict
+workload files and the exact report statuses.
 
 ## EP research experiments
 
@@ -480,7 +490,8 @@ Fields a first reader meets; the code defines the rest.
 
 `optimize` writes its measurements to `OUTPUT/report.json`, per profile:
 `baseline`/`candidate` medians, `pairs` (one original and one prepared sample
-each), `stopped` (`identical`, `futility`), `tactics_rejected` and `tuned`.
+each), `stopped` (`identical`, `futility`), `tactics_rejected`, `tuned` and
+`measurement` (see [measurement modes](#measurement-modes)).
 
 ## API and tests
 
@@ -500,6 +511,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 Use RTX 4070 for the initial performance target and lavapipe for correctness.
 Results do not imply AMD performance. The initial vision corpus is ResNet50,
 MobileNetV2 and YOLOv8; application quality still needs representative task data.
+
+## Automation delivery (2026-10-23)
+
+The automation audit increments are implemented: separate diagnostic, span-only
+and uninstrumented measurement modes; graph-local coverage guards; independent
+quality contracts; budgeted, resumable top-K quantization search; CPU-only ORT
+session optimization; and versioned workload examples. Start with
+[AUTOMATION.md](AUTOMATION.md) for bounded commands and report interpretation.
+
+Final checks: 362 Python tests, 13 autotuner tests, 465 serialized Rust tests,
+workspace fmt and Clippy with warnings denied. A real RTX 4070 MobileNetV2 smoke
+validated all three measurement modes and golden-output checks (three measured
+iterations per mode, insufficient for promotion). A CPU MobileNetV2 trial
+refused its optimized baseline at unchanged default tolerances; no CPU gain or
+application-quality improvement is established. The historical delivery below
+retains its original dates, inputs and tolerances.
 
 ## Delivery status (2026-10-06)
 
@@ -544,6 +571,137 @@ Checks on this checkout, 2026-10-06: 113 Python tests, 13 autotune tests,
 Failed runs keep their reports, replay command and complete output
 (`error.log`) under `.BUNDLE.run-failed` beside the bundle, replaced by the
 next failure.
+
+## Execution policy
+
+Every run records the runtime settings it executed under as
+`execution_policy` (version 1) in its report and in failure evidence;
+`optimize` also stores it in `resume.json` and the sealed manifest. Only the
+allowlisted runtime settings below are read and serialized; unrelated
+environment values are not. The value of an allowlisted setting is recorded
+verbatim where noted, so do not put sensitive text in one. The record covers
+the settings the pipeline knows about, not the whole environment, and it is not
+a complete identity of the host. Values are canonicalized as the runtime reads
+them: an unset default and its explicit equivalent are the same policy, and a
+value the runtime ignores (`ONNX_VULKAN_ATTENTION_FP16=true`) changes nothing.
+
+| Section | Covers |
+|---|---|
+| `numerics` | `ONNX_VULKAN_ATTENTION_FP16` (on only for `1`) |
+| `allocator` | `VULKAN_POOL_BUDGET_MB` (a count, or `auto`, which depends on the device identity) |
+| `tuning` | tuned artifact in use (`cache-only`) or `off`; always set by the pipeline |
+| `ep` | compiled path, `VULKAN_EP_OPS` |
+| `measurement` | `VULKAN_EP_STATS` and the presence-based probes (`VULKAN_GPU_SPAN`, `NODE_PROBE`, `ALLOC_PROBE`, `POOL_PROBE`) |
+| `device_selection` | The Vulkan loader, layer and Mesa/NVIDIA selector variables listed in `policy.DEVICE_SELECTION`, verbatim. The loader names were checked against `libvulkan`; the Mesa and NVIDIA names were not, and other selectors are not covered |
+
+The reported policy is what the child process received: the pipeline derives
+its environment from the same record, so an explicit override (statistics on,
+compiled path on, tuning artifact) and a conflicting parent variable cannot
+disagree with the report. `tool_identity` is unchanged; the policy is a
+separate record.
+
+- `optimize` refuses to resume an experiment whose policy differs, or that
+  predates this record, and stops if the policy changes while it runs.
+- With tuning on, the autotuner subprocess is launched under the caller's own
+  settings (the pipeline's runs override statistics and the compiled path, the
+  tuner does not). That launch policy is bound separately as
+  `tuner_execution_policy` in `resume.json` and the manifest (`null` without
+  tuning), checked on resume and at finalization, and the error says whether the
+  pipeline or the tuner policy changed. `<profile>/tuning-policy.json` is the
+  same launch policy. It describes the launch only: the tuner sets its own
+  tuning mode and artifact for its nested validation runs, so `tuning` in that
+  file does not describe them.
+- A tuned bundle is reused by `run` only when `numerics`, `allocator`, `ep` and
+  `device_selection` match the policy it was optimized under; measurement
+  differences are reported as `bundle_execution_policy`. A tuned bundle made
+  before the record is refused. An untuned one runs and reports `unrecorded`.
+- The policy says what ran, not whether it is good: FP16 attention still needs
+  an application quality gate.
+
+## Measurement modes
+
+`optimize` separates three kinds of run. Each child receives exactly the
+instrumentation of its mode (`policy.MODES`); an ambient `VULKAN_EP_STATS`,
+`VULKAN_GPU_SPAN`, `NODE_PROBE`, `ALLOC_PROBE` or `POOL_PROBE` is removed, and
+the runner reports the instrumentation it observed (`measurement.instrumentation`).
+The pipeline raises if that report differs from the mode, so a leaked probe
+cannot be timed silently.
+
+| Mode | Instrumentation | Used for |
+|---|---|---|
+| `timing` | `VULKAN_GPU_SPAN` only (two timestamps per command buffer; chunked submission is kept) | the ≥20 interleaved AB/BA pairs: `wall_ms` and `gpu_span.busy_ms` |
+| `diagnostic` | `VULKAN_EP_STATS` (per-dispatch timestamps, one command buffer) | one run per side for partitions, transfers and coverage; never timed |
+| `confirmation` | none | ≥20 interleaved pairs of uninstrumented wall time |
+
+A candidate is promoted only when all three agree:
+
+1. **Timing:** at least 20 pairs, and both the GPU busy time and the wall time
+   fall by more than `required_gain` (10%) and than twice the noise of either
+   side. Wall time alone never promotes. A missing, non-finite or incomplete GPU
+   span (`gpu_ms` is `null`) never promotes and ends the experiment by futility.
+2. **Diagnostics:** `measurement.diagnostics_hold` is `null`. Each graph is
+   inspected separately under the profile's dimensions and must be compatible
+   and have run verified with the CPU fallback disabled. Coverage is the
+   graph-local fraction `supported_nodes / total_nodes` from `inspect`; the
+   candidate may not cover a smaller fraction than the source, so a smaller
+   rewritten graph is not penalized for claiming fewer nodes. The EP's
+   `nodes_claimed` must only be positive. Flushes, upload/download volume and
+   convex blocks may not grow. Missing evidence is a reason, not a pass.
+3. **Confirmation:** the uninstrumented wall time shows the same gain.
+
+`report.json` keeps the medians (`baseline`, `candidate`), and per profile a
+`measurement` block with `diagnostics`, `diagnostics_hold` and `confirmation`
+(`null` when the candidate did not reach it). `resume.json` binds the
+measurement plan (`policy.measurement_plan()`); an experiment or row from
+another plan, or one that predates it, is refused with the reason rather than
+mixed. The `gpu_span` of a run is a per-inference sum of per-flush
+command-buffer unions, `null` without evidence and `complete: false` when a
+flush lost timestamps or the span capacity was exceeded. EP and standalone
+spans are reported separately (`candidate_gpu_span`, `standalone_gpu_span`)
+and only the standalone one times the standalone rows.
+
+This is deployment-like timing of the model, not a deployment benchmark of the
+application. The bounded research controller still takes plain
+`{"wall_ms","gpu_ms"}` samples from its own gates.
+
+## Before automating optimization
+
+Define a workload contract before asking a user, script or LLM to search for a
+faster model. Record the input profiles and their frequencies, the deployment
+backend, the latency scope (model only or the complete application), the
+numerical tolerances, an application metric and its allowed degradation, and
+the time/attempt budget. Keep calibration data separate from evaluation data;
+reserve a final holdout if repeated search decisions use the evaluation set.
+Missing application data means application quality is unmeasured, even when
+CPU correctness and EP/standalone parity pass. Never loosen tolerances to make
+a candidate pass.
+
+The following measurement boundaries matter for unattended use:
+
+- `run` enables `VULKAN_EP_STATS`, which on timestamp-capable queues disables
+  chunked submission: its `gpu` block describes that diagnostic mode only.
+  `optimize` does not time with it; see
+  [measurement modes](#measurement-modes). The pipeline's timing is still
+  one standalone model on one device, not application latency.
+- Tool hashes (`tools`) do not identify inherited runtime settings; the
+  separate [execution policy](#execution-policy) record does. Keep it fixed
+  alongside the driver/device and artifacts, and use a new experiment
+  directory after changing it. FP16 attention changes numerics and requires an
+  application quality gate.
+- Quantization screening ranks candidates in separate, short runs. The top-K
+  confirmations alone can establish acceleration. Check the selected bundle,
+  per-profile guards and confirmation outcomes in `search.json`; an attempted
+  candidate is not necessarily a promoted candidate.
+
+Report CPU correctness, EP/standalone parity, application quality and latency
+as separate results. Retain rejected candidates and their failure evidence.
+Report cold-start and steady-state latency separately; include transfers and
+pre/postprocessing when the workload contract calls for application latency.
+The optimized CPU timing in the Vulkan runner is a comparison baseline.
+The separate `cpu-optimize` service searches ORT CPU session settings and
+conservatively prepared graphs; it does not require Vulkan. Its numerical
+oracle, fair baseline and deployment recipe are described in
+[AUTOMATION.md](AUTOMATION.md#cpu-deployment).
 
 ## Bounded Gemm routing experiment
 

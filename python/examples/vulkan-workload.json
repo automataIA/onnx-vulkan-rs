@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "text-encoder",
+  "source": "model.onnx",
+  "adapter": "adapter.py",
+  "backend": "standalone",
+  "objective": "weighted_median_wall",
+  "profiles": {
+    "short": {"dimensions": {"batch": 1, "sequence": 16}, "weight": 3, "max_regression": 0.02},
+    "long": {"dimensions": {"batch": 1, "sequence": 128}, "weight": 1, "max_regression": 0.05}
+  },
+  "tolerances": {"atol": 1e-5, "rtol": 1e-4},
+  "quantization": {
+    "config": "vulkan-quantization.json",
+    "grid": [
+      {"mode": "dynamic", "per_channel": false},
+      {"mode": "dynamic", "per_channel": true},
+      {"mode": "int4", "block_size": 32},
+      {"mode": "int4", "block_size": 128}
+    ]
+  },
+  "budget": {"seconds": 7200, "attempts": 12, "top_k": 2, "samples": 20, "screen_samples": 5, "timeout": 600}
+}

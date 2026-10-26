@@ -14,6 +14,13 @@ def main():
     if config.get("adapter"):
         config["adapter"] = Path(config["adapter"])
     quantization = config.pop("quantization", None)
+    quality = config.pop("quality", None)
+    if quality is not None:
+        # Checked before the costly export, optimization and quantization.
+        from .quality import check_quantization_compatible, validate_config
+        quality = validate_config(quality)
+        if quantization is not None:
+            check_quantization_compatible(quality, quantization)
     try:
         result = prepare_model(source, destination, **config)
     except VerificationError as error:
@@ -24,6 +31,11 @@ def main():
         result["quantization"] = quantize_model(destination / "model.onnx", quantization,
                                                atol=config["atol"], rtol=config["rtol"])
     write_json(destination / "preparation.json", result)
+    if quality is not None:
+        # Reads preparation.json: a legacy quantization contract is reused, not duplicated.
+        from .quality import attach_quality
+        result["quality"] = attach_quality(destination, quality)
+        write_json(destination / "preparation.json", result)
 
 
 if __name__ == "__main__":

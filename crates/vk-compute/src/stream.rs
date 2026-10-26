@@ -35,7 +35,8 @@ const SPAN_CAPACITY: u32 = 256;
 /// submission left on (unlike `VULKAN_EP_STATS`), and at each flush the GPU
 /// busy time (union of the command buffers' intervals) against their span.
 /// The difference is time the GPU waited for the host to record and submit.
-fn span_probe() -> bool {
+/// Each flush's result is also published to [`crate::stats::take_gpu_span`].
+pub(crate) fn span_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VULKAN_GPU_SPAN").is_some())
 }
@@ -62,6 +63,9 @@ pub(crate) struct StreamState {
     /// `VULKAN_GPU_SPAN`: timestamps written since the last flush (odd = the
     /// current command buffer still has to write its end).
     span_count: u32,
+    /// A command buffer of this flush went untimed because the query pool was
+    /// full: its busy time is a lower bound.
+    span_truncated: bool,
 }
 
 impl VkContext {
@@ -88,20 +92,24 @@ impl VkContext {
         state.cmd = Some(cmd);
         state.ts_labels.clear();
         state.ts_count = 0;
-        if self.span_on() && state.span_count + 2 <= SPAN_CAPACITY {
-            let pool = self.ensure_query_pool()?;
-            unsafe {
-                if state.span_count == 0 {
-                    device.cmd_reset_query_pool(cmd, pool, 0, SPAN_CAPACITY);
+        if self.span_on() {
+            if state.span_count + 2 <= SPAN_CAPACITY {
+                let pool = self.ensure_query_pool()?;
+                unsafe {
+                    if state.span_count == 0 {
+                        device.cmd_reset_query_pool(cmd, pool, 0, SPAN_CAPACITY);
+                    }
+                    device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        pool,
+                        state.span_count,
+                    );
                 }
-                device.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    pool,
-                    state.span_count,
-                );
+                state.span_count += 1;
+            } else {
+                state.span_truncated = true;
             }
-            state.span_count += 1;
         }
         // profiling: reset query pool + baseline timestamp at the start of the cmd buffer
         if self.profiling_on() {
@@ -143,14 +151,24 @@ impl VkContext {
         }
     }
 
-    /// Logs the probe's busy time and span for the flush just waited on.
+    /// Logs the probe's busy time and span for the flush just waited on, and
+    /// publishes them to [`crate::stats::take_gpu_span`]. A flush whose
+    /// timestamps cannot be read is published as incomplete, never dropped.
     fn report_span(&self, state: &mut StreamState, host_wait: std::time::Duration) {
         let count = std::mem::take(&mut state.span_count);
+        let truncated = std::mem::take(&mut state.span_truncated);
+        let lost = || {
+            crate::stats::record_gpu_span(crate::stats::GpuSpan {
+                flushes: 1,
+                complete: false,
+                ..Default::default()
+            });
+        };
         let Some(pool) = *self.query_pool.lock().unwrap() else {
-            return;
+            return lost();
         };
         if count < 2 {
-            return;
+            return lost();
         }
         let mut ts = vec![0u64; count as usize];
         let read = unsafe {
@@ -158,7 +176,7 @@ impl VkContext {
                 .get_query_pool_results(pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
         };
         if read.is_err() {
-            return;
+            return lost();
         }
         // in ms from the first begin, which wrapping counters only allow as deltas
         let ms = |t: u64| {
@@ -179,6 +197,14 @@ impl VkContext {
             }
             end = end.max(b);
         }
+        crate::stats::record_gpu_span(crate::stats::GpuSpan {
+            flushes: 1,
+            command_buffers: intervals.len() as u32,
+            submits: 0,
+            busy_ms: busy,
+            span_ms: end,
+            complete: !truncated,
+        });
         log::info!(
             "gpu span: {} command buffers, busy {busy:.3} ms of {end:.3} ms, host waited {:.3} ms",
             intervals.len(),

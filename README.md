@@ -13,8 +13,28 @@ a **standalone pure-Rust engine** (own ONNX parser, no ORT in the process) that
 shares the same kernels. Linux, NVIDIA/AMD GPUs (lavapipe as a CPU
 fallback — correctness only, never performance).
 
+## At a glance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/model-benchmarks-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/model-benchmarks-light.png">
+  <img alt="Before and after inference latency for 15 model/profile cases. SAM 3: 346 to 314 ms; Piper Serena: about 742 to 69.05 ms; Piper Ryan: 911.63 to 58.411 ms. Full values and methodology in BENCHMARKS.md." src="assets/model-benchmarks-light.png" width="100%">
+</picture>
+
+RTX 4070, recorded runs. SAM 3 compares against PyTorch CUDA bf16; the other
+pairs compare against ONNX Runtime CPU. Bars use a separate scale per model.
+Piper INT8 is experimental: strict numerical checks fail; listening feedback
+for Ryan was positive. [All values, quality checks and methodology](BENCHMARKS.md).
+
+**Models:** [SAM 3](https://huggingface.co/Autognosi/sam3-onnx-vulkan) ·
+[Serena](https://huggingface.co/Autognosi/piper-it_IT-serena-high-int8) ·
+[Ryan](https://huggingface.co/Autognosi/piper-en_US-ryan-high-int8).
+**Article:** [SAM 3 without CUDA](https://autognosi.substack.com/p/segment-anything-3-without-cuda-a).
+
+## Runtime capabilities
+
 Runs int4 LLMs at **~160 tok/s** (gemma3-1b) and **~71 tok/s** (qwen2.5-VL),
-puts static int8 convolutions on the **tensor cores**, and reaches 7.98× the
+puts static int8 convolutions on the **tensor cores**, and reaches 7.94× the
 ORT CPU EP on the Parakeet encoder — while refusing at load time, loudly and completely, any
 graph it cannot run end to end on the GPU. Reference app: STT with **Parakeet
 TDT 0.6B v3 (int8 ONNX)**.
@@ -335,98 +355,10 @@ can trust.
 
 ## Performance
 
-RTX 4070, driver 595.84, Pop!_OS 24.04, batch 1, ORT 1.29.0. Every cell is the
-**median of three back-to-back full matrix runs** (`runs/ort129{,-b,-c}`).
-Ratio is against the ORT **CPU EP (MLAS)** on the same graph. `GPU` is the
-profiler's compute time, i.e. the part of the wall that is actually shaders.
-
-| model | wall | CPU EP | ratio | GPU | blocks | flush | GPU Pareto head |
-|---|---|---|---|---|---|---|---|
-| parakeet (encoder) | 43.3 ms | 343.8 ms | **7.94×** | 32.8 | 1 | 7 | `MMI_matmul_coop_k32` 59% |
-| rfdetr | 40.9 ms | 306.8 ms | **7.50×** | 34.7 | 1 | 9 | `MatMul` 61% |
-| yolov4 | 35.5 ms | 176.8 ms | **4.98×** | 19.1 | 1 | 4 | `Conv_split` 54% |
-| yolov8n | 7.1 ms | 29.9 ms | **4.21×** | 4.8 | 1 | 2 | `Conv_split` 41% |
-| roberta seq 1 | 3.5 ms | 13.3 ms | **3.80×** | 2.2 | 1 | 4 | `GEMV` 46% |
-| qwen2.5-VL decoder (int4) | 29.2 ms | 85.4 ms | **2.92×** | 12.7 | 1 | 77 | `MatMulNBits_wide` 37% |
-| roberta seq 128 | 19.5 ms | 55.0 ms | **2.82×** | 17.1 | 1 | 4 | `MatMul` 89% |
-| resnet50-int8 | 3.3 ms | 6.7 ms | **2.03×** | 2.4 | 1 | 2 | `ConvInteger_coop` 35% |
-| resnet50-qdq | 5.1 ms | 9.0 ms | **1.76×** | 3.6 | 1 | 2 | `Conv_split` 62% |
-| gemma3-1b (int4) | 16.4 ms | 27.1 ms | **1.65×** | 6.5 | 1 | 57 | `MatMulNBits` 29% |
-| mobilenetv2 | 1.7 ms | 1.3 ms | 0.76× | 1.1 | 1 | 2 | `Conv` 21% |
-| mobilenetv2-int8 | 1.8 ms | 0.8 ms | 0.44× | 0.9 | 1 | 2 | `Requantize` 30% |
-
-These walls use the default kernels. `onnx-vulkan optimize` measured no further
-gain from tuning on YOLOv8n (GPU 5.16 → 4.96 ms, wall 10.97 → 11.94 ms per
-process, 2026-10-06) or MobileNetV2, so it keeps the untuned model there.
-
-**These ratios are not comparable with the ORT 1.27.1 table they replace.** Our
-walls are 3–8% higher and our GPU compute moved with them (parakeet 30.95 →
-32.84 with no kernel touched), i.e. the host is slightly slower today; the CPU
-EP reference moved much more, and upward (yolov4 123.4 → 176.8, roberta seq 1
-9.4 → 13.3). The improved ratios are ORT's CPU path, not our kernels.
-
-Correctness in the same run: `sync-check.sh` reports **12/12 models clean**
-under the Khronos synchronization-validation layer, both int8 classifiers are
-bit-exact against their golden data (`max|Δ| = 0.000e0`), and every golden
-argmax is reproduced.
-
-Generation, measured on the replayed decode loop rather than on a single
-forward: **gemma3-1b 6.24 ms/token (~160 tok/s)** and **qwen2.5-VL 14.09
-ms/token (~71 tok/s)**, zero device allocations per step, one flush. These two
-were taken on the previous Windows host. Re-measured for gemma3-1b on this host
-on 2026-10-06 with the command in
-[Decoders with a KV cache](#decoders-with-a-kv-cache): **5.46 ms/token
-(~183 tok/s)**, median of the last 16 of 24 steps. qwen2.5-VL has not been
-re-measured. The table's gemma and qwen rows are a single forward through the
-EP, not this loop.
-
-Read honestly:
-
-- **The biggest single win here was one Vulkan call, not a kernel.** Every
-  submit+fence used to create and destroy its fence. `cargo run --release -p
-  vk-compute --example flush_cost` times the round trip with nothing to compute:
-  0.496 ms through `flush()`, 0.136 ms with a pre-recorded command buffer and a
-  reused fence, and 0.494 ms again the moment the fence is created and destroyed
-  — so **0.358 ms of every flush was one fence allocation**, which the NVIDIA
-  driver charges dearly and lavapipe does not charge at all. Creating the fence
-  once and resetting it per submit took **qwen2.5-VL 69.4 → 28.5 ms** and
-  **gemma3-1b 41.2 → 17.3**, and moved all twelve models by 0.42–0.73 ms per
-  flush — a constant that now shows up identically from 2 flushes to 77.
-- **Structure is solved and the submit boundary is now cheap.** Every model is
-  at 1 convex block, so boundary *count* was already not a lever; each remaining
-  flush costs ~0.14 ms, which is the driver's own floor.
-- **The kernels are unchanged across all of this.** GPU compute matches the
-  previous Windows-host baseline within ±10% on every model (gemma3-1b 6.4 →
-  6.0 ms, rfdetr 34.9 → 34.0, yolov8n 4.83 → 4.86). Everything above and below
-  moved the wall around the shaders, never the shaders.
-- **Two models are below the CPU EP, and no kernel will move them.**
-  `mobilenetv2-int8` spends 0.9 of its 1.8 ms on the GPU; the rest is ORT and
-  plugin overhead across 73 nodes. Its `ConvInteger` work is 17 depthwise
-  convolutions with `K = 9` — not a GEMM, nothing to tile, nothing to split.
-  They are overhead items, and they are labelled as such instead of tuned.
-- **The two models that used to be below 1× no longer are**, and neither was
-  fixed by a bigger tile. roberta at `seq_len = 1` (0.76×) is a GEMV: 768 useful
-  threads on a card that holds 70,656, so the fix was splitting `K` to
-  manufacture workgroups — now 3.80×, at 500–515 GB/s against the card's ~504,
-  so that lever is spent. resnet50-qdq
-  (0.74×) was the same diagnosis with split-K on `Conv` — now 1.76×, against a
-  reference so unstable it reads 13.4 / 7.1 / 9.0 ms across three consecutive
-  runs.
-- **Ratios move because the reference moves, and this table is mostly ratios.**
-  Across the three runs behind this table it swung by **1.9×** on the same
-  binary (resnet50-qdq 13.4 / 7.1 / 9.0 ms, roberta seq 1 13.4 / 9.9 / 13.3)
-  while our own walls repeated to a tenth (yolov8n 7.1 / 7.1 / 7.1) — which is
-  why every cell above is a median of three and no single run is quotable for
-  the small models. Compare milliseconds, and treat `blocks` / `flushes` /
-  `MB transferred`, which are deterministic, as the primary metric.
-- **lavapipe numbers mean nothing for performance**; the suite marks those runs
-  `perf_valid: false`. They are still a valid *correctness* gate, because
-  integer arithmetic is exact on any device.
-
-When `--baseline FILE` is supplied, the regression gate fails on accuracy
-outside tolerance, median wall past `perf_tol`, more flushes or MB transferred,
-or **more convex blocks / fewer claimed nodes** — the last two are deterministic
-and lead the wall clock.
+The [overview above](#at-a-glance) shows recorded inference latency, including
+the two MobileNetV2 cases where CPU is faster. The twelve-model CPU/Vulkan
+matrix uses the same graph and precision on both backends.
+[Benchmark tables, protocols and validation](BENCHMARKS.md#performance).
 
 ## Technical notes
 
@@ -461,6 +393,8 @@ this repository.
 | Model | Files | Weights license |
 |---|---|---|
 | SAM 3 int8 image segmentation, ONNX: text prompts (vision encoder, text encoder, detector) and point/box prompts (tracker vision encoder, prompt decoder); no video | [`Autognosi/sam3-onnx-vulkan`](https://huggingface.co/Autognosi/sam3-onnx-vulkan) | [SAM License](https://huggingface.co/facebook/sam3) |
+| Piper Serena high, Italian TTS: selective INT8 ONNX, unchanged config and quantization recipe | [`Autognosi/piper-it_IT-serena-high-int8`](https://huggingface.co/Autognosi/piper-it_IT-serena-high-int8) | MIT (upstream voice); dataset CC-BY-4.0, see model card |
+| Piper Ryan high, US English TTS: experimental selective INT8 ONNX, unchanged config, preparation/quantization recipe and validation report | [`Autognosi/piper-en_US-ryan-high-int8`](https://huggingface.co/Autognosi/piper-en_US-ryan-high-int8) | Upstream repository metadata: MIT; original voice card also records RyanSpeech dataset CC BY-NC-SA 4.0, see model card |
 
 The weights keep the license of their base model. The license below covers
 the code of this repository and not the weights.

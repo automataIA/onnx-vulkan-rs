@@ -311,6 +311,111 @@ pub fn dump_and_reset() {
     );
 }
 
+/// GPU timestamps of one inference as the `VULKAN_GPU_SPAN` probe saw them,
+/// summed over the flushes that inference issued.
+///
+/// This is deployment-like telemetry: the probe keeps chunked submission and
+/// costs two timestamps per command buffer, unlike the `VULKAN_EP_STATS`
+/// profiler, whose per-dispatch timestamps force one buffer and whose numbers
+/// are for attribution, not for timing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuSpan {
+    /// Flushes that contributed.
+    pub flushes: u32,
+    /// Command buffers the probe timed.
+    pub command_buffers: u32,
+    /// Queue submissions made since the last reset, of any path. Fewer timed
+    /// command buffers than submissions means some GPU work was not timed.
+    pub submits: u64,
+    /// Union of the command buffers' intervals, per flush, summed.
+    pub busy_ms: f64,
+    /// First begin to last end, per flush, summed. Never below `busy_ms`.
+    pub span_ms: f64,
+    /// False when a flush lost timestamps (more command buffers than the query
+    /// pool holds, or a failed read) or when `submits` exceeds the timed
+    /// command buffers: the figures are then lower bounds, not evidence.
+    pub complete: bool,
+}
+
+/// Accumulates [`GpuSpan`] of the flushes between two takes.
+///
+/// Separate from the process-wide instance so that the accounting is testable
+/// without a device.
+pub struct GpuSpanMeter {
+    total: Option<GpuSpan>,
+    submits_base: u64,
+}
+
+impl GpuSpanMeter {
+    pub const fn new() -> Self {
+        Self {
+            total: None,
+            submits_base: 0,
+        }
+    }
+
+    /// Adds one flush. `flush.complete` is false for a flush that lost data.
+    pub fn record(&mut self, flush: GpuSpan) {
+        let total = self.total.get_or_insert(GpuSpan {
+            complete: true,
+            ..GpuSpan::default()
+        });
+        total.flushes += flush.flushes;
+        total.command_buffers += flush.command_buffers;
+        total.busy_ms += flush.busy_ms;
+        total.span_ms += flush.span_ms;
+        total.complete &= flush.complete;
+    }
+
+    /// Discards what was recorded, so that the next take only covers what runs
+    /// after this call. `submits_now` is the process's submission count.
+    pub fn reset(&mut self, submits_now: u64) {
+        self.total = None;
+        self.submits_base = submits_now;
+    }
+
+    /// The flushes since the last take or reset, or `None` when the probe saw
+    /// none (probe off, no timestamp support, or no GPU work): absence of
+    /// evidence is reported as absence, never as a zero.
+    pub fn take(&mut self, submits_now: u64) -> Option<GpuSpan> {
+        let mut span = self.total.take()?;
+        span.submits = submits_now.saturating_sub(self.submits_base);
+        span.complete &= u64::from(span.command_buffers) == span.submits;
+        self.submits_base = submits_now;
+        Some(span)
+    }
+}
+
+impl Default for GpuSpanMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GPU_SPAN: Mutex<GpuSpanMeter> = Mutex::new(GpuSpanMeter::new());
+
+/// One flush's probe result, from the stream.
+pub(crate) fn record_gpu_span(flush: GpuSpan) {
+    GPU_SPAN.lock().unwrap().record(flush);
+}
+
+/// Starts a measurement window: call before the warm-up of each backend, so
+/// that one backend's flushes are never attributed to the next.
+pub fn reset_gpu_span() {
+    GPU_SPAN
+        .lock()
+        .unwrap()
+        .reset(SUBMITS.load(Ordering::Relaxed));
+}
+
+/// Ends the current inference's window and starts the next one.
+pub fn take_gpu_span() -> Option<GpuSpan> {
+    GPU_SPAN
+        .lock()
+        .unwrap()
+        .take(SUBMITS.load(Ordering::Relaxed))
+}
+
 /// Storage-buffer allocations so far (probe hook, see interp's ALLOC_PROBE).
 pub fn allocs() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
@@ -331,4 +436,114 @@ pub fn dispatches() -> u64 {
 
 pub(crate) fn record_dispatch_count() {
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Diagnostic instrumentation this process was started with. A report carries
+/// it so that a consumer can check the measurement mode it asked for, instead
+/// of trusting that its environment reached the process unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Instrumentation {
+    /// `VULKAN_EP_STATS`: per-dispatch timestamps, one command buffer.
+    pub stats: bool,
+    /// `VULKAN_GPU_SPAN`: two timestamps per command buffer.
+    pub gpu_span: bool,
+    pub node_probe: bool,
+    pub alloc_probe: bool,
+    pub pool_probe: bool,
+}
+
+pub fn instrumentation() -> Instrumentation {
+    let present = |name| std::env::var_os(name).is_some();
+    Instrumentation {
+        stats: enabled(),
+        gpu_span: crate::stream::span_probe(),
+        node_probe: present("NODE_PROBE"),
+        alloc_probe: present("ALLOC_PROBE"),
+        pool_probe: present("POOL_PROBE"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flush(command_buffers: u32, busy_ms: f64, span_ms: f64) -> GpuSpan {
+        GpuSpan {
+            flushes: 1,
+            command_buffers,
+            busy_ms,
+            span_ms,
+            complete: true,
+            ..GpuSpan::default()
+        }
+    }
+
+    #[test]
+    fn a_window_without_flushes_is_absent_not_zero() {
+        let mut meter = GpuSpanMeter::new();
+        assert_eq!(meter.take(5), None);
+        meter.record(flush(2, 1.0, 1.5));
+        assert!(meter.take(2).is_some());
+        assert_eq!(meter.take(2), None);
+    }
+
+    #[test]
+    fn the_flushes_of_one_inference_are_summed_and_the_window_resets() {
+        let mut meter = GpuSpanMeter::new();
+        meter.reset(10);
+        meter.record(flush(2, 1.0, 1.5));
+        meter.record(flush(1, 0.5, 0.5));
+        let first = meter.take(13).unwrap();
+        assert_eq!(first.flushes, 2);
+        assert_eq!(first.command_buffers, 3);
+        assert_eq!(first.submits, 3);
+        assert!((first.busy_ms - 1.5).abs() < 1e-12 && (first.span_ms - 2.0).abs() < 1e-12);
+        assert!(first.complete);
+
+        // the next inference starts from nothing, not from the previous total
+        meter.record(flush(4, 3.0, 3.0));
+        let second = meter.take(17).unwrap();
+        assert_eq!(
+            (second.flushes, second.command_buffers, second.submits),
+            (1, 4, 4)
+        );
+        assert!((second.busy_ms - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reset_drops_what_an_earlier_backend_recorded() {
+        let mut meter = GpuSpanMeter::new();
+        meter.record(flush(2, 9.0, 9.0)); // e.g. the EP's last inference
+        meter.reset(2);
+        assert_eq!(meter.take(2), None);
+        meter.record(flush(1, 1.0, 1.0)); // the standalone run
+        let span = meter.take(3).unwrap();
+        assert_eq!(span.command_buffers, 1);
+        assert!((span.busy_ms - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn untimed_submissions_or_lost_timestamps_make_the_span_incomplete() {
+        let mut meter = GpuSpanMeter::new();
+        meter.reset(0);
+        meter.record(flush(2, 1.0, 1.0));
+        assert!(
+            !meter.take(3).unwrap().complete,
+            "a submission nobody timed"
+        );
+
+        meter.record(GpuSpan {
+            complete: false,
+            ..flush(2, 1.0, 1.0)
+        });
+        assert!(
+            !meter.take(5).unwrap().complete,
+            "a flush that lost timestamps"
+        );
+        meter.record(flush(1, 1.0, 1.0));
+        assert!(
+            meter.take(6).unwrap().complete,
+            "incompleteness does not leak into the next window"
+        );
+    }
 }

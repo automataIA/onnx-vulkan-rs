@@ -17,6 +17,7 @@ import statistics
 import sys
 import tempfile
 
+from . import policy
 from .process import command, failure_reason, gpu_lock
 
 ROOT = Path(os.environ.get("ONNX_VULKAN_ROOT", Path(__file__).resolve().parents[2]))
@@ -189,9 +190,14 @@ def _preparation_workspace(destination):
             raise
 
 
-def prepare_bundle(source, destination, *, adapter=None, profiles=None, atol=1e-5, rtol=1e-4, timeout=300, quantization=None):
+def prepare_bundle(source, destination, *, adapter=None, profiles=None, atol=1e-5, rtol=1e-4, timeout=300, quantization=None, quality=None):
     if not all(math.isfinite(t) and t >= 0 for t in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
+    if quality is not None:
+        from . import quality as quality_module
+        quality = quality_module.validate_config(quality)
+        if quantization is not None:
+            quality_module.check_quantization_compatible(quality, quantization)
     destination = Path(destination).resolve()
     if destination.exists():
         raise FileExistsError(destination)
@@ -219,7 +225,8 @@ def prepare_bundle(source, destination, *, adapter=None, profiles=None, atol=1e-
             config_path = Path(temporary) / "prepare-config.json"
             write_json(config_path, {"source": str(Path(source).resolve()), "destination": str(directory),
                                     "adapter": str(Path(adapter).resolve()) if adapter else None,
-                                    "profiles": profile, "atol": atol, "rtol": rtol, "quantization": quantization})
+                                    "profiles": profile, "atol": atol, "rtol": rtol, "quantization": quantization,
+                                    "quality": quality})
             command([sys.executable, "-m", "onnx_vulkan_pipeline._prepare_worker", config_path], timeout=timeout)
             _link_duplicates(directory)
             result = json.loads((directory / "preparation.json").read_text())
@@ -244,6 +251,51 @@ def _gpu_metrics(text):
     if result is not None:
         result["blocks"] = module.parse_blocks(text.splitlines())
     return result
+
+
+def _expected_instrumentation(run_policy):
+    """What the runtime must report as enabled under `run_policy`: the profiler
+    and the span probe as the policy says, and no other probe at all."""
+    measurement = run_policy["measurement"]
+    return {"stats": measurement["stats"], "gpu_span": "VULKAN_GPU_SPAN" in measurement["probes"],
+            "node_probe": False, "alloc_probe": False, "pool_probe": False}
+
+
+def _require_instrumentation(report, run_policy):
+    """The runner reports which instrumentation was active in its process. A
+    timing taken with an ambient probe, or without the one it relies on, is not
+    the timing of its mode."""
+    observed = (report.get("measurement") or {}).get("instrumentation")
+    if observed is None:
+        raise RuntimeError("model-runner reported no instrumentation: rebuild it before measuring")
+    expected = _expected_instrumentation(run_policy)
+    if observed != expected:
+        raise RuntimeError(f"Instrumentation of the run differs from its measurement mode: ran with {observed}, "
+                           f"expected {expected}")
+
+
+def _valid_span(span):
+    """A GPU span usable as evidence: complete, covering the inference and finite."""
+    if not isinstance(span, dict) or span.get("complete") is not True:
+        return None
+    busy, extent = span.get("busy_ms"), span.get("span_ms")
+    if not span.get("flushes") or not span.get("command_buffers"):
+        return None
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (busy, extent)):
+        return None
+    return span if 0 < busy <= extent else None
+
+
+def _timing_row(report):
+    """One interleaved timing: the backend's wall clock and GPU busy time of the
+    same last inference. Without a valid span `gpu_ms` is None and the pair
+    cannot promote anything."""
+    spans = (report.get("measurement") or {}).get("standalone_gpu_span") or [None]
+    span = spans[-1]
+    valid = _valid_span(span)
+    return {"wall_ms": report["standalone_ms"][-1], "gpu_ms": valid["busy_ms"] if valid else None,
+            "gpu_span": span, "storage_peak_bytes": report.get("standalone_storage_peak_bytes"),
+            "measurement_mode": "timing"}
 
 
 def _default_reference(bundle, profile, model):
@@ -380,7 +432,9 @@ CPU_BUDGET_SECONDS = 30
 
 
 def _run(bundle, manifest, profile, backend, samples, timeout, *, model=None, tactics=None, reference=None, output_data=False,
-         cpu_timing=False):
+         cpu_timing=False, mode="diagnostic"):
+    """One model-runner validation. `mode` is the measurement it runs under (`policy.MODES`):
+    only `diagnostic` carries the profiler, whose timings explain a run but are not a timing."""
     selected = manifest["profiles"][profile]
     with tempfile.TemporaryDirectory(prefix="vulkan-validation-") as temporary:
         report_path = Path(temporary) / "report.json"
@@ -406,15 +460,14 @@ def _run(bundle, manifest, profile, backend, samples, timeout, *, model=None, ta
                 raise ValueError("A dynamically quantized model is verified by standalone/EP parity; "
                                  "run it with --backend standalone")
             args += ["--parity-gate"]
-        env = {"VULKAN_EP_COMPILE": "1", "VULKAN_EP_STATS": "1", "RUST_LOG": "info",
-               "ONNX_VULKAN_TUNING_MODE": "cache-only" if tactics else "off",
-               "ONNX_VULKAN_TUNING_ARTIFACT": str(bundle / tactics) if tactics else ""}
+        run_policy = policy.resolve(tactics=tactics, ep_compile=True, mode=mode)
+        env = {**policy.environment(run_policy, bundle=bundle), "RUST_LOG": "info" if mode == "diagnostic" else "warn"}
         try:
             result = command(args, cwd=ROOT, timeout=timeout, env=env)
         except BaseException as error:
             _retain_evidence(error, temporary, bundle.with_name(f".{bundle.name}.run-failed"), "Run", {
                 "profile": profile, "backend": backend, "bundle": str(bundle), "identity": manifest.get("identity"),
-                "command": [str(arg) for arg in args], "environment": env,
+                "command": [str(arg) for arg in args], "environment": env, "execution_policy": run_policy,
             })
             raise
         report = json.loads(report_path.read_text())
@@ -423,11 +476,15 @@ def _run(bundle, manifest, profile, backend, samples, timeout, *, model=None, ta
             raise RuntimeError("Full-model validation did not pass")
         if backend == "standalone" and not report.get("standalone_outputs"):
             raise RuntimeError("Standalone validation missing")
+        _require_instrumentation(report, run_policy)
+        report["measurement_mode"] = mode
         report["dynamic_quantization"] = dynamic
         report["requested_backend"] = backend
         report["executed_backends"] = ["ort-cpu", "vulkan-ep"] + (["standalone"] if backend == "standalone" else [])
         report["tools"] = tool_identity()
-        report["gpu"] = _gpu_metrics(result.stderr + "\n" + result.stdout)
+        report["execution_policy"] = run_policy
+        # Only the profiler prints the Pareto block these are read from.
+        report["gpu"] = _gpu_metrics(result.stderr + "\n" + result.stdout) if mode == "diagnostic" else None
         if output_data:
             report["output_data"] = json.loads((Path(temporary) / "outputs.json").read_text())
         report["log"] = result.stdout + result.stderr
@@ -439,6 +496,37 @@ def unsupported_operators(issues):
     counts = collections.Counter(issue.get("op", "?") for issue in issues
                                  if issue.get("blocking") and issue.get("kind") != "shape")
     return ", ".join(f"{op} ×{count}" for op, count in counts.most_common())
+
+
+def _device(timeout):
+    """Identity of the device the runtime picks under the caller's device selection."""
+    return json.loads(command([binary("examples/conv_blocked"), "--device-json"], timeout=timeout,
+                              env=policy.environment(policy.resolve())).stdout)
+
+
+def _require_compatible_policy(manifest):
+    """A tuned artifact was measured and validated under the policy its manifest
+    records (numerics, allocator, EP and device selection; its device is bound
+    separately). One without a record predates policy identity and cannot be
+    shown to match."""
+    recorded = manifest.get("execution_policy")
+    if recorded is None:
+        raise ValueError("Tuned bundle records no execution policy (made before policy identity); "
+                         "optimize again in a new directory")
+    changes = policy.differences(recorded, policy.pipeline_identity(), policy.COMPATIBILITY)
+    if changes:
+        raise ValueError("Tuned bundle was optimized under a different execution policy ("
+                         + "; ".join(changes) + "); restore it or optimize again in a new directory")
+
+
+def _bundle_policy(manifest):
+    """How the policy of this run compares with the one the bundle was sealed under.
+    Untuned bundles run under any policy; the report says which one it was."""
+    recorded = manifest.get("execution_policy")
+    if recorded is None:
+        return {"status": "unrecorded", "differences": []}
+    changes = policy.differences(recorded, policy.pipeline_identity())
+    return {"status": "different" if changes else "match", "differences": changes}
 
 
 def run_bundle(bundle, *, profile="default", backend="standalone", samples=20, timeout=300):
@@ -456,11 +544,12 @@ def run_bundle(bundle, *, profile="default", backend="standalone", samples=20, t
                          + f", and there is no CPU fallback; details in {compatibility}")
     with gpu_lock(timeout):
         if selected["tactics"]:
-            device = json.loads(command([binary("examples/conv_blocked"), "--device-json"], timeout=timeout).stdout)
-            if manifest.get("device") != device or manifest.get("tools") != tool_identity():
+            if manifest.get("device") != _device(timeout) or manifest.get("tools") != tool_identity():
                 raise ValueError("Tuned bundle targets different tools or device; optimize again in a new directory")
+            _require_compatible_policy(manifest)
         result = _run(bundle, manifest, profile, backend, samples, timeout, tactics=selected["tactics"],
                       cpu_timing=True)
+        result["bundle_execution_policy"] = _bundle_policy(manifest)
         result["quality_evaluation"] = _verify_quality(bundle, manifest, profile, backend, timeout)
         if result.get("gate") == "parity":
             result["quantized_tensors"] = _verify_quantized_tensors(bundle, manifest, profile, backend, timeout)
@@ -469,47 +558,40 @@ def run_bundle(bundle, *, profile="default", backend="standalone", samples=20, t
 
 
 def _verify_quality(bundle, manifest, profile, backend, timeout):
-    references = sorted(p for p in (bundle / profile / "quality").glob("*") if p.is_dir())
-    if not references:
-        return {"samples": 0, "vulkan_verified": False}
-    if manifest["profiles"][profile]["model"] != f"{profile}/model.onnx":
-        # The profile fell back to the fp32 baseline: the quantized fixtures
-        # and metric do not describe the model that runs.
-        return {"samples": 0, "vulkan_verified": False, "reason": "profile runs the fp32 baseline"}
-    import numpy as np
-
-    records = []
-    with tempfile.TemporaryDirectory(prefix="vulkan-quality-") as temporary:
-        for index, reference in enumerate(references):
-            result = _run(bundle, manifest, profile, backend, 1, timeout,
-                          tactics=manifest["profiles"][profile]["tactics"], reference=reference,
-                          output_data=True)
-            # Kept as .npy files, not JSON lists: SAM 3's detector writes 17M
-            # values a sample, and holding every sample as Python floats (then
-            # serializing them again for the worker) exhausted 15 GB.
-            data = result["output_data"]
-            for position, item in enumerate(data["outputs"]):
-                path = Path(temporary) / f"{index:04d}_{position}.npy"
-                np.save(path, np.asarray(item.pop("values"), dtype=item["dtype"]).reshape(item["shape"]))
-                item["file"] = str(path)
-            records.append({"reference": str(reference), "result": data})
-            del result
-        request = Path(temporary) / "request.json"
-        response = Path(temporary) / "response.json"
-        write_json(request, {"directory": str(bundle / profile), "records": records,
-                             "response": str(response)})
-        command([sys.executable, "-m", "onnx_vulkan_pipeline._quality_worker", request], timeout=timeout)
-        return json.loads(response.read_text())
+    from .quality import verify_quality
+    return verify_quality(bundle, manifest, profile, backend, timeout)
 
 
 @contextmanager
 def _optimization_workspace(source, destination, manifest, samples, tune):
     staging = destination.with_name(f".{destination.name}.incomplete")
     identity = {"source": manifest["identity"], "tools": tool_identity(), "samples": samples, "tune": tune,
-                "profiles": manifest["profiles"], "atol": manifest["atol"], "rtol": manifest["rtol"]}
+                "profiles": manifest["profiles"], "atol": manifest["atol"], "rtol": manifest["rtol"],
+                "execution_policy": policy.pipeline_identity(),
+                # How the timings are taken; rows measured under another plan are never mixed in.
+                "measurement": policy.measurement_plan(),
+                # The tuner subprocess runs under the caller's settings, which the pipeline's own
+                # runs override; without tuning there is no such launch.
+                "tuner_execution_policy": policy.resolve() if tune else None}
     if staging.exists():
-        if json.loads((staging / "resume.json").read_text()) != identity:
-            raise ValueError(f"Stale experiment at {staging}; choose a new output directory")
+        recorded = json.loads((staging / "resume.json").read_text())
+        if recorded != identity:
+            if "execution_policy" not in recorded or "tuner_execution_policy" not in recorded:
+                reason = " (it predates execution-policy identity)"
+            elif "measurement" not in recorded:
+                reason = " (it predates measurement-mode identity)"
+            elif recorded["execution_policy"] != identity["execution_policy"]:
+                reason = " (execution policy changed: " + "; ".join(
+                    policy.differences(recorded["execution_policy"], identity["execution_policy"])) + ")"
+            elif recorded.get("tune") == tune and recorded["tuner_execution_policy"] != identity["tuner_execution_policy"]:
+                reason = " (tuner execution policy changed: " + "; ".join(
+                    policy.differences(recorded["tuner_execution_policy"], identity["tuner_execution_policy"])) + ")"
+            elif recorded["measurement"] != identity["measurement"]:
+                reason = " (measurement modes changed: " + "; ".join(
+                    policy.differences(recorded["measurement"], identity["measurement"])) + ")"
+            else:
+                reason = ""
+            raise ValueError(f"Stale experiment at {staging}{reason}; choose a new output directory")
     else:
         staging.mkdir()
         write_json(staging / "resume.json", identity)
@@ -531,31 +613,98 @@ def _optimization_workspace(source, destination, manifest, samples, tune):
 REQUIRED_GAIN = 0.10
 
 
-def _improvement(baseline, candidate, *, threshold=REQUIRED_GAIN):
-    """Require GPU evidence first; wall alone cannot promote a candidate."""
-    if len(baseline) < 20 or len(candidate) < 20:
+MIN_PAIRS = 20
+
+
+def _gain(baseline, candidate, key, threshold):
+    """Whether `key` fell by more than the required gain and than twice the
+    noise of either side. A missing or invalid value never gains."""
+    a, b = [x.get(key) for x in baseline], [x.get(key) for x in candidate]
+    if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 for v in a + b):
         return False
-    for a, b in zip(baseline, candidate):
-        if "gpu" in a or "gpu" in b:
-            for key in ("flushes", "upload_mb", "download_mb"):
-                before, after = a.get("gpu", {}).get(key), b.get("gpu", {}).get(key)
-                if before is None or after is None or after > before:
-                    return False
-            before, after = a.get("gpu", {}).get("blocks", {}), b.get("gpu", {}).get("blocks", {})
-            if before.get("convex_blocks") is None or after.get("convex_blocks") is None:
-                return False
-            if after["convex_blocks"] > before["convex_blocks"]:
-                return False
-            if before.get("nodes_claimed") is None or after.get("nodes_claimed", -1) < before["nodes_claimed"]:
-                return False
-    for key in ("gpu_ms", "wall_ms"):
-        a, b = [x[key] for x in baseline], [x[key] for x in candidate]
-        if any(v is None or not math.isfinite(v) or v <= 0 for v in a + b):
-            return False
-        noise = max(statistics.stdev(a), statistics.stdev(b)) * 2
-        if statistics.median(a) - statistics.median(b) <= max(statistics.median(a) * threshold, noise):
-            return False
-    return True
+    noise = max(statistics.stdev(a), statistics.stdev(b)) * 2
+    return statistics.median(a) - statistics.median(b) > max(statistics.median(a) * threshold, noise)
+
+
+def _improvement(baseline, candidate, *, threshold=REQUIRED_GAIN):
+    """The timing verdict of interleaved pairs: GPU evidence and wall must both
+    gain; wall alone cannot promote a candidate. Whether the candidate also keeps
+    its coverage, transfers and partitioning is `_diagnostics_hold`'s question."""
+    if len(baseline) < MIN_PAIRS or len(candidate) < MIN_PAIRS:
+        return False
+    return all(_gain(baseline, candidate, key, threshold) for key in ("gpu_ms", "wall_ms"))
+
+
+def _confirmed(baseline, candidate, *, threshold=REQUIRED_GAIN):
+    """The uninstrumented confirmation: no probe, no profiler, so only the wall
+    clock a user sees can speak, and it must show the same gain."""
+    if len(baseline) < MIN_PAIRS or len(candidate) < MIN_PAIRS:
+        return False
+    return _gain(baseline, candidate, "wall_ms", threshold)
+
+
+def _graph_evidence(bundle, model, inspection):
+    """The inspection of one graph under the profile's dimensions, with the
+    digest of the file inspected so that two sides are told apart by content."""
+    execution = inspection.get("execution") or {}
+    return {"model": model, "digest": digest(bundle / model), "compatible": bool(inspection.get("compatible")),
+            **{key: execution.get(key) for key in ("total_nodes", "supported_nodes", "unsupported_nodes")}}
+
+
+def _diagnostic_evidence(report, graph, tactics):
+    """What one profiled run of a graph says about its coverage, transfers and
+    partitioning. Deterministic, so one run per side is enough."""
+    gpu = report.get("gpu") or {}
+    blocks = gpu.get("blocks") or {}
+    return {"graph": graph, "tactics": tactics, "passed": bool(report.get("passed")),
+            "cpu_fallback_disabled": bool(report.get("cpu_fallback_disabled")),
+            "flushes": gpu.get("flushes"), "upload_mb": gpu.get("upload_mb"), "download_mb": gpu.get("download_mb"),
+            "convex_blocks": blocks.get("convex_blocks"), "nodes_claimed": blocks.get("nodes_claimed")}
+
+
+def _coverage(evidence):
+    """(supported, total) nodes of a graph that ran verified on Vulkan with the
+    CPU fallback disabled, else None. The counts belong to the graph itself:
+    a rewrite may be smaller, so its claimed node count is not comparable."""
+    graph = evidence.get("graph") or {}
+    total, supported = graph.get("total_nodes"), graph.get("supported_nodes")
+    claimed = evidence.get("nodes_claimed")
+    if not (graph.get("compatible") and evidence.get("passed") and evidence.get("cpu_fallback_disabled")):
+        return None
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (total, supported, claimed)):
+        return None
+    if graph.get("unsupported_nodes") != total - supported:
+        return None
+    return (supported, total) if 0 < claimed and 0 < total and 0 <= supported <= total else None
+
+
+TRANSFER_KEYS = ("flushes", "upload_mb", "download_mb", "convex_blocks")
+
+
+def _diagnostics_hold(source, candidate):
+    """Why a faster candidate still must not replace the source, else None.
+
+    Fails closed: evidence that is absent or inconsistent is a reason. Coverage
+    is the fraction of each graph the Vulkan runtime supports, so a smaller
+    rewritten graph passes while one that leaves nodes to a fallback does not;
+    transfers and partitions may not grow.
+    """
+    reasons = []
+    covered = {name: _coverage(evidence) for name, evidence in (("source", source), ("candidate", candidate))}
+    for name, value in covered.items():
+        if value is None:
+            reasons.append(f"{name} graph has no verified Vulkan coverage evidence")
+    if all(covered.values()):
+        (s_sup, s_tot), (c_sup, c_tot) = covered["source"], covered["candidate"]
+        if c_sup * s_tot < s_sup * c_tot:
+            reasons.append(f"candidate covers {c_sup}/{c_tot} nodes, source {s_sup}/{s_tot}")
+    for key in TRANSFER_KEYS:
+        before, after = source.get(key), candidate.get(key)
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (before, after)):
+            reasons.append(f"{key} not measured")
+        elif after > before:
+            reasons.append(f"{key} grew from {before:g} to {after:g}")
+    return reasons or None
 
 
 # Pairs measured before a hopeless candidate may stop early.
@@ -586,11 +735,11 @@ def _futile(baseline, candidate, *, threshold=REQUIRED_GAIN):
     return False
 
 
-def _medians(rows):
+def _medians(rows, keys=("wall_ms", "gpu_ms")):
     """Median wall and GPU time of interleaved runs, for the human report only."""
     result = {}
-    for key in ("wall_ms", "gpu_ms"):
-        values = [row[key] for row in rows]
+    for key in keys:
+        values = [row.get(key) for row in rows]
         result[f"median_{key}"] = (statistics.median(values)
                                    if values and all(isinstance(v, (int, float)) for v in values) else None)
     return result
@@ -628,6 +777,51 @@ def _divergence(error):
     return f"output {match[1]}: max|Δ|={match[2]}, {match[3]} value(s) beyond tolerance"
 
 
+def _load_rows(path, mode):
+    """Rows of interleaved runs kept for a resume, trimmed to the completed pairs.
+    Rows taken under another measurement mode are an error, never mixed in."""
+    rows = json.loads(path.read_text()) if path.exists() else {"baseline": [], "candidate": []}
+    for label, values in rows.items():
+        stray = [row.get("measurement_mode") for row in values if row.get("measurement_mode") != mode]
+        if stray:
+            raise ValueError(f"{path} holds {label} rows measured as {stray[0]!r}, not {mode!r}; "
+                             "choose a new output directory")
+    completed = min(len(rows["baseline"]), len(rows["candidate"]))
+    return {label: values[:completed] for label, values in rows.items()}
+
+
+def _interleave(rows, path, samples, measure, *, futile=None):
+    """Alternates baseline/candidate (AB, then BA, ...) until `samples` pairs exist,
+    appending `measure(label)` to `rows` and saving after each run. Returns
+    "futility" when `futile` ends the run early."""
+    for index in range(samples):
+        if futile and futile(rows["baseline"], rows["candidate"]):
+            return "futility"
+        for label in (("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")):
+            if len(rows[label]) > index:
+                continue
+            rows[label].append(measure(label))
+            write_json(path, rows)
+    return None
+
+
+def _diagnose(bundle, manifest, name, timeout, baseline_model, baseline_check, candidate_model, candidate_check,
+              tactics):
+    """Profiled runs of the source and the candidate graph, each inspected on its
+    own file: a rewrite is judged against its own coverage, not the source's."""
+    path = bundle / name / "diagnostics.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    sides = {}
+    for label, model, inspection, side_tactics in (("baseline", baseline_model, baseline_check, None),
+                                                   ("candidate", candidate_model, candidate_check, tactics)):
+        report = _run(bundle, manifest, name, "standalone", 1, timeout, mode="diagnostic",
+                      model=model if label == "baseline" else None, tactics=side_tactics)
+        sides[label] = _diagnostic_evidence(report, _graph_evidence(bundle, model, inspection), side_tactics)
+    write_json(path, sides)
+    return sides
+
+
 def optimize_bundle(source, destination, *, samples=20, timeout=300, tune=True):
     if samples < 20:
         raise ValueError("Optimization requires at least 20 interleaved samples")
@@ -638,10 +832,12 @@ def optimize_bundle(source, destination, *, samples=20, timeout=300, tune=True):
     destination.parent.mkdir(parents=True, exist_ok=True)
     with _optimization_workspace(source, destination, manifest, samples, tune) as temporary:
         bundle = Path(temporary) / "bundle"
-        experiment_tools = json.loads((Path(temporary) / "resume.json").read_text())["tools"]
+        experiment = json.loads((Path(temporary) / "resume.json").read_text())
+        experiment_tools, experiment_policy = experiment["tools"], experiment["execution_policy"]
+        tuner_policy = experiment["tuner_execution_policy"]
         outcomes = {}
         with gpu_lock(timeout):
-            device = json.loads(command([binary("examples/conv_blocked"), "--device-json"], timeout=timeout).stdout)
+            device = _device(timeout)
             device_path = Path(temporary) / "device.json"
             if device_path.exists() and json.loads(device_path.read_text()) != device:
                 raise ValueError("Device or implementation changed since interrupted experiment")
@@ -662,13 +858,18 @@ def optimize_bundle(source, destination, *, samples=20, timeout=300, tune=True):
                 rejected = None
                 if can_tune:
                     reference = _default_reference(bundle, name, profile["model"])
+                    # The file describes the tuner's launch. The tuner sets its own tuning
+                    # mode and artifact for its nested validation runs; everything else
+                    # it runs under is recorded here.
+                    write_json(bundle / name / "tuning-policy.json", tuner_policy)
                     try:
                         command(["uv", "run", "--no-project", ROOT / "scripts/autotune/model.py",
                                  bundle / profile["model"], "--output", bundle / tactics, "--no-build",
                                  "--priority-json", priority_path,
                                  "--atol", str(manifest["atol"]), "--rtol", str(manifest["rtol"]),
                                  *(["--reference", reference] if reference.is_dir() else []),
-                                 *dimensions(profile["dimensions"])], cwd=ROOT, timeout=timeout)
+                                 *dimensions(profile["dimensions"])], cwd=ROOT, timeout=timeout,
+                                env=policy.environment(tuner_policy))
                     except RuntimeError as error:
                         # The tuner validates on the bundle's reference inputs;
                         # tuned kernels that miss its tolerance there are
@@ -677,31 +878,43 @@ def optimize_bundle(source, destination, *, samples=20, timeout=300, tune=True):
                             raise
                         tactics, rejected = None, _divergence(error)
                 original = f"{name}/original.onnx"
-                baseline_model = original if inspect_model(bundle / original, profile=profile["dimensions"], timeout=timeout).get("compatible") else profile["model"]
+                original_check = inspect_model(bundle / original, profile=profile["dimensions"], timeout=timeout)
+                baseline_model, baseline_check = ((original, original_check) if original_check.get("compatible")
+                                                  else (profile["model"], check))
                 benchmark_path = bundle / name / "benchmark.json"
-                rows = json.loads(benchmark_path.read_text()) if benchmark_path.exists() else {"baseline": [], "candidate": []}
-                completed_pairs = min(len(rows["baseline"]), len(rows["candidate"]))
-                rows = {label: values[:completed_pairs] for label, values in rows.items()}
+                rows = _load_rows(benchmark_path, "timing")
                 # The same model with the same kernels on both sides: nothing to measure.
                 same_model = (baseline_model == profile["model"]
                               or digest(bundle / baseline_model) == digest(bundle / profile["model"]))
                 stopped = "identical" if same_model and tactics is None else None
-                for index in range(samples):
-                    if stopped or _futile(rows["baseline"], rows["candidate"]):
-                        stopped = stopped or "futility"
-                        break
-                    for label in (("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")):
-                        if len(rows[label]) > index:
-                            continue
-                        report = _run(bundle, manifest, name, "standalone", 1, timeout,
+
+                def timing(label):
+                    return _timing_row(_run(bundle, manifest, name, "standalone", 1, timeout, mode="timing",
+                                            model=baseline_model if label == "baseline" else None,
+                                            tactics=tactics if label == "candidate" else None))
+
+                stopped = stopped or _interleave(rows, benchmark_path, samples, timing, futile=_futile)
+                improved = not stopped and _improvement(rows["baseline"], rows["candidate"])
+                # Diagnostics are profiled runs of the two graphs, apart from the timed pairs:
+                # they are deterministic, so they are taken once and kept for a resume.
+                diagnostics = held = confirmation = None
+                if improved:
+                    diagnostics = _diagnose(bundle, manifest, name, timeout, baseline_model, baseline_check,
+                                            profile["model"], check, tactics)
+                    held = _diagnostics_hold(diagnostics["baseline"], diagnostics["candidate"])
+                    improved = held is None
+                if improved:
+                    confirmation_path = bundle / name / "confirmation.json"
+                    confirmation = _load_rows(confirmation_path, "confirmation")
+
+                    def uninstrumented(label):
+                        report = _run(bundle, manifest, name, "standalone", 1, timeout, mode="confirmation",
                                       model=baseline_model if label == "baseline" else None,
                                       tactics=tactics if label == "candidate" else None)
-                        gpu = report.get("gpu") or {}
-                        rows[label].append({"wall_ms": report["standalone_ms"][-1],
-                                            "gpu_ms": gpu.get("compute_ms"), "gpu": gpu,
-                                            "storage_peak_bytes": report.get("standalone_storage_peak_bytes")})
-                        write_json(benchmark_path, rows)
-                improved = not stopped and _improvement(rows["baseline"], rows["candidate"])
+                        return {"wall_ms": report["standalone_ms"][-1], "measurement_mode": "confirmation"}
+
+                    _interleave(confirmation, confirmation_path, samples, uninstrumented)
+                    improved = _confirmed(confirmation["baseline"], confirmation["candidate"])
                 profile["model"] = profile["model"] if improved else baseline_model
                 profile["tactics"] = tactics if improved else None
                 verification = _run(bundle, manifest, name, "standalone", 20, timeout, tactics=profile["tactics"])
@@ -711,16 +924,31 @@ def optimize_bundle(source, destination, *, samples=20, timeout=300, tune=True):
                                                                                   timeout)
                 _require_metric(verification)
                 write_json(bundle / name / "validation.json", verification)
-                # The medians explain the decision; `_improvement` alone makes it.
+                # The medians explain the decision; the timing verdict, the diagnostics and the
+                # uninstrumented confirmation alone make it.
                 outcomes[name] = {"status": "accelerated" if improved else "compatible_no_measured_gain",
                                   "baseline_model": baseline_model, "samples": samples, "tuned": can_tune,
                                   "tactics_rejected": rejected,
                                   "pairs": min(len(rows["baseline"]), len(rows["candidate"])), "stopped": stopped,
                                   "required_gain": REQUIRED_GAIN, "baseline": _medians(rows["baseline"]),
-                                  "candidate": _medians(rows["candidate"])}
+                                  "candidate": _medians(rows["candidate"]),
+                                  "measurement": {"timing": "timing", "gpu_metric": "gpu_span.busy_ms",
+                                                  "diagnostics_hold": held,
+                                                  "diagnostics": diagnostics,
+                                                  "confirmation": None if confirmation is None else {
+                                                      "pairs": min(len(confirmation["baseline"]),
+                                                                   len(confirmation["candidate"])),
+                                                      "baseline": _medians(confirmation["baseline"], ("wall_ms",))["median_wall_ms"],
+                                                      "candidate": _medians(confirmation["candidate"], ("wall_ms",))["median_wall_ms"]}}}
             if tool_identity() != experiment_tools:
                 raise ValueError("Tools changed during optimization; rerun in a new directory")
+            if policy.pipeline_identity() != experiment_policy:
+                raise ValueError("Execution policy changed during optimization; rerun in a new directory")
             manifest["tools"] = experiment_tools
+            if tune and policy.resolve() != tuner_policy:
+                raise ValueError("Tuner execution policy changed during optimization; rerun in a new directory")
+            manifest["execution_policy"] = experiment_policy
+            manifest["tuner_execution_policy"] = tuner_policy
             manifest["status"] = "verified" if all(p["compatible"] for p in manifest["profiles"].values()) else "incompatible"
             manifest["acceleration_demonstrated"] = any(o["status"] == "accelerated" for o in outcomes.values())
             write_json(bundle / "report.json", outcomes)

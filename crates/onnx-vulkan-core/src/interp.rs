@@ -96,16 +96,17 @@ use crate::shaders::matmul_integer::{
     ANY_K_PUSH_BYTES as MMI_ANY_K_PUSH_BYTES, COOP_BINDINGS as MMI_COOP_BINDINGS,
     COOP_EPILOGUE_BINDINGS as MMI_COOP_EPILOGUE_BINDINGS,
     COOP_EPILOGUE_PUSH_BYTES as MMI_COOP_EPILOGUE_PUSH_BYTES,
-    COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES, COOP_TILE as MMI_COOP_TILE, CoopVariant, FLIP_BINDINGS as MMI_FLIP_BINDINGS,
-    FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY, FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES,
-    MATMUL_BINDINGS as MMI_BINDINGS, MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B,
-    PACK_BINDINGS as MMI_PACK_BINDINGS, PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES,
-    PACKED_KEY as MMI_PACKED_KEY, SIGN_FLIP_BYTE as MMI_SIGN_FLIP_BYTE,
-    SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD, SMALL_EPILOGUE_KEY as MMI_SMALL_EPILOGUE_KEY,
-    TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY,
-    any_k_epilogue_spirv as mmi_any_k_epilogue_spirv, coop_applies as mmi_coop_applies,
-    coop_variant_for as mmi_coop_variant, matmul as mmi_matmul, small_applies as mmi_small_applies,
-    small_epilogue_spirv as mmi_small_epilogue_spirv, small_grid as mmi_small_grid,
+    COOP_PUSH_BYTES as MMI_COOP_PUSH_BYTES, COOP_TILE as MMI_COOP_TILE, CoopVariant,
+    FLIP_BINDINGS as MMI_FLIP_BINDINGS, FLIP_BYTES as MMI_FLIP_BYTES, FLIP_KEY as MMI_FLIP_KEY,
+    FLIP_PUSH_BYTES as MMI_FLIP_PUSH_BYTES, MATMUL_BINDINGS as MMI_BINDINGS,
+    MATMUL_PUSH_BYTES as MMI_PUSH_BYTES, PACK_B as MMI_PACK_B, PACK_BINDINGS as MMI_PACK_BINDINGS,
+    PACK_PUSH_BYTES as MMI_PACK_PUSH_BYTES, PACKED_KEY as MMI_PACKED_KEY,
+    SIGN_FLIP_BYTE as MMI_SIGN_FLIP_BYTE, SIGN_FLIP_WORD as MMI_SIGN_FLIP_WORD,
+    SMALL_EPILOGUE_KEY as MMI_SMALL_EPILOGUE_KEY, TILE_SIZE as MMI_TILE_SIZE,
+    VECTOR_KEY as MMI_VECTOR_KEY, any_k_epilogue_spirv as mmi_any_k_epilogue_spirv,
+    coop_applies as mmi_coop_applies, coop_variant_for as mmi_coop_variant, matmul as mmi_matmul,
+    small_applies as mmi_small_applies, small_epilogue_spirv as mmi_small_epilogue_spirv,
+    small_grid as mmi_small_grid,
 };
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, MATMUL_NBITS as MMNB_MATMUL, PUSH_BYTES as MMNB_PUSH_BYTES,
@@ -5351,7 +5352,16 @@ fn conv_im2col_coop(
     if let Some(steps) = epilogue {
         let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, total)?)?;
         for [p0, len] in slices {
-            conv_im2col(env, node, x_name, xt.as_ref(), g, &col, [p0, len, kdepth], x_signed)?;
+            conv_im2col(
+                env,
+                node,
+                x_name,
+                xt.as_ref(),
+                g,
+                &col,
+                [p0, len, kdepth],
+                x_signed,
+            )?;
             conv_coop_epilogue(
                 env,
                 node,
@@ -5382,7 +5392,16 @@ fn conv_im2col_coop(
         );
         return Ok(());
     }
-    conv_im2col(env, node, x_name, xt.as_ref(), g, &col, [0, pixels, kdepth], x_signed)?;
+    conv_im2col(
+        env,
+        node,
+        x_name,
+        xt.as_ref(),
+        g,
+        &col,
+        [0, pixels, kdepth],
+        x_signed,
+    )?;
     if let Some(xt) = xt {
         ctx.recycle_storage_buffer(xt);
     }

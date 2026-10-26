@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "source": "model.onnx",
+  "profiles": {
+    "short": {"batch": 1, "sequence": 16},
+    "long": {"batch": 1, "sequence": 128}
+  },
+  "atol": 1e-5,
+  "rtol": 1e-4,
+  "samples": 20,
+  "warmup": 3,
+  "min_gain": 0.10,
+  "regression_limit": 0.02,
+  "budget_seconds": 1800,
+  "attempts": 16,
+  "timeout": 300,
+  "threads": null
+}

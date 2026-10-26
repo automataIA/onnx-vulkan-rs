@@ -1,0 +1,152 @@
+[
+  {
+    "model": "SAM 3",
+    "profile": "Image + 6 text prompts",
+    "before_ms": 346,
+    "after_ms": 314,
+    "before_label": "346",
+    "after_label": "314",
+    "reference": "CUDA bf16",
+    "project": "Vulkan INT8"
+  },
+  {
+    "model": "Piper Serena",
+    "profile": "Italian \u00b7 sentence 1",
+    "before_ms": 742,
+    "after_ms": 69.05,
+    "before_label": "~742",
+    "after_label": "69.05",
+    "reference": "CPU FP32",
+    "project": "Vulkan INT8"
+  },
+  {
+    "model": "Piper Ryan",
+    "profile": "US English \u00b7 sentence 1",
+    "before_ms": 911.63,
+    "after_ms": 58.411,
+    "before_label": "911.63",
+    "after_label": "58.411",
+    "reference": "CPU FP32",
+    "project": "Vulkan INT8"
+  },
+  {
+    "model": "Parakeet",
+    "profile": "Speech encoder",
+    "before_ms": 343.8,
+    "after_ms": 43.3,
+    "before_label": "343.8",
+    "after_label": "43.3",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "RF-DETR",
+    "profile": "Object detection",
+    "before_ms": 306.8,
+    "after_ms": 40.9,
+    "before_label": "306.8",
+    "after_label": "40.9",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "YOLOv4",
+    "profile": "Object detection",
+    "before_ms": 176.8,
+    "after_ms": 35.5,
+    "before_label": "176.8",
+    "after_label": "35.5",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "YOLOv8n",
+    "profile": "Object detection",
+    "before_ms": 29.9,
+    "after_ms": 7.1,
+    "before_label": "29.9",
+    "after_label": "7.1",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "RoBERTa",
+    "profile": "Sequence length 1",
+    "before_ms": 13.3,
+    "after_ms": 3.5,
+    "before_label": "13.3",
+    "after_label": "3.5",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "Qwen2.5-VL",
+    "profile": "INT4 \u00b7 decoder forward",
+    "before_ms": 85.4,
+    "after_ms": 29.2,
+    "before_label": "85.4",
+    "after_label": "29.2",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "RoBERTa",
+    "profile": "Sequence length 128",
+    "before_ms": 55,
+    "after_ms": 19.5,
+    "before_label": "55.0",
+    "after_label": "19.5",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "ResNet50",
+    "profile": "INT8 \u00b7 classification",
+    "before_ms": 6.7,
+    "after_ms": 3.3,
+    "before_label": "6.7",
+    "after_label": "3.3",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "ResNet50",
+    "profile": "QDQ \u00b7 classification",
+    "before_ms": 9,
+    "after_ms": 5.1,
+    "before_label": "9.0",
+    "after_label": "5.1",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "Gemma 3 1B",
+    "profile": "INT4 \u00b7 decoder forward",
+    "before_ms": 27.1,
+    "after_ms": 16.4,
+    "before_label": "27.1",
+    "after_label": "16.4",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "MobileNetV2",
+    "profile": "FP32 \u00b7 classification",
+    "before_ms": 1.3,
+    "after_ms": 1.7,
+    "before_label": "1.3",
+    "after_label": "1.7",
+    "reference": "CPU",
+    "project": "Vulkan"
+  },
+  {
+    "model": "MobileNetV2",
+    "profile": "INT8 \u00b7 classification",
+    "before_ms": 0.8,
+    "after_ms": 1.8,
+    "before_label": "0.8",
+    "after_label": "1.8",
+    "reference": "CPU",
+    "project": "Vulkan"
+  }
+]

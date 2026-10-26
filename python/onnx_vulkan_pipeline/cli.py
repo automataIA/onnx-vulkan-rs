@@ -8,12 +8,15 @@ import statistics
 import sys
 import subprocess
 
+from . import cpu, workload
 from .pipeline import (inspect_model, input_symbols, kv_cache_example, prepare_bundle, optimize_bundle, run_bundle,
                        unsupported_operators)
 from .research import research
-from .process import failure_reason
+from .process import BudgetExhausted, failure_reason
 from .search import search_quantization
 
+# Commands whose limits come either from a workload file or from flags.
+WORKLOAD_COMMANDS = ("quantize-search", "cpu-optimize")
 DESCRIPTIONS = {
     "inspect": "Report whether the Rust Vulkan pipeline supports every node of an ONNX model.",
     "prepare": "Verify an ONNX model on the CPU and seal it into a bundle directory with reference outputs.",
@@ -21,8 +24,13 @@ DESCRIPTIONS = {
     "optimize": "Tune Vulkan kernels for a bundle and keep the result only if it is measurably faster.",
     "research": "Bounded automatic EP code experiments in git worktrees; results are review proposals. "
                 "Needs a prepared bundle, a git checkout and a problem JSON (python/README.md, EP research).",
-    "quantize-search": "Try several quantization settings and optimize the fastest one that keeps quality. "
-                       "Needs the --quantization config that prepare takes (python/README.md, quantization).",
+    "quantize-search": "Bounded, resumable search over quantization settings: screen every candidate, confirm the "
+                       "best few against the fp32 model and keep only a proven winner. Needs the --quantization "
+                       "config that prepare takes, or a --workload (python/AUTOMATION.md).",
+    "plan": "Validate a Vulkan workload file and show the bounded plan of a search and what is missing; "
+            "runs no model and touches no device (python/AUTOMATION.md).",
+    "cpu-optimize": "Bounded, resumable search over ONNX Runtime CPU session settings for a model; "
+                    "a CPU deployment, separate from the Vulkan commands (python/AUTOMATION.md).",
 }
 EPILOG = """\
 Typical flow: inspect → prepare → run → optimize. See python/README.md.
@@ -31,7 +39,9 @@ The JSON result goes to stdout when it is redirected or piped (> result.json, | 
 on a terminal only the verdict lines (onnx-vulkan: ...) are printed, on stderr.
 
 Exit status: 0 success; 1 failure (bad input, a worker error, outputs beyond
-tolerance); 2 inspect/prepare worked but the model cannot run on Vulkan.
+tolerance); 2 inspect/prepare worked but the model cannot run on Vulkan or `plan`
+found the workload not ready; 3 a search ran out of its time or attempt budget
+(nothing wrong, the output directory resumes with the same inputs).
 `optimize` exits 0 when it keeps the untuned model (compatible_no_measured_gain).
 A failed prepare/optimize keeps its evidence in a hidden .OUTPUT.failed or
 .OUTPUT.incomplete directory beside --output, named in the message."""
@@ -41,7 +51,9 @@ SOURCES = {
     "run": "bundle directory written by prepare or optimize",
     "optimize": "bundle directory written by prepare",
     "research": "problem JSON naming a prepared bundle, a proposer and four gates (see python/README.md)",
-    "quantize-search": "ONNX model file",
+    "quantize-search": "ONNX model file (omit it with --workload, which names the model)",
+    "plan": "Vulkan workload JSON (python/examples/vulkan-workload.json)",
+    "cpu-optimize": "ONNX model file (omit it with --workload, which names the model)",
 }
 # Pattern in a failure → what the user can do about it.
 HINTS = (
@@ -320,19 +332,127 @@ def success_summary(command, args, result):
             lines.append(f"next: uv run onnx-vulkan run {args.output}")
         return lines
     if command == "quantize-search":
-        optimized = result.get("optimized") or {}
         rows = []
         for item in result.get("candidates", []):
-            detail = (f"standalone {item['median_wall_ms']:.2f} ms, Vulkan metric drop {item.get('vulkan_drop', 0):g}"
+            # Screening times rank candidates only; no acceleration is claimed from them.
+            detail = (f"screening {item['weighted_wall_ms']:.2f} ms (ranking only), "
+                      f"Vulkan metric drop {item.get('vulkan_drop', 0):g}"
                       if item.get("status") == "passed" else item.get("reason", ""))
             # Full reasons, with paths, stay in search.json.
             detail = detail if len(detail) <= 160 else detail[:159] + "…"
             rows.append(f"  {item['name']}: {item.get('status')} — {detail}")
-        return rows + [f"selected candidate: {result.get('selected') or 'none passed'}"
-                + (f"; acceleration demonstrated: {'yes' if optimized.get('acceleration_demonstrated') else 'no'}"
-                   if optimized else ""),
-                f"details: {Path(args.output) / 'search.json'}"]
+        for name, entry in result.get("confirmations", {}).items():
+            ratio = entry.get("weighted_ratio")
+            rows.append(f"  confirmation {name}: {entry.get('status')}"
+                        + (f", weighted candidate/baseline ratio {ratio:.3f}" if ratio is not None else "")
+                        + "".join(f"; {failure}" for failure in entry.get("guard_failures", []))
+                        + (f" — {entry['reason']}" if entry.get("reason") else ""))
+        status = result.get("status")
+        budget = result.get("budget", {})
+        if status == "promoted":
+            rows.append(f"selected candidate: {result['selected']} (acceleration demonstrated by its confirmation; "
+                        f"bundle {result['optimized']['bundle']})")
+        elif status == "budget_exhausted":
+            rows.append(f"budget exhausted ({result.get('exhausted')}; {budget.get('attempts_used')} attempts, "
+                        f"{budget.get('seconds_used', 0):.0f} s used): run the same command again to resume "
+                        f"{result.get('resume')}")
+        elif status == "no_measured_gain":
+            rows.append("no candidate was confirmed faster within every profile guard; nothing was promoted")
+        elif status == "no_passing_candidate":
+            rows.append("no candidate passed screening; nothing was promoted")
+        return rows + [f"details: {Path(args.output) / 'search.json'}"]
+    if command == "cpu-optimize":
+        claims = result.get("claims", {})
+        rows = [f"status: {result.get('status')}; selected: {result.get('selected') or 'baseline settings'}"]
+        if result.get("selected_settings") and result.get("selected"):
+            rows.append(f"  settings: {result['selected_settings']}")
+        rows += [f"  acceleration: {claims.get('acceleration')}", f"  CPU correctness: {claims.get('cpu_correctness')}"]
+        if result.get("status") == "budget_exhausted":
+            rows.append(f"budget exhausted: run the same command again to resume {args.output}")
+        return rows
+    if command == "plan":
+        rows = [f"workload {result['name'] or args.source}: {'ready' if result['ready'] else 'NOT ready'} "
+                f"(objective {result['objective']}, backend {result['backend']}, quality "
+                f"{result['quality']['status']})"]
+        rows += [f"  profile {name}: weight {item['weight']:.2f}, max regression {item['max_regression']:g}"
+                 for name, item in result["profiles"].items()]
+        if result["candidates"]:
+            rows.append(f"  candidates: {', '.join(result['candidates'])}")
+        work = result["worst_case"]
+        if work:
+            rows.append(f"  worst case: {work['screening_candidates']} screenings x {work['screening_profile_runs'] // max(work['screening_candidates'], 1)} "
+                        f"profile(s), {work['confirmations']} confirmations; {work['attempts_needed']} attempts needed "
+                        f"(limit {work['attempts_limit'] or 'none'}), {work['seconds_limit']:.0f} s limit")
+        rows += [f"  missing: {item}" for item in result["missing"]]
+        rows += [f"  note: {item}" for item in result.get("notes", [])]
+        return rows
     return []
+
+
+def _threads(text):
+    """`--threads 8` (an upper bound) or `--threads 1,2,4` (the exact counts)."""
+    try:
+        counts = [int(item) for item in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected an integer or a comma-separated list of integers") from None
+    return counts[0] if len(counts) == 1 and "," not in text else counts
+
+
+def _given(args, names):
+    """The `--option` spellings of those of `names` the user passed (options default to None)."""
+    return [f"--{name.replace('_', '-')}" for name in names
+            if getattr(args, name, None) not in (None, [])]
+
+
+def _no_workload_conflict(args, names):
+    conflicts = _given(args, names) + (["the model argument"] if args.source is not None else [])
+    if conflicts:
+        raise ValueError(f"--workload defines these already; do not also pass {', '.join(conflicts)}")
+
+
+def quantize_search(args, dims):
+    """`quantize-search` from flags or from a workload file; the search itself is `search_quantization`."""
+    if args.workload:
+        _no_workload_conflict(args, ("dim", "adapter", "quantization", "quality", "profiles", "atol", "rtol", "grid",
+                                     "samples", "timeout", "top_k", "screen_samples", "weights", "max_regression",
+                                     "attempts", "budget_seconds"))
+        loaded = workload.load(args.workload)
+        # Everything that can be known without a device is checked first: a typo costs no GPU time.
+        plan = workload.plan(loaded)
+        if not plan["ready"]:
+            raise ValueError(f"the workload is not ready: {'; '.join(plan['missing'])}")
+        arguments = workload.search_arguments(loaded)
+        return search_quantization(arguments.pop("source"), args.output, arguments.pop("base"),
+                                   tune=not args.no_tune, **arguments)
+    if args.source is None or args.quantization is None:
+        raise ValueError("quantize-search needs the model and --quantization, or a --workload")
+    profiles = json.loads(args.profiles.read_text()) if args.profiles else {"default": dims}
+    limits = {"samples": args.samples, "timeout": args.timeout, "top_k": args.top_k,
+              "screen_samples": args.screen_samples, "attempts": args.attempts,
+              "budget_seconds": args.budget_seconds, "atol": args.atol, "rtol": args.rtol,
+              "max_profile_regression": args.max_regression}
+    return search_quantization(
+        args.source, args.output, json.loads(args.quantization.read_text()),
+        grid=json.loads(args.grid.read_text()) if args.grid else None, adapter=args.adapter, profiles=profiles,
+        tune=not args.no_tune, profile_weights=json.loads(args.weights.read_text()) if args.weights else None,
+        quality=json.loads(args.quality.read_text()) if args.quality else None,
+        **{key: value for key, value in limits.items() if value is not None})
+
+
+def cpu_optimize(args):
+    """`cpu-optimize` from flags or from a CPU workload file; flags left out keep `optimize_cpu`'s own defaults."""
+    names = ("adapter", "profiles", "atol", "rtol", "samples", "timeout", "warmup", "min_gain", "regression_limit",
+             "threads", "attempts", "budget_seconds")
+    if args.workload:
+        _no_workload_conflict(args, names)
+        arguments = cpu.load_workload(args.workload)
+        return cpu.optimize_cpu(arguments.pop("source"), args.output, **arguments)
+    if args.source is None:
+        raise ValueError("cpu-optimize needs the model or a --workload")
+    arguments = {name: getattr(args, name) for name in names if getattr(args, name) is not None}
+    if "profiles" in arguments:
+        arguments["profiles"] = json.loads(arguments["profiles"].read_text())
+    return cpu.optimize_cpu(args.source, args.output, **arguments)
 
 
 def main():
@@ -344,29 +464,64 @@ def main():
     for name in DESCRIPTIONS:
         sub = commands.add_parser(name, help=DESCRIPTIONS[name].split(". ")[0], description=DESCRIPTIONS[name],
                                   epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-        sub.add_argument("source", type=Path, help=SOURCES[name])
-        sub.add_argument("--timeout", type=float, default=300, help="seconds allowed per worker process (default 300)")
-        if name in ("prepare", "optimize", "research", "quantize-search"):
-            sub.add_argument("--output", type=Path, required=True, help="new directory to create; must not exist")
+        sub.add_argument("source", type=Path, nargs="?" if name in WORKLOAD_COMMANDS else None, help=SOURCES[name])
+        if name != "plan":
+            # Searches take their limits from a workload file or from flags, never both: no default here.
+            sub.add_argument("--timeout", type=float, default=None if name in WORKLOAD_COMMANDS else 300,
+                             help="seconds allowed per worker process (default 300)")
+        if name in ("prepare", "optimize", "research", "quantize-search", "cpu-optimize"):
+            sub.add_argument("--output", type=Path, required=True,
+                             help=("directory of the experiment: new, or an unfinished one with the same inputs, "
+                                   "which resumes" if name == "quantize-search" else
+                                   "new directory to create; must not exist"))
+        if name in WORKLOAD_COMMANDS:
+            sub.add_argument("--workload", type=Path,
+                             help="workload JSON that names the model, profiles and limits (python/AUTOMATION.md); "
+                                  "replaces the model argument and the options it defines")
+            sub.add_argument("--attempts", type=int, help="most candidates screened and confirmed in this invocation")
+            sub.add_argument("--budget-seconds", type=float,
+                             help="wall-clock limit for the whole invocation, nested workers and GPU-lane waits "
+                                  "included; the output directory resumes when it ends")
         if name in ("inspect", "prepare", "quantize-search"):
             sub.add_argument("--dim", action="append", default=[], metavar="SYMBOL=N",
                              help="value of a symbolic input dimension, e.g. --dim batch_size=1; repeatable")
-        if name in ("prepare", "quantize-search"):
+        if name in ("prepare", "quantize-search", "cpu-optimize"):
             sub.add_argument("--adapter", type=Path,
                              help="Python file with load_model()/example_inputs() for export or real inputs; "
                                   "the quality metric is the quantization config's own 'adapter' key")
-            sub.add_argument("--quantization", type=Path, required=name == "quantize-search",
+            sub.add_argument("--profiles", type=Path, help="JSON object mapping profile names to symbol/value objects")
+            sub.add_argument("--atol", type=float, default=None if name in WORKLOAD_COMMANDS else 1e-5,
+                             help="absolute tolerance of every later CPU/Vulkan comparison (default 1e-5)")
+            sub.add_argument("--rtol", type=float, default=None if name in WORKLOAD_COMMANDS else 1e-4,
+                             help="relative tolerance of every later CPU/Vulkan comparison (default 1e-4)")
+        if name in ("prepare", "quantize-search"):
+            sub.add_argument("--quantization", type=Path,
                              help="quantization config JSON: datasets, quality adapter, metric and threshold "
                                   "(see python/README.md)")
-            sub.add_argument("--profiles", type=Path, help="JSON object mapping profile names to symbol/value objects")
-            sub.add_argument("--atol", type=float, default=1e-5,
-                             help="absolute tolerance of every later CPU/Vulkan comparison (default 1e-5)")
-            sub.add_argument("--rtol", type=float, default=1e-4,
-                             help="relative tolerance of every later CPU/Vulkan comparison (default 1e-4)")
+            sub.add_argument("--quality", type=Path,
+                             help="independent quality config JSON (dataset, metric, adapter; python/AUTOMATION.md): "
+                                  "also verified on the Vulkan outputs of the deployed model")
         if name == "quantize-search":
             sub.add_argument("--grid", type=Path, help="JSON list of option overrides; default covers static, dynamic and int4")
-        if name in ("optimize", "run", "quantize-search"):
-            sub.add_argument("--samples", type=int, default=20, help="timed iterations (default 20)")
+            sub.add_argument("--top-k", type=int, help="candidates confirmed against fp32 (default 3)")
+            sub.add_argument("--screen-samples", type=int,
+                             help="timed iterations of a screening run; ranking only, no speed claim (default 5)")
+            sub.add_argument("--weights", type=Path,
+                             help="JSON object mapping each profile to its weight in the objective (default equal)")
+            sub.add_argument("--max-regression", type=float,
+                             help="largest tolerated latency regression of any profile against fp32 (default 0)")
+        if name == "cpu-optimize":
+            sub.add_argument("--warmup", type=int, help="untimed iterations before each sample (default 3)")
+            sub.add_argument("--min-gain", type=float, help="smallest median gain to accept, as a fraction (default 0.10)")
+            sub.add_argument("--regression-limit", type=float,
+                             help="largest tolerated slowdown of any profile, as a fraction (default 0.02)")
+            sub.add_argument("--threads", type=_threads,
+                             help="intra-op thread counts: N (powers of two up to N) or a list such as 1,2,4; "
+                                  "default up to the usable CPUs")
+        if name in ("optimize", "run", "quantize-search", "cpu-optimize"):
+            sub.add_argument("--samples", type=int, default=None if name in WORKLOAD_COMMANDS else 20,
+                             help="timed iterations (default 20); for a search, the interleaved pairs of each "
+                                  "confirmation")
         if name in ("optimize", "quantize-search"):
             sub.add_argument("--no-tune", action="store_true", help="skip kernel tuning; only measure the bundle")
         if name == "run":
@@ -390,13 +545,14 @@ def main():
             profiles = json.loads(args.profiles.read_text()) if args.profiles else {"default": dims}
             result = prepare_bundle(args.source, args.output, adapter=args.adapter, profiles=profiles,
                                     atol=args.atol, rtol=args.rtol, timeout=args.timeout,
-                                    quantization=json.loads(args.quantization.read_text()) if args.quantization else None)
+                                    quantization=json.loads(args.quantization.read_text()) if args.quantization else None,
+                                    **({"quality": json.loads(args.quality.read_text())} if args.quality else {}))
         elif args.command == "quantize-search":
-            profiles = json.loads(args.profiles.read_text()) if args.profiles else {"default": dims}
-            result = search_quantization(args.source, args.output, json.loads(args.quantization.read_text()),
-                                         grid=json.loads(args.grid.read_text()) if args.grid else None,
-                                         adapter=args.adapter, profiles=profiles, atol=args.atol, rtol=args.rtol,
-                                         samples=args.samples, timeout=args.timeout, tune=not args.no_tune)
+            result = quantize_search(args, dims)
+        elif args.command == "cpu-optimize":
+            result = cpu_optimize(args)
+        elif args.command == "plan":
+            result = workload.plan(workload.load(args.source))
         elif args.command == "optimize":
             result = optimize_bundle(args.source, args.output, samples=args.samples, timeout=args.timeout, tune=not args.no_tune)
         elif args.command == "run":
@@ -416,8 +572,14 @@ def main():
         # The command worked but the model cannot run on Vulkan: 2, so that a
         # script chaining inspect → prepare → run stops; 1 means it failed.
         unrunnable = ((args.command == "inspect" and not result.get("compatible"))
-                      or (args.command == "prepare" and not result.get("compatibility_obtained")))
-        return 2 if unrunnable else 0
+                      or (args.command == "prepare" and not result.get("compatibility_obtained"))
+                      or (args.command == "plan" and not result["ready"]))
+        # A search that ran out of budget did nothing wrong and resumes: 3, not a failure.
+        return 2 if unrunnable else 3 if result.get("status") == "budget_exhausted" else 0
+    except (BudgetExhausted, cpu.BudgetExhausted) as error:
+        print(f"onnx-vulkan: {args.command} stopped: {error}; run the same command again to resume",
+              file=sys.stderr)
+        return 3
     except FileExistsError as error:
         print(f"onnx-vulkan: {error.filename or error} already exists; choose a new --output directory",
               file=sys.stderr)

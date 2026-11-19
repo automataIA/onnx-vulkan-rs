@@ -686,7 +686,68 @@ pub fn row_major_strides(shape: &[i64]) -> Vec<i64> {
 
 /// `Pad` mode=constant, host-side dtype-generic. `begins`/`ends` per dim,
 /// `cval` = bytes of the constant value (length elem_size; empty ⇒ zeros).
-pub fn pad(data: &HostTensor, begins: &[i64], ends: &[i64], cval: &[u8]) -> Result<HostTensor> {
+/// `Pad`'s `mode` attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadMode {
+    Constant,
+    Edge,
+    Reflect,
+    Wrap,
+}
+
+impl PadMode {
+    pub fn parse(mode: &str) -> Option<Self> {
+        match mode {
+            "constant" => Some(Self::Constant),
+            "edge" => Some(Self::Edge),
+            "reflect" => Some(Self::Reflect),
+            "wrap" => Some(Self::Wrap),
+            _ => None,
+        }
+    }
+
+    /// The code the `PAD` shader takes in its push constants.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Constant => 0,
+            Self::Edge => 1,
+            Self::Reflect => 2,
+            Self::Wrap => 3,
+        }
+    }
+
+    /// The input coordinate that output coordinate `ic` (already shifted by
+    /// the leading pad) reads along a dimension of `dim`, or `None` for the
+    /// constant value. Reflect and wrap repeat for pads wider than the
+    /// dimension, as numpy does.
+    pub fn source(self, ic: i64, dim: i64) -> Option<i64> {
+        if (0..dim).contains(&ic) {
+            return Some(ic);
+        }
+        if dim <= 0 {
+            return None;
+        }
+        match self {
+            Self::Constant => None,
+            Self::Edge => Some(ic.clamp(0, dim - 1)),
+            Self::Reflect if dim == 1 => Some(0),
+            Self::Reflect => {
+                let period = 2 * (dim - 1);
+                let m = ic.rem_euclid(period);
+                Some(if m < dim { m } else { period - m })
+            }
+            Self::Wrap => Some(ic.rem_euclid(dim)),
+        }
+    }
+}
+
+pub fn pad(
+    data: &HostTensor,
+    begins: &[i64],
+    ends: &[i64],
+    cval: &[u8],
+    mode: PadMode,
+) -> Result<HostTensor> {
     data.validate()?;
     let es = elem_size(data.dtype);
     ensure!(es > 0, "Pad: dtype {} with unknown size", data.dtype);
@@ -710,11 +771,10 @@ pub fn pad(data: &HostTensor, begins: &[i64], ends: &[i64], cval: &[u8]) -> Resu
             let od = out_shape[d].max(1) as usize;
             acc /= od;
             let c = (o / acc.max(1)) % od;
-            let ic = c as i64 - begins[d];
-            if ic < 0 || ic >= data.shape[d] {
-                oob = true;
+            match mode.source(c as i64 - begins[d], data.shape[d]) {
+                Some(ic) => si += ic * in_str[d],
+                None => oob = true,
             }
-            si += ic * in_str[d];
         }
         if oob {
             if let Some(cv) = cval_bytes {

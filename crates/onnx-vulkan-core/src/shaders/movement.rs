@@ -228,7 +228,9 @@ pub const PAD: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<f32>;
 @group(0) @binding(1) var<storage, read> params: array<i32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
-struct Push { n: u32, rank: u32, cval: f32 }
+// mode: 0 constant, 1 edge, 2 reflect, 3 wrap (host_ops::PadMode::code);
+// the host refuses non-constant modes on empty input dimensions
+struct Push { n: u32, rank: u32, cval: f32, mode: u32 }
 var<immediate> pc: Push;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -241,9 +243,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let odim = u32(params[1u + d]);
         acc = acc / odim;
         let c = i32((o / acc) % odim);
-        let ic = c - params[1u + pc.rank + d];
+        var ic = c - params[1u + pc.rank + d];
         let idim = params[1u + 2u * pc.rank + d];
-        if (ic < 0 || ic >= idim) { oob = true; }
+        if (ic < 0 || ic >= idim) {
+            if (pc.mode == 1u) {
+                ic = clamp(ic, 0, idim - 1);
+            } else if (pc.mode == 2u) {
+                if (idim == 1) {
+                    ic = 0;
+                } else {
+                    let p = 2 * (idim - 1);
+                    var m = ic % p;
+                    if (m < 0) { m = m + p; }
+                    if (m >= idim) { m = p - m; }
+                    ic = m;
+                }
+            } else if (pc.mode == 3u) {
+                var m = ic % idim;
+                if (m < 0) { m = m + idim; }
+                ic = m;
+            } else {
+                oob = true;
+            }
+        }
         si = si + ic * params[1u + 3u * pc.rank + d];
     }
     if (oob) { dst[o] = pc.cval; } else { dst[o] = src[u32(si)]; }
@@ -283,7 +305,7 @@ pub const CONCAT_PUSH_BYTES: u32 = 20;
 pub const GATHER_BINDINGS: u32 = 3;
 pub const GATHER_PUSH_BYTES: u32 = 16;
 pub const PAD_BINDINGS: u32 = 3;
-pub const PAD_PUSH_BYTES: u32 = 12;
+pub const PAD_PUSH_BYTES: u32 = 16;
 pub const SLICE_BINDINGS: u32 = 3;
 pub const SLICE_PUSH_BYTES: u32 = 8;
 

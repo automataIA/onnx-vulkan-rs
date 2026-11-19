@@ -371,6 +371,12 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 )
         }
         "MaxPool" | "AveragePool" => int_attr("ceil_mode", 0) == 0 && node.outputs.len() == 1,
+        // a mode the kernel lacks, or the opset 18 `axes` input, would fail
+        // at run time, and an EP error ends hosts such as sherpa-onnx: leave
+        // those nodes to the CPU
+        "Pad" => {
+            pad_mode(node).is_ok() && !node.inputs.get(3).is_some_and(|a| !a.is_empty())
+        }
         // the schema's optional second output is `inv_std_var`, which the kernel
         // does not produce: claiming a node that asks for it would silently
         // leave a value undefined
@@ -3228,15 +3234,11 @@ fn range(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// optional constant_value (input[2], scalar). Device (f32) via kernel;
 /// otherwise host. Only mode=constant (the only one used by the model).
 fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
-    if let Some(m) = node.attrs.get("mode").and_then(|a| match a {
-        crate::AttrValue::String(s) => Some(s.as_str()),
-        _ => None,
-    }) {
-        ensure!(
-            m == "constant",
-            "Pad: mode '{m}' not supported (only constant)"
-        );
-    }
+    let mode = pad_mode(node)?;
+    ensure!(
+        !node.inputs.get(3).is_some_and(|a| !a.is_empty()),
+        "Pad: the axes input is not supported"
+    );
     let data = &node.inputs[0];
     let rank = env.shape_of(data)?.len();
     let pads = env.host(&node.inputs[1])?.to_i64()?;
@@ -3248,6 +3250,14 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
     );
     let begins = pads[..rank].to_vec();
     let ends = pads[rank..].to_vec();
+    if mode != host_ops::PadMode::Constant {
+        // nothing to repeat: onnxruntime refuses this too
+        let shape = env.shape_of(data)?;
+        ensure!(
+            (0..rank).all(|d| shape[d] > 0 || (begins[d] <= 0 && ends[d] <= 0)),
+            "Pad: mode {mode:?} on an empty dimension of {shape:?}"
+        );
+    }
 
     // no padding, as SAM 3's window partition when the grid divides: a copy
     if pads.iter().all(|&p| p == 0) && env.on_device(data) && env.dtype_of(data)? == FLOAT {
@@ -3255,7 +3265,7 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
         return meta_reshape_out(env, node, shape);
     }
     if env.dtype_of(data)? == FLOAT {
-        pad_device(env, node, &begins, &ends)
+        pad_device(env, node, &begins, &ends, mode)
     } else {
         let d = env.host(data)?;
         let cval = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -3263,15 +3273,32 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
         } else {
             Vec::new()
         };
-        let out = host_ops::pad(&d, &begins, &ends, &cval)?;
+        let out = host_ops::pad(&d, &begins, &ends, &cval, mode)?;
         env.set(&node.outputs[0], Tensor::Host(out));
         Ok(())
     }
 }
 
-/// GPU (constant) Pad of an f32 activation: per-dim parameters in an i32 buffer,
-/// f32 constant value in the push.
-fn pad_device(env: &mut Env, node: &NodeIr, begins: &[i64], ends: &[i64]) -> Result<()> {
+/// `Pad`'s mode attribute; constant when absent.
+fn pad_mode(node: &NodeIr) -> Result<host_ops::PadMode> {
+    let mode = match node.attrs.get("mode") {
+        None => "constant",
+        Some(a) => a
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Pad: mode is not a string"))?,
+    };
+    host_ops::PadMode::parse(mode).ok_or_else(|| anyhow::anyhow!("Pad: mode '{mode}' not supported"))
+}
+
+/// GPU Pad of an f32 activation: per-dim parameters in an i32 buffer, f32
+/// constant value and the mode in the push.
+fn pad_device(
+    env: &mut Env,
+    node: &NodeIr,
+    begins: &[i64],
+    ends: &[i64],
+    mode: host_ops::PadMode,
+) -> Result<()> {
     let ctx = env.context();
     let data = &node.inputs[0];
     let in_shape = env.shape_of(data)?;
@@ -3302,10 +3329,11 @@ fn pad_device(env: &mut Env, node: &NodeIr, begins: &[i64], ends: &[i64]) -> Res
     let d = env.device(data)?;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, n)?)?;
     if n > 0 {
-        let mut push = Vec::with_capacity(12);
+        let mut push = Vec::with_capacity(PAD_PUSH_BYTES as usize);
         push.extend_from_slice(&(n as u32).to_le_bytes());
         push.extend_from_slice(&(rank as u32).to_le_bytes());
         push.extend_from_slice(&cval.to_le_bytes());
+        push.extend_from_slice(&mode.code().to_le_bytes());
         with_pipeline(
             env.cache(),
             "Pad",

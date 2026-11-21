@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # bindgen 0.73.2 fails to compile when syn 3 and prettyplease's syn 2 types differ.
+      - dependency-name: bindgen
+        versions: ["= 0.73.2"]
     groups:
       cargo:
         patterns: ["*"]

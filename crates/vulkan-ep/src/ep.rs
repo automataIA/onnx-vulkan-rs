@@ -174,7 +174,8 @@ unsafe fn fuse_supported(
     let mut supported = Vec::with_capacity(nodes.len());
     let only = op_filter();
     for (&node, ir) in nodes.iter().zip(&irs) {
-        let (ins, outs) = unsafe { crate::compile::graph_ir::fused_node_io(node)? };
+        let (_, outs) = unsafe { crate::compile::graph_ir::fused_node_io(node)? };
+        let ins = unsafe { crate::compile::graph_ir::node_dependency_inputs(node)? };
         let op = unsafe { node_op(node) }?;
         // `VULKAN_EP_OPS=Op1,Op2` restricts fusion to those ops: useful to
         // bisect which kernel introduces a divergence on a real model.

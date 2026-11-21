@@ -8810,12 +8810,28 @@ fn gemm(env: &mut Env, node: &NodeIr) -> Result<()> {
 fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
     let ctx = env.context();
     let x_name = node.inputs[0].clone();
-    let x_shape = env.shape_of(&x_name)?;
+    let orig_shape = env.shape_of(&x_name)?;
+    // a 1-D resize [N,C,W] (the upsampling of audio models) is the 2-D kernel
+    // with H = 1
+    let rank3 = orig_shape.len() == 3;
     ensure!(
-        x_shape.len() == 4,
-        "Resize: only [N,C,H,W] tensors (rank {})",
-        x_shape.len()
+        orig_shape.len() == 4 || rank3,
+        "Resize: only [N,C,W] or [N,C,H,W] tensors (rank {})",
+        orig_shape.len()
     );
+    let x_shape = if rank3 {
+        vec![orig_shape[0], orig_shape[1], 1, orig_shape[2]]
+    } else {
+        orig_shape.clone()
+    };
+    // scales/sizes of a rank-3 input get the H entry (scale 1, size 1)
+    let widen = |v: Vec<f32>, h: f32| -> Vec<f32> {
+        if rank3 && v.len() == 3 {
+            vec![v[0], v[1], h, v[2]]
+        } else {
+            v
+        }
+    };
     let attr_str = |name: &str, default: &'static str| {
         node.attrs
             .get(name)
@@ -8867,8 +8883,8 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
             _ => Ok(None),
         }
     };
-    let scales = optional(env, 2)?.filter(|v| !v.is_empty());
-    let sizes = optional(env, 3)?.filter(|v| !v.is_empty());
+    let scales = optional(env, 2)?.filter(|v| !v.is_empty()).map(|v| widen(v, 1.0));
+    let sizes = optional(env, 3)?.filter(|v| !v.is_empty()).map(|v| widen(v, 1.0));
     let (h_in, w_in) = (x_shape[2], x_shape[3]);
     let (h_out, w_out, scale_h, scale_w) = match (&scales, &sizes) {
         (Some(s), _) => {
@@ -8898,7 +8914,11 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
 
     env.ensure_device(&x_name)?;
     let x = env.device(&x_name)?;
-    let out_shape = vec![x_shape[0], x_shape[1], h_out, w_out];
+    let out_shape = if rank3 {
+        vec![x_shape[0], x_shape[1], w_out]
+    } else {
+        vec![x_shape[0], x_shape[1], h_out, w_out]
+    };
     let elem_count = (x_shape[0] * x_shape[1] * h_out * w_out).max(0) as usize;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
     if elem_count > 0 {

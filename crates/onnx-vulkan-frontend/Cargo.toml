@@ -24,4 +24,4 @@ env_logger.workspace = true
 
 [build-dependencies]
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"

@@ -741,6 +741,60 @@ impl PadMode {
     }
 }
 
+pub(crate) struct PadGeometry {
+    pub shape: Vec<i64>,
+    pub begins: Vec<i64>,
+    pub cropped: Vec<i64>,
+    pub strides: Vec<i64>,
+    pub offset: i64,
+    pub count: usize,
+}
+
+impl PadGeometry {
+    pub fn new(shape: &[i64], begins: &[i64], ends: &[i64], mode: PadMode) -> Result<Self> {
+        let rank = shape.len();
+        ensure!(
+            begins.len() == rank && ends.len() == rank,
+            "Pad: pads do not match rank {rank}"
+        );
+        let mut geometry = Self {
+            shape: Vec::with_capacity(rank),
+            begins: Vec::with_capacity(rank),
+            cropped: Vec::with_capacity(rank),
+            strides: row_major_strides(shape),
+            offset: 0,
+            count: 0,
+        };
+        // Negative pads crop the source before edge, reflect, or wrap sampling.
+        for (axis, ((&dim, &begin), &end)) in shape.iter().zip(begins).zip(ends).enumerate() {
+            let start = begin.saturating_neg().max(0);
+            let stop = dim + end.min(0);
+            ensure!(
+                start <= stop,
+                "Pad: crop exceeds input dimension on axis {axis}"
+            );
+            let cropped = stop - start;
+            let begin = begin.max(0);
+            let out = cropped
+                .checked_add(begin)
+                .and_then(|size| size.checked_add(end.max(0)))
+                .ok_or_else(|| {
+                    Error::InvalidShape(format!("Pad: output dimension overflow on axis {axis}"))
+                })?;
+            geometry.shape.push(out);
+            geometry.begins.push(begin);
+            geometry.cropped.push(cropped);
+            geometry.offset += start * geometry.strides[axis];
+        }
+        geometry.count = element_count(&geometry.shape)?;
+        ensure!(
+            geometry.count == 0 || mode == PadMode::Constant || !geometry.cropped.contains(&0),
+            "Pad: mode {mode:?} cannot extend an empty cropped input"
+        );
+        Ok(geometry)
+    }
+}
+
 pub fn pad(
     data: &HostTensor,
     begins: &[i64],
@@ -751,28 +805,20 @@ pub fn pad(
     data.validate()?;
     let es = elem_size(data.dtype);
     ensure!(es > 0, "Pad: dtype {} with unknown size", data.dtype);
-    let rank = data.shape.len();
-    ensure!(
-        begins.len() == rank && ends.len() == rank,
-        "Pad: pads incompatibili con rank {rank}"
-    );
-    let in_str = row_major_strides(&data.shape);
-    let out_shape: Vec<i64> = (0..rank)
-        .map(|d| data.shape[d] + begins[d] + ends[d])
-        .collect();
-    let n = element_count(&out_shape)?;
+    let geometry = PadGeometry::new(&data.shape, begins, ends, mode)?;
+    let n = geometry.count;
     let mut out = vec![0u8; n * es];
     let cval_bytes = if cval.len() == es { Some(cval) } else { None };
     for o in 0..n {
         let mut acc = n;
-        let mut si = 0i64;
+        let mut si = geometry.offset;
         let mut oob = false;
-        for d in 0..rank {
-            let od = out_shape[d].max(1) as usize;
+        for (d, &dim) in geometry.shape.iter().enumerate() {
+            let od = dim as usize;
             acc /= od;
             let c = (o / acc.max(1)) % od;
-            match mode.source(c as i64 - begins[d], data.shape[d]) {
-                Some(ic) => si += ic * in_str[d],
+            match mode.source(c as i64 - geometry.begins[d], geometry.cropped[d]) {
+                Some(ic) => si += ic * geometry.strides[d],
                 None => oob = true,
             }
         }
@@ -785,7 +831,7 @@ pub fn pad(
             out[o * es..(o + 1) * es].copy_from_slice(&data.data[s * es..(s + 1) * es]);
         }
     }
-    Ok(HostTensor::new(data.dtype, out_shape, out))
+    Ok(HostTensor::new(data.dtype, geometry.shape, out))
 }
 
 /// Broadcast strides (in elements) of `in_shape` relative to `out_shape`

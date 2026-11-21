@@ -229,7 +229,7 @@ pub const PAD: &str = r#"
 @group(0) @binding(1) var<storage, read> params: array<i32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 // mode: 0 constant, 1 edge, 2 reflect, 3 wrap (host_ops::PadMode::code);
-// the host refuses non-constant modes on empty input dimensions
+// The host refuses non-constant sampling from an empty cropped input.
 struct Push { n: u32, rank: u32, cval: f32, mode: u32 }
 var<immediate> pc: Push;
 @compute @workgroup_size(256)
@@ -237,7 +237,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let o = gid.x;
     if (o >= pc.n) { return; }
     var acc = pc.n;
-    var si = 0i;
+    var si = params[0];
     var oob = false;
     for (var d = 0u; d < pc.rank; d = d + 1u) {
         let odim = u32(params[1u + d]);

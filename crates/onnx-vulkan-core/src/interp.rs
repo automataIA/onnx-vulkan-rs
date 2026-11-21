@@ -357,6 +357,7 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
             // exclude_outside = 1 would require zeroing and renormalizing the
             // weights of out-of-border neighbors: not implemented
             int_attr("exclude_outside", 0) == 0
+                && resize_sampling_supported(node)
                 && matches!(
                     string_attr("mode", "nearest").as_str(),
                     "nearest" | "linear" | "cubic"
@@ -374,9 +375,7 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
         // a mode the kernel lacks, or the opset 18 `axes` input, would fail
         // at run time, and an EP error ends hosts such as sherpa-onnx: leave
         // those nodes to the CPU
-        "Pad" => {
-            pad_mode(node).is_ok() && !node.inputs.get(3).is_some_and(|a| !a.is_empty())
-        }
+        "Pad" => pad_mode(node).is_ok() && !node.inputs.get(3).is_some_and(|a| !a.is_empty()),
         // the schema's optional second output is `inv_std_var`, which the kernel
         // does not produce: claiming a node that asks for it would silently
         // leave a value undefined
@@ -3248,16 +3247,7 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
         pads.len(),
         2 * rank
     );
-    let begins = pads[..rank].to_vec();
-    let ends = pads[rank..].to_vec();
-    if mode != host_ops::PadMode::Constant {
-        // nothing to repeat: onnxruntime refuses this too
-        let shape = env.shape_of(data)?;
-        ensure!(
-            (0..rank).all(|d| shape[d] > 0 || (begins[d] <= 0 && ends[d] <= 0)),
-            "Pad: mode {mode:?} on an empty dimension of {shape:?}"
-        );
-    }
+    let (begins, ends) = pads.split_at(rank);
 
     // no padding, as SAM 3's window partition when the grid divides: a copy
     if pads.iter().all(|&p| p == 0) && env.on_device(data) && env.dtype_of(data)? == FLOAT {
@@ -3265,7 +3255,7 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
         return meta_reshape_out(env, node, shape);
     }
     if env.dtype_of(data)? == FLOAT {
-        pad_device(env, node, &begins, &ends, mode)
+        pad_device(env, node, begins, ends, mode)
     } else {
         let d = env.host(data)?;
         let cval = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -3273,7 +3263,7 @@ fn pad(env: &mut Env, node: &NodeIr) -> Result<()> {
         } else {
             Vec::new()
         };
-        let out = host_ops::pad(&d, &begins, &ends, &cval, mode)?;
+        let out = host_ops::pad(&d, begins, ends, &cval, mode)?;
         env.set(&node.outputs[0], Tensor::Host(out));
         Ok(())
     }
@@ -3287,7 +3277,8 @@ fn pad_mode(node: &NodeIr) -> Result<host_ops::PadMode> {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Pad: mode is not a string"))?,
     };
-    host_ops::PadMode::parse(mode).ok_or_else(|| anyhow::anyhow!("Pad: mode '{mode}' not supported"))
+    host_ops::PadMode::parse(mode)
+        .ok_or_else(|| anyhow::anyhow!("Pad: mode '{mode}' not supported"))
 }
 
 /// GPU Pad of an f32 activation: per-dim parameters in an i32 buffer, f32
@@ -3303,25 +3294,24 @@ fn pad_device(
     let data = &node.inputs[0];
     let in_shape = env.shape_of(data)?;
     let rank = in_shape.len();
-    let in_str = host_ops::row_major_strides(&in_shape);
-    let out_shape: Vec<i64> = (0..rank)
-        .map(|d| in_shape[d] + begins[d] + ends[d])
-        .collect();
-    let n: usize = out_shape.iter().product::<i64>().max(0) as usize;
+    let geometry = host_ops::PadGeometry::new(&in_shape, begins, ends, mode)?;
+    let n = geometry.count;
     let cval: f32 = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
         *env.host(&node.inputs[2])?.to_f32()?.first().unwrap_or(&0.0)
     } else {
         0.0
     };
 
-    // params i32: [rank, odim(rank), begin(rank), idim(rank), istride(rank)]
-    let mut params: Vec<i32> = Vec::with_capacity(1 + rank * 4);
-    params.push(rank as i32);
-    params.extend(out_shape.iter().map(|&d| d as i32));
-    params.extend(begins.iter().map(|&b| b as i32));
-    params.extend(in_shape.iter().map(|&d| d as i32));
-    params.extend(in_str.iter().map(|&s| s as i32));
-    let params_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // params i32: [source offset, output shape, leading pads, cropped shape, source strides]
+    let mut params_bytes = Vec::with_capacity((1 + rank * 4) * size_of::<i32>());
+    for value in std::iter::once(&geometry.offset)
+        .chain(&geometry.shape)
+        .chain(&geometry.begins)
+        .chain(&geometry.cropped)
+        .chain(&geometry.strides)
+    {
+        params_bytes.extend_from_slice(&i32::try_from(*value)?.to_le_bytes());
+    }
     let mut params_buf_own = None;
     let params_buf = param_buffer(env, &params_bytes, &mut params_buf_own)?;
 
@@ -3330,7 +3320,8 @@ fn pad_device(
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, n)?)?;
     if n > 0 {
         let mut push = Vec::with_capacity(PAD_PUSH_BYTES as usize);
-        push.extend_from_slice(&(n as u32).to_le_bytes());
+        let count = u32::try_from(n)?;
+        push.extend_from_slice(&count.to_le_bytes());
         push.extend_from_slice(&(rank as u32).to_le_bytes());
         push.extend_from_slice(&cval.to_le_bytes());
         push.extend_from_slice(&mode.code().to_le_bytes());
@@ -3343,7 +3334,7 @@ fn pad_device(
                     pipe,
                     &[d.buffer(), params_buf, &out],
                     &push,
-                    [(n as u32).div_ceil(256), 1, 1],
+                    [count.div_ceil(256), 1, 1],
                 )
             },
         )?;
@@ -3356,7 +3347,7 @@ fn pad_device(
         &node.outputs[0],
         Tensor::Device(DevTensor {
             dtype: FLOAT,
-            shape: out_shape,
+            shape: geometry.shape,
             elem_count: n,
             buf: BufRef::Owned(out),
         }),
@@ -8808,6 +8799,10 @@ fn gemm(env: &mut Env, node: &NodeIr) -> Result<()> {
 /// `Resize` (opset ≥11) on [N, C, H, W]: nearest or bilinear, with `scales`
 /// or `sizes`; non-spatial dimensions must stay unchanged.
 fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
+    ensure!(
+        resize_sampling_supported(node),
+        "Resize: antialias, explicit axes and non-stretch aspect policies are unsupported"
+    );
     let ctx = env.context();
     let x_name = node.inputs[0].clone();
     let orig_shape = env.shape_of(&x_name)?;
@@ -8883,8 +8878,12 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
             _ => Ok(None),
         }
     };
-    let scales = optional(env, 2)?.filter(|v| !v.is_empty()).map(|v| widen(v, 1.0));
-    let sizes = optional(env, 3)?.filter(|v| !v.is_empty()).map(|v| widen(v, 1.0));
+    let scales = optional(env, 2)?
+        .filter(|v| !v.is_empty())
+        .map(|v| widen(v, 1.0));
+    let sizes = optional(env, 3)?
+        .filter(|v| !v.is_empty())
+        .map(|v| widen(v, 1.0));
     let (h_in, w_in) = (x_shape[2], x_shape[3]);
     let (h_out, w_out, scale_h, scale_w) = match (&scales, &sizes) {
         (Some(s), _) => {
@@ -8963,6 +8962,17 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+fn resize_sampling_supported(node: &NodeIr) -> bool {
+    node.attrs
+        .get("antialias")
+        .is_none_or(|value| value.as_i64() == Some(0))
+        && !node.attrs.contains_key("axes")
+        && node
+            .attrs
+            .get("keep_aspect_ratio_policy")
+            .is_none_or(|value| value.as_str() == Some("stretch"))
 }
 
 /// `Constant`: the value lives in an attribute, stays host until needed.

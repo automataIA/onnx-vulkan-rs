@@ -6,6 +6,7 @@
 use onnx_vulkan_core::host_ops::{FLOAT, HostTensor};
 use onnx_vulkan_core::{
     AttrValue, ExecutionEnv, GraphIr, InitializerIr, KernelCache, NodeIr, Tensor, execute,
+    is_implemented_node,
 };
 use std::collections::HashMap;
 use vk_compute::VkContext;
@@ -26,13 +27,20 @@ fn run(mode: &str, shape: Vec<i64>, scales: &[f32], use_sizes: bool) -> (Vec<f32
             sizes,
         )
     } else {
-        (vec!["x".into(), String::new(), "scales".into()], "scales", scales.to_vec())
+        (
+            vec!["x".into(), String::new(), "scales".into()],
+            "scales",
+            scales.to_vec(),
+        )
     };
     let init = if use_sizes {
         InitializerIr {
             dtype: onnx_vulkan_core::host_ops::INT64,
             shape: vec![data.len() as i64],
-            data: data.iter().flat_map(|v| (*v as i64).to_le_bytes()).collect(),
+            data: data
+                .iter()
+                .flat_map(|v| (*v as i64).to_le_bytes())
+                .collect(),
         }
     } else {
         InitializerIr {
@@ -86,8 +94,34 @@ fn rank3_equals_rank4_with_unit_height() {
             // the cubic weights differently per pipeline build, so allow 1e-5
             assert_eq!(got3.len(), got4.len());
             for (a, b) in got3.iter().zip(&got4) {
-                assert!((a - b).abs() <= 1e-5, "{mode} sizes={use_sizes}: {a} != {b}");
+                assert!(
+                    (a - b).abs() <= 1e-5,
+                    "{mode} sizes={use_sizes}: {a} != {b}"
+                );
             }
         }
+    }
+}
+
+#[test]
+fn resize_leaves_unsupported_sampling_to_cpu() {
+    for (name, value) in [
+        ("axes", AttrValue::Ints(vec![2])),
+        ("antialias", AttrValue::Int(1)),
+        (
+            "keep_aspect_ratio_policy",
+            AttrValue::String("not_larger".to_owned()),
+        ),
+    ] {
+        let node = NodeIr {
+            domain: String::new(),
+            op: "Resize".to_owned(),
+            opset: 19,
+            name: "resize".to_owned(),
+            inputs: vec!["x".to_owned(), String::new(), "scales".to_owned()],
+            outputs: vec!["out".to_owned()],
+            attrs: HashMap::from([(name.to_owned(), value)]),
+        };
+        assert!(!is_implemented_node(&node), "{name}");
     }
 }

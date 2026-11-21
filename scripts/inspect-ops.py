@@ -145,6 +145,13 @@ def _pool_ok(node, _consts) -> bool:
     return _attr(node, "ceil_mode", 0) == 0 and len(node.output) == 1
 
 
+def _pad_ok(node, _consts) -> bool:
+    mode = _attr(node, "mode", b"constant")
+    return mode in {b"constant", b"edge", b"reflect", b"wrap"} and (
+        len(node.input) < 4 or not node.input[3]
+    )
+
+
 def _resize_ok(node, _consts) -> bool:
     def s(name: str, default: str) -> str:
         v = _attr(node, name, default)
@@ -152,6 +159,9 @@ def _resize_ok(node, _consts) -> bool:
 
     return (
         _attr(node, "exclude_outside", 0) == 0
+        and _attr(node, "antialias", 0) == 0
+        and _attr(node, "axes", None) is None
+        and s("keep_aspect_ratio_policy", "stretch") == "stretch"
         and s("mode", "nearest") in {"nearest", "linear", "cubic"}
         and s("coordinate_transformation_mode", "half_pixel")
         in {"half_pixel", "asymmetric", "align_corners", "pytorch_half_pixel"}
@@ -363,6 +373,7 @@ NODE_RULES = {
     "AddTransposePad": lambda node, _consts: _rewrite_node(
         node, lambda n: 4 <= len(n.input) <= 5, lambda n: len(n.output) == 1
     ),
+    "Pad": _pad_ok,
     "Resize": _resize_ok,
     "MaxPool": _pool_ok,
     "AveragePool": _pool_ok,

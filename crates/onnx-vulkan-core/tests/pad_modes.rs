@@ -88,22 +88,31 @@ fn as_i64(t: &HostTensor) -> Vec<i64> {
 const MATRIX: [(&str, [f32; 18]); 3] = [
     (
         "edge",
-        [1., 1., 1., 2., 3., 3., 4., 4., 4., 5., 6., 6., 4., 4., 4., 5., 6., 6.],
+        [
+            1., 1., 1., 2., 3., 3., 4., 4., 4., 5., 6., 6., 4., 4., 4., 5., 6., 6.,
+        ],
     ),
     (
         "reflect",
-        [3., 2., 1., 2., 3., 2., 6., 5., 4., 5., 6., 5., 3., 2., 1., 2., 3., 2.],
+        [
+            3., 2., 1., 2., 3., 2., 6., 5., 4., 5., 6., 5., 3., 2., 1., 2., 3., 2.,
+        ],
     ),
     (
         "wrap",
-        [2., 3., 1., 2., 3., 1., 5., 6., 4., 5., 6., 4., 2., 3., 1., 2., 3., 1.],
+        [
+            2., 3., 1., 2., 3., 1., 5., 6., 4., 5., 6., 4., 2., 3., 1., 2., 3., 1.,
+        ],
     ),
 ];
 
 // np.pad([1, 2, 3], (5, 5), mode=...): pads wider than the dimension
 const WIDE: [(&str, [f32; 13]); 3] = [
     ("edge", [1., 1., 1., 1., 1., 1., 2., 3., 3., 3., 3., 3., 3.]),
-    ("reflect", [2., 1., 2., 3., 2., 1., 2., 3., 2., 1., 2., 3., 2.]),
+    (
+        "reflect",
+        [2., 1., 2., 3., 2., 1., 2., 3., 2., 1., 2., 3., 2.],
+    ),
     ("wrap", [2., 3., 1., 2., 3., 1., 2., 3., 1., 2., 3., 1., 2.]),
 ];
 
@@ -130,9 +139,23 @@ fn negative_pads_crop_in_every_mode() {
         let want: &[f32] = match mode {
             "edge" => &[2., 3., 4., 4., 4.],
             "reflect" => &[2., 3., 4., 3., 2.],
-            _ => &[2., 3., 4., 1., 2.],
+            _ => &[2., 3., 4., 2., 3.],
         };
         assert_eq!(as_f32(&y), want, "{mode}");
+        let x = HostTensor::new(
+            INT64,
+            vec![4],
+            [1i64, 2, 3, 4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        );
+        let host = run(mode, x, &[-1, 2], false);
+        assert_eq!(
+            as_i64(&host),
+            want.iter().map(|&v| v as i64).collect::<Vec<_>>(),
+            "{mode}"
+        );
     }
 }
 
@@ -142,7 +165,10 @@ fn host_matches_numpy() {
         let x = HostTensor::new(
             INT64,
             vec![2, 3],
-            [1i64, 2, 3, 4, 5, 6].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            [1i64, 2, 3, 4, 5, 6]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
         );
         let y = run(mode, x, &[0, 2, 1, 1], false);
         let want: Vec<i64> = want.iter().map(|&v| v as i64).collect();
@@ -164,13 +190,22 @@ fn source_index() {
 #[test]
 fn unknown_mode_and_axes_are_refused_at_load() {
     assert!(is_implemented_node(&pad_node(None, &["x", "pads"])));
-    assert!(is_implemented_node(&pad_node(Some("constant"), &["x", "pads", "v"])));
-    assert!(!is_implemented_node(&pad_node(Some("mirror"), &["x", "pads"])));
+    assert!(is_implemented_node(&pad_node(
+        Some("constant"),
+        &["x", "pads", "v"]
+    )));
+    assert!(!is_implemented_node(&pad_node(
+        Some("mirror"),
+        &["x", "pads"]
+    )));
     assert!(!is_implemented_node(&pad_node(
         Some("edge"),
         &["x", "pads", "", "axes"]
     )));
-    assert!(is_implemented_node(&pad_node(Some("edge"), &["x", "pads", "", ""])));
+    assert!(is_implemented_node(&pad_node(
+        Some("edge"),
+        &["x", "pads", "", ""]
+    )));
 }
 
 #[test]

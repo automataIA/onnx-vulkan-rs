@@ -453,6 +453,37 @@ pub unsafe fn fused_node_io(node: *const sys::OrtNode) -> Result<(Vec<String>, V
     Ok((inputs, outputs))
 }
 
+/// Every value a node reads, for the dependency graph of `GetCapability`:
+/// its explicit inputs plus the implicit ones, the outer-scope values that the
+/// subgraphs of a `Loop`, `If` or `Scan` read. Without the implicit inputs the
+/// fusion does not see the path that goes through such a node, and ONNX
+/// Runtime rejects the whole group ("nodes that cannot be fused together").
+///
+/// # Safety
+/// `node` valid for the call duration.
+pub unsafe fn node_dependency_inputs(node: *const sys::OrtNode) -> Result<Vec<String>> {
+    let api = apis().ort;
+    unsafe {
+        let mut names = node_value_names(api, node, true)?;
+        let mut n = 0usize;
+        check(
+            (api.Node_GetNumImplicitInputs.expect("Node_GetNumImplicitInputs"))(node, &mut n),
+            "Node_GetNumImplicitInputs",
+        )?;
+        if n > 0 {
+            let mut vis: Vec<*const sys::OrtValueInfo> = vec![ptr::null(); n];
+            check(
+                (api.Node_GetImplicitInputs.expect("Node_GetImplicitInputs"))(node, vis.as_mut_ptr(), n),
+                "Node_GetImplicitInputs",
+            )?;
+            for vi in vis {
+                names.push(value_info_name(vi)?);
+            }
+        }
+        Ok(names)
+    }
+}
+
 /// Names of a node's input or output values.
 /// Records the element type of every value this node reads or writes.
 ///

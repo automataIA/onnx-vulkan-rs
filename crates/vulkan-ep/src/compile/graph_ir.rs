@@ -467,13 +467,18 @@ pub unsafe fn node_dependency_inputs(node: *const sys::OrtNode) -> Result<Vec<St
         let mut names = node_value_names(api, node, true)?;
         let mut n = 0usize;
         check(
-            (api.Node_GetNumImplicitInputs.expect("Node_GetNumImplicitInputs"))(node, &mut n),
+            (api.Node_GetNumImplicitInputs
+                .expect("Node_GetNumImplicitInputs"))(node, &mut n),
             "Node_GetNumImplicitInputs",
         )?;
         if n > 0 {
             let mut vis: Vec<*const sys::OrtValueInfo> = vec![ptr::null(); n];
             check(
-                (api.Node_GetImplicitInputs.expect("Node_GetImplicitInputs"))(node, vis.as_mut_ptr(), n),
+                (api.Node_GetImplicitInputs.expect("Node_GetImplicitInputs"))(
+                    node,
+                    vis.as_mut_ptr(),
+                    n,
+                ),
                 "Node_GetImplicitInputs",
             )?;
             for vi in vis {
